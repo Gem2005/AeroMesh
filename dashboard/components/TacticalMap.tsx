@@ -3,13 +3,17 @@
 /**
  * TacticalMap — Leaflet-based geographical tactical display for AeroMesh.
  *
- * Renders mesh nodes as custom glowing divIcon markers on CartoDB DarkMatter
- * tiles, with Polyline links and UAV relay injection animations. All GPS
+ * Renders mesh nodes as custom glowing divIcon markers on dark tiles,
+ * with Polyline links and UAV relay injection animations. All GPS
  * coordinates come pre-calculated from the Python/NetworkX bridge.
  *
  * This component is loaded via next/dynamic (ssr: false) because Leaflet
- * requires the DOM. Re-renders are minimized: the map instance persists,
- * and only markers/polylines update when topology changes.
+ * requires the DOM. Re-renders are minimized via React.memo: the map
+ * instance persists, only markers/polylines update on topology changes.
+ *
+ * Node click events are forwarded to the parent via onNodeClick callback
+ * so the inspector panel lives OUTSIDE the MapContainer (preventing
+ * zoom resets on selectedNode state changes).
  */
 
 import { memo, useEffect, useMemo, useRef } from "react";
@@ -99,9 +103,10 @@ interface TacticalMapProps {
   nodes: TopoNode[];
   links: TopoLink[];
   relay: AerialRelay | null;
+  onNodeClick?: (node: TopoNode) => void;
 }
 
-function TacticalMap({ center, zoom, nodes, links, relay }: TacticalMapProps) {
+function TacticalMap({ center, zoom, nodes, links, relay, onNodeClick }: TacticalMapProps) {
   /* Build a lookup for node positions by id. */
   const nodeMap = useMemo(() => {
     const map = new Map<number, TopoNode>();
@@ -202,6 +207,9 @@ function TacticalMap({ center, zoom, nodes, links, relay }: TacticalMapProps) {
             key={node.id}
             position={[node.lat, node.lon]}
             icon={icon}
+            eventHandlers={{
+              click: () => onNodeClick?.(node),
+            }}
           >
             <Tooltip
               permanent

@@ -22,6 +22,101 @@ body {
 }
 
 /* ================================================================== */
+/* FEATURE 1: NODE INSPECTOR PANEL                                     */
+/* ================================================================== */
+
+.inspector-panel {
+  background: rgba(2, 6, 23, 0.92);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow:
+    4px 0 30px rgba(0, 0, 0, 0.5),
+    inset -1px 0 0 rgba(51, 65, 85, 0.3);
+}
+
+/* Force Signal Loss button glow on hover */
+.force-loss-btn:hover {
+  animation: force-loss-glow 1.5s ease-in-out infinite;
+}
+
+@keyframes force-loss-glow {
+  0%, 100% {
+    box-shadow: 0 0 15px rgba(244, 63, 94, 0.15);
+  }
+  50% {
+    box-shadow: 0 0 25px rgba(244, 63, 94, 0.35);
+  }
+}
+
+/* Make map markers clickable */
+.tactical-marker {
+  cursor: pointer;
+}
+
+/* ================================================================== */
+/* FEATURE 2: AUTHORIZE DEPLOYMENT BUTTON                              */
+/* ================================================================== */
+
+.authorize-btn {
+  animation: authorize-pulse 2s ease-in-out infinite;
+  position: relative;
+  overflow: hidden;
+}
+
+@keyframes authorize-pulse {
+  0%, 100% {
+    border-color: rgba(34, 211, 238, 0.4);
+    box-shadow:
+      0 0 10px rgba(34, 211, 238, 0.1),
+      inset 0 0 10px rgba(34, 211, 238, 0.05);
+  }
+  50% {
+    border-color: rgba(34, 211, 238, 0.8);
+    box-shadow:
+      0 0 25px rgba(34, 211, 238, 0.25),
+      inset 0 0 15px rgba(34, 211, 238, 0.1);
+  }
+}
+
+.authorize-btn::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(34, 211, 238, 0.08),
+    transparent
+  );
+  animation: authorize-sweep 3s ease-in-out infinite;
+}
+
+@keyframes authorize-sweep {
+  0% { left: -100%; }
+  50% { left: 100%; }
+  100% { left: 100%; }
+}
+
+/* ================================================================== */
+/* FEATURE 3: EVENT TERMINAL                                           */
+/* ================================================================== */
+
+.event-terminal {
+  height: 150px;
+  background: rgba(2, 6, 23, 0.88);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(51, 65, 85, 0.4);
+  border-bottom-color: rgba(51, 65, 85, 0.5);
+  box-shadow:
+    0 -4px 30px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(51, 65, 85, 0.2);
+}
+
+/* ================================================================== */
 /* TACTICAL MAP MARKER SYSTEM                                          */
 /* ================================================================== */
 
@@ -414,7 +509,7 @@ body {
 }
 
 /* ------------------------------------------------------------------ */
-/* Terminal-style scrollbars (event log, node roster)                  */
+/* Terminal-style scrollbars (event log, node roster, inspector)       */
 /* ------------------------------------------------------------------ */
 .terminal-scroll {
   scrollbar-width: thin;

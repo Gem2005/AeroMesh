@@ -3,14 +3,22 @@
 /**
  * AeroMesh Command — Palantir-inspired C2 tactical dashboard.
  *
- * Replaces the abstract physics graph with a real-time Leaflet map
- * showing GPS-projected mesh nodes. All FSPL math and graph topology
- * lives in the Python/NetworkX bridge; this frontend strictly renders
- * the map and UI panels based on WebSocket instructions.
+ * Three interactive features for the 75% jury review:
  *
- * WebSocket payloads:
- *   TOPOLOGY    → full node/link snapshot with GPS coords
- *   UAV_DISPATCH → jamming event, triggers tactical alert + UAV injection
+ *   1. TACTICAL NODE INSPECTOR — Click any node on the map to open a
+ *      sliding left-side panel with full node details and a manual
+ *      "FORCE SIGNAL LOSS" override button.
+ *
+ *   2. HUMAN-IN-THE-LOOP UAV AUTHORIZATION — UAV_DISPATCH payloads
+ *      (and manual overrides) do NOT auto-inject the relay. The system
+ *      waits indefinitely for the presenter to click [AUTHORIZE DEPLOYMENT].
+ *
+ *   3. LIVE EVENT TERMINAL — Bottom-anchored terminal with timestamped
+ *      log entries and a [CLEAR] button for jury resets.
+ *
+ * The selectedNode state is managed entirely outside <MapContainer> to
+ * prevent Leaflet zoom/pan resets. The map component is memoized and
+ * only re-renders on topology or relay changes.
  */
 
 import dynamic from "next/dynamic";
@@ -25,8 +33,6 @@ import {
   DEFAULT_CENTER,
   DEFAULT_ZOOM,
   GATEWAY_ID,
-  UAV_INJECT_DELAY_MS,
-  DISPATCH_PANEL_DURATION_MS,
 } from "@/lib/mesh";
 
 /* ------------------------------------------------------------------ */
@@ -48,7 +54,7 @@ const TacticalMap = dynamic(() => import("@/components/TacticalMap"), {
 
 const WS_URL = "ws://localhost:8765"; // must match bridge.py --ws-port
 const WS_RETRY_MS = 2000;
-const MAX_EVENTS = 60;
+const MAX_EVENTS = 80;
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -64,10 +70,13 @@ interface MeshEvent {
   text: string;
 }
 
-interface DispatchAlert {
+/** Pending dispatch awaiting human authorization. */
+interface PendingDispatch {
   targetNode: number;
   midpoint: [number, number];
   receivedAt: number;
+  /** "awaiting" = waiting for button click; "transit" = authorized, UAV deploying */
+  phase: "awaiting" | "transit";
 }
 
 const timestamp = () =>
@@ -85,11 +94,14 @@ export default function Home() {
   const [relay, setRelay] = useState<AerialRelay | null>(null);
   const [wsStatus, setWsStatus] = useState<WsStatus>("connecting");
   const [events, setEvents] = useState<MeshEvent[]>([]);
-  const [dispatchAlert, setDispatchAlert] = useState<DispatchAlert | null>(null);
+
+  /* Feature 1: Node inspector */
+  const [selectedNode, setSelectedNode] = useState<TopoNode | null>(null);
+
+  /* Feature 2: Human-in-the-loop dispatch */
+  const [pendingDispatch, setPendingDispatch] = useState<PendingDispatch | null>(null);
 
   const eventIdRef = useRef(0);
-  const dispatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const panelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /* ---- Geolocation on mount ---- */
   useEffect(() => {
@@ -100,7 +112,7 @@ export default function Home() {
     );
   }, []);
 
-  /* ---- Event log ring buffer ---- */
+  /* ---- Event log ---- */
   const addEvent = useCallback((severity: Severity, text: string) => {
     const event: MeshEvent = {
       id: ++eventIdRef.current,
@@ -115,56 +127,112 @@ export default function Home() {
     );
   }, []);
 
+  const clearEvents = useCallback(() => setEvents([]), []);
+
   /* ---- Handle TOPOLOGY payload ---- */
   const handleTopology = useCallback(
     (payload: TopologyPayload) => {
-      setNodes(payload.nodes);
+      setNodes((prev) => {
+        // Log new nodes joining
+        const prevIds = new Set(prev.map((n) => n.id));
+        for (const n of payload.nodes) {
+          if (!prevIds.has(n.id)) {
+            addEvent("info", `NODE JOINED: ${n.id.toString(16).toUpperCase()} (${n.id})`);
+          }
+        }
+        return payload.nodes;
+      });
       setLinks(payload.links);
-    },
-    []
-  );
-
-  /* ---- Handle UAV_DISPATCH payload ---- */
-  const handleDispatch = useCallback(
-    (payload: DispatchPayload) => {
-      const alert: DispatchAlert = {
-        targetNode: payload.target_node,
-        midpoint: payload.midpoint,
-        receivedAt: Date.now(),
-      };
-      setDispatchAlert(alert);
-
-      addEvent(
-        "critical",
-        `JAMMING DETECTED: Node ${payload.target_node}. UAV dispatch required.`
-      );
-
-      // Clear any pending timers
-      if (dispatchTimerRef.current) clearTimeout(dispatchTimerRef.current);
-      if (panelTimerRef.current) clearTimeout(panelTimerRef.current);
-
-      // Inject UAV relay marker after 3 seconds
-      dispatchTimerRef.current = setTimeout(() => {
-        const newRelay: AerialRelay = {
-          lat: payload.midpoint[0],
-          lon: payload.midpoint[1],
-          targetNodeId: payload.target_node,
-          injectedAt: Date.now(),
-        };
-        setRelay(newRelay);
-        addEvent(
-          "ok",
-          `AERIAL_RELAY deployed at [${payload.midpoint[0].toFixed(4)}, ${payload.midpoint[1].toFixed(4)}]. Network gap bridged.`
-        );
-      }, UAV_INJECT_DELAY_MS);
-
-      // Auto-dismiss alert panel
-      panelTimerRef.current = setTimeout(() => {
-        setDispatchAlert(null);
-      }, DISPATCH_PANEL_DURATION_MS);
     },
     [addEvent]
   );
+
+  /* ---- Handle UAV_DISPATCH payload (human-in-the-loop) ---- */
+  const handleDispatch = useCallback(
+    (payload: DispatchPayload) => {
+      const pending: PendingDispatch = {
+        targetNode: payload.target_node,
+        midpoint: payload.midpoint,
+        receivedAt: Date.now(),
+        phase: "awaiting",
+      };
+      setPendingDispatch(pending);
+
+      addEvent(
+        "critical",
+        `INTERFERENCE DETECTED: ${payload.target_node.toString(16).toUpperCase()}. Awaiting authorization.`
+      );
+    },
+    [addEvent]
+  );
+
+  /* ---- Authorize deployment (Feature 2 action) ---- */
+  const authorizeDeployment = useCallback(() => {
+    if (!pendingDispatch) return;
+
+    // Transition to "transit" phase
+    setPendingDispatch((prev) => prev ? { ...prev, phase: "transit" } : null);
+    addEvent("ok", "UAV AUTHORIZED. Aerial relay in transit…");
+
+    // Inject relay marker after short transit animation (1.5s)
+    const mid = pendingDispatch.midpoint;
+    const target = pendingDispatch.targetNode;
+    setTimeout(() => {
+      setRelay({
+        lat: mid[0],
+        lon: mid[1],
+        targetNodeId: target,
+        injectedAt: Date.now(),
+      });
+      addEvent(
+        "ok",
+        `AERIAL_RELAY deployed at [${mid[0].toFixed(4)}, ${mid[1].toFixed(4)}]. Network gap bridged.`
+      );
+      // Dismiss panel after deployment
+      setTimeout(() => setPendingDispatch(null), 3000);
+    }, 1500);
+  }, [pendingDispatch, addEvent]);
+
+  /* ---- Force signal loss (Feature 1 action) ---- */
+  const forceSignalLoss = useCallback(
+    (nodeId: number) => {
+      // Locally jam the node
+      setNodes((prev) =>
+        prev.map((n) =>
+          n.id === nodeId ? { ...n, status: "JAMMED" as const } : n
+        )
+      );
+
+      addEvent("critical", `INTERFERENCE DETECTED: ${nodeId.toString(16).toUpperCase()} (manual override)`);
+
+      // Find the node and gateway for midpoint calculation
+      const node = nodes.find((n) => n.id === nodeId);
+      const gateway = nodes.find((n) => n.id === GATEWAY_ID);
+
+      if (node && gateway) {
+        const midLat = (gateway.lat + node.lat) / 2;
+        const midLon = (gateway.lon + node.lon) / 2;
+
+        // Trigger human-in-the-loop dispatch
+        const pending: PendingDispatch = {
+          targetNode: nodeId,
+          midpoint: [midLat, midLon],
+          receivedAt: Date.now(),
+          phase: "awaiting",
+        };
+        setPendingDispatch(pending);
+      }
+
+      // Close inspector
+      setSelectedNode(null);
+    },
+    [nodes, addEvent]
+  );
+
+  /* ---- Node click handler (stable ref for TacticalMap memo) ---- */
+  const handleNodeClick = useCallback((node: TopoNode) => {
+    setSelectedNode((prev) => (prev?.id === node.id ? null : node));
+  }, []);
 
   /* ---- WebSocket lifecycle ---- */
   useEffect(() => {
@@ -180,7 +248,7 @@ export default function Home() {
       ws.onopen = () => {
         wasConnected = true;
         setWsStatus("connected");
-        addEvent("info", `Uplink established (${WS_URL}).`);
+        addEvent("info", `WS CONNECTED (${WS_URL})`);
       };
 
       ws.onmessage = (event) => {
@@ -202,7 +270,7 @@ export default function Home() {
         if (disposed) return;
         setWsStatus("disconnected");
         if (wasConnected)
-          addEvent("warn", "WARN: Bridge uplink lost. Reconnecting…");
+          addEvent("warn", "Bridge uplink lost. Reconnecting…");
         retryTimer = setTimeout(connect, WS_RETRY_MS);
       };
 
@@ -213,11 +281,15 @@ export default function Home() {
     return () => {
       disposed = true;
       if (retryTimer) clearTimeout(retryTimer);
-      if (dispatchTimerRef.current) clearTimeout(dispatchTimerRef.current);
-      if (panelTimerRef.current) clearTimeout(panelTimerRef.current);
       ws?.close();
     };
   }, [addEvent, handleTopology, handleDispatch]);
+
+  /* ---- Keep selectedNode in sync with live topology ---- */
+  const inspectedNode = useMemo(() => {
+    if (!selectedNode) return null;
+    return nodes.find((n) => n.id === selectedNode.id) ?? selectedNode;
+  }, [selectedNode, nodes]);
 
   /* ---- Derived metrics ---- */
   const metrics = useMemo(() => {
@@ -238,8 +310,16 @@ export default function Home() {
           nodes={nodes}
           links={links}
           relay={relay}
+          onNodeClick={handleNodeClick}
         />
       </div>
+
+      {/* Feature 1: Node Inspector — sliding left panel (outside MapContainer) */}
+      <NodeInspector
+        node={inspectedNode}
+        onClose={() => setSelectedNode(null)}
+        onForceSignalLoss={forceSignalLoss}
+      />
 
       {/* Top bar */}
       <TopBar
@@ -253,20 +333,21 @@ export default function Home() {
       {/* Tactical status panel — top left */}
       <StatusPanel metrics={metrics} relay={relay} />
 
-      {/* UAV Dispatch tactical alert — top right, glassmorphism overlay */}
-      {dispatchAlert && (
+      {/* Feature 2: Human-in-the-loop dispatch panel — top right */}
+      {pendingDispatch && (
         <DispatchPanel
-          alert={dispatchAlert}
+          dispatch={pendingDispatch}
           relay={relay}
-          onDismiss={() => setDispatchAlert(null)}
+          onAuthorize={authorizeDeployment}
+          onDismiss={() => setPendingDispatch(null)}
         />
       )}
 
       {/* Node roster — right side */}
       <NodeRoster nodes={nodes} />
 
-      {/* Bottom: live event log */}
-      <EventLog events={events} />
+      {/* Feature 3: Live event terminal — bottom anchored */}
+      <EventTerminal events={events} onClear={clearEvents} />
 
       {/* Empty-state hint */}
       {nodes.length === 0 && (
@@ -286,6 +367,150 @@ export default function Home() {
         </div>
       )}
     </main>
+  );
+}
+
+/* ================================================================== */
+/* Feature 1: Node Inspector Panel                                     */
+/* ================================================================== */
+
+function NodeInspector({
+  node,
+  onClose,
+  onForceSignalLoss,
+}: {
+  node: TopoNode | null;
+  onClose: () => void;
+  onForceSignalLoss: (nodeId: number) => void;
+}) {
+  const isOpen = node !== null;
+  const isGateway = node?.id === GATEWAY_ID;
+  const isJammed = node?.status === "JAMMED";
+
+  return (
+    <div
+      className={`inspector-panel absolute top-12 bottom-0 left-0 z-40 w-80 border-r border-slate-800 transition-transform duration-300 ease-out ${
+        isOpen ? "translate-x-0" : "-translate-x-full"
+      }`}
+    >
+      {node && (
+        <div className="flex h-full flex-col p-5">
+          {/* Header */}
+          <div className="mb-5 flex items-start justify-between">
+            <div>
+              <h2 className="text-[10px] font-semibold tracking-[0.25em] text-slate-400">
+                TACTICAL NODE INSPECTOR
+              </h2>
+              <div className="mt-1 flex items-center gap-2">
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    isGateway
+                      ? "bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.6)]"
+                      : isJammed
+                        ? "bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.6)] animate-pulse"
+                        : "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]"
+                  }`}
+                />
+                <span
+                  className={`font-mono text-xs font-bold tracking-wider ${
+                    isGateway
+                      ? "text-cyan-400"
+                      : isJammed
+                        ? "text-rose-400"
+                        : "text-emerald-400"
+                  }`}
+                >
+                  {isGateway ? "GATEWAY" : isJammed ? "JAMMED" : "ONLINE"}
+                </span>
+              </div>
+            </div>
+            <button
+              onClick={onClose}
+              className="rounded border border-slate-700 px-2 py-1 font-mono text-[10px] text-slate-500 transition-colors hover:border-slate-500 hover:text-slate-300"
+              aria-label="Close inspector"
+            >
+              ESC ✕
+            </button>
+          </div>
+
+          {/* Node Details */}
+          <div className="space-y-3 font-mono text-[11px]">
+            <div className="rounded border border-slate-800 bg-slate-900/60 p-3">
+              <div className="mb-2 text-[9px] font-bold tracking-[0.2em] text-slate-500">
+                NODE ID
+              </div>
+              <div className="text-lg font-bold text-slate-100">
+                {node.id}
+              </div>
+              <div className="mt-0.5 text-[10px] text-slate-400">
+                0x{node.id.toString(16).toUpperCase()}
+              </div>
+            </div>
+
+            <div className="rounded border border-slate-800 bg-slate-900/60 p-3">
+              <div className="mb-2 text-[9px] font-bold tracking-[0.2em] text-slate-500">
+                STATUS
+              </div>
+              <div
+                className={`text-sm font-bold ${
+                  isGateway
+                    ? "text-cyan-400"
+                    : isJammed
+                      ? "text-rose-400"
+                      : "text-emerald-400"
+                }`}
+              >
+                {isGateway ? "GATEWAY (ROOT)" : isJammed ? "JAMMED — SIGNAL LOST" : "ONLINE — NOMINAL"}
+              </div>
+            </div>
+
+            <div className="rounded border border-slate-800 bg-slate-900/60 p-3">
+              <div className="mb-2 text-[9px] font-bold tracking-[0.2em] text-slate-500">
+                COORDINATES
+              </div>
+              <div className="space-y-1">
+                <div className="flex justify-between">
+                  <span className="text-slate-500">LAT</span>
+                  <span className="text-slate-200">{node.lat.toFixed(6)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">LON</span>
+                  <span className="text-slate-200">{node.lon.toFixed(6)}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded border border-slate-800 bg-slate-900/60 p-3">
+              <div className="mb-2 text-[9px] font-bold tracking-[0.2em] text-slate-500">
+                ROLE
+              </div>
+              <div className="text-[11px] text-slate-300">
+                {isGateway ? "Mesh Root · Serial Bridge" : "Mesh Endpoint · Sensor Node"}
+              </div>
+            </div>
+          </div>
+
+          {/* Spacer */}
+          <div className="flex-1" />
+
+          {/* Force Signal Loss button — only for non-gateway, non-jammed nodes */}
+          {!isGateway && !isJammed && (
+            <button
+              onClick={() => onForceSignalLoss(node.id)}
+              className="force-loss-btn mt-4 w-full rounded border-2 border-rose-600/60 bg-rose-950/30 px-4 py-3 font-mono text-xs font-bold tracking-[0.15em] text-rose-400 transition-all hover:border-rose-500 hover:bg-rose-950/60 hover:text-rose-300 hover:shadow-[0_0_20px_rgba(244,63,94,0.2)]"
+            >
+              ⚠ FORCE SIGNAL LOSS
+            </button>
+          )}
+
+          {isJammed && (
+            <div className="mt-4 rounded border border-rose-800/40 bg-rose-950/20 px-4 py-3 text-center font-mono text-[10px] tracking-wider text-rose-400/80">
+              NODE INTERFERENCE ACTIVE
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -444,17 +669,24 @@ function StatusPanel({
   );
 }
 
+/* ================================================================== */
+/* Feature 2: Human-in-the-Loop Dispatch Panel                         */
+/* ================================================================== */
+
 function DispatchPanel({
-  alert,
+  dispatch,
   relay,
+  onAuthorize,
   onDismiss,
 }: {
-  alert: DispatchAlert;
+  dispatch: PendingDispatch;
   relay: AerialRelay | null;
+  onAuthorize: () => void;
   onDismiss: () => void;
 }) {
-  const elapsed = Date.now() - alert.receivedAt;
-  const injecting = elapsed < UAV_INJECT_DELAY_MS && !relay;
+  const isAwaiting = dispatch.phase === "awaiting";
+  const isTransit = dispatch.phase === "transit";
+  const isDeployed = relay !== null;
 
   return (
     <section className="dispatch-panel absolute top-16 right-4 z-30 w-80 rounded-sm border-2 border-rose-500/80 p-5">
@@ -468,10 +700,30 @@ function DispatchPanel({
       </button>
 
       {/* Flash header */}
-      <div className="dispatch-flash mb-3 flex items-center gap-2">
-        <span className="h-2.5 w-2.5 rounded-full bg-rose-500 shadow-[0_0_12px_rgba(244,63,94,0.8)]" />
-        <h2 className="font-mono text-sm font-bold tracking-[0.2em] text-rose-300">
-          UAV DISPATCH REQUIRED
+      <div className={`mb-3 flex items-center gap-2 ${isAwaiting ? "dispatch-flash" : ""}`}>
+        <span
+          className={`h-2.5 w-2.5 rounded-full ${
+            isDeployed
+              ? "bg-cyan-400 shadow-[0_0_12px_rgba(34,211,238,0.8)]"
+              : isTransit
+                ? "bg-amber-400 shadow-[0_0_12px_rgba(251,191,36,0.8)] animate-pulse"
+                : "bg-rose-500 shadow-[0_0_12px_rgba(244,63,94,0.8)]"
+          }`}
+        />
+        <h2
+          className={`font-mono text-sm font-bold tracking-[0.2em] ${
+            isDeployed
+              ? "text-cyan-300"
+              : isTransit
+                ? "text-amber-300"
+                : "text-rose-300"
+          }`}
+        >
+          {isDeployed
+            ? "RELAY DEPLOYED"
+            : isTransit
+              ? "UAV IN TRANSIT"
+              : "UAV DISPATCH REQUIRED"}
         </h2>
       </div>
 
@@ -480,42 +732,46 @@ function DispatchPanel({
         <div className="flex justify-between">
           <span className="text-slate-500">TARGET NODE</span>
           <span className="text-rose-300">
-            {alert.targetNode.toString(16).toUpperCase()}
+            {dispatch.targetNode.toString(16).toUpperCase()}
           </span>
         </div>
         <div className="flex justify-between">
           <span className="text-slate-500">NODE ID (DEC)</span>
-          <span className="text-rose-300">{alert.targetNode}</span>
+          <span className="text-rose-300">{dispatch.targetNode}</span>
         </div>
         <div className="flex justify-between">
           <span className="text-slate-500">DEPLOY COORDS</span>
           <span className="text-cyan-300">
-            {alert.midpoint[0].toFixed(4)}, {alert.midpoint[1].toFixed(4)}
+            {dispatch.midpoint[0].toFixed(4)}, {dispatch.midpoint[1].toFixed(4)}
           </span>
         </div>
       </div>
 
-      {/* Status bar */}
-      <div className="mt-4 border-t border-rose-800/50 pt-3">
-        {injecting ? (
-          <div className="flex items-center gap-2">
-            <span className="h-2 w-2 animate-pulse rounded-full bg-amber-400" />
-            <span className="font-mono text-[10px] tracking-wider text-amber-300">
+      {/* Authorization / status area */}
+      <div className="mt-4 border-t border-rose-800/50 pt-4">
+        {isAwaiting && (
+          <button
+            onClick={onAuthorize}
+            className="authorize-btn w-full rounded border-2 border-cyan-400/60 bg-cyan-950/40 px-4 py-3 font-mono text-sm font-bold tracking-[0.2em] text-cyan-300 transition-all hover:border-cyan-400 hover:bg-cyan-900/50 hover:shadow-[0_0_30px_rgba(34,211,238,0.3)]"
+          >
+            ▶ AUTHORIZE DEPLOYMENT
+          </button>
+        )}
+
+        {isTransit && (
+          <div className="flex items-center justify-center gap-3 py-2">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.6)]" />
+            <span className="font-mono text-[11px] tracking-wider text-amber-300">
               DEPLOYING AERIAL RELAY…
             </span>
           </div>
-        ) : relay ? (
-          <div className="flex items-center gap-2">
-            <span className="h-2 w-2 animate-pulse-glow rounded-full bg-cyan-400" />
-            <span className="font-mono text-[10px] tracking-wider text-cyan-300">
+        )}
+
+        {isDeployed && (
+          <div className="flex items-center justify-center gap-3 py-2">
+            <span className="h-2 w-2 animate-pulse-glow rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.6)]" />
+            <span className="font-mono text-[11px] tracking-wider text-cyan-300">
               AERIAL_RELAY ACTIVE — GAP BRIDGED
-            </span>
-          </div>
-        ) : (
-          <div className="flex items-center gap-2">
-            <span className="h-2 w-2 rounded-full bg-rose-500" />
-            <span className="font-mono text-[10px] tracking-wider text-rose-300">
-              AWAITING RELAY DEPLOYMENT
             </span>
           </div>
         )}
@@ -524,14 +780,16 @@ function DispatchPanel({
   );
 }
 
+/* ================================================================== */
+/* Node Roster                                                         */
+/* ================================================================== */
+
 function NodeRoster({ nodes }: { nodes: TopoNode[] }) {
   if (nodes.length === 0) return null;
 
   const sorted = [...nodes].sort((a, b) => {
-    // Gateway first
     if (a.id === GATEWAY_ID) return -1;
     if (b.id === GATEWAY_ID) return 1;
-    // Jammed nodes next
     if (a.status === "JAMMED" && b.status !== "JAMMED") return -1;
     if (a.status !== "JAMMED" && b.status === "JAMMED") return 1;
     return a.id - b.id;
@@ -587,9 +845,9 @@ function NodeRoster({ nodes }: { nodes: TopoNode[] }) {
   );
 }
 
-/* ------------------------------------------------------------------ */
-/* Event Log                                                           */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/* Feature 3: Live Event Terminal                                      */
+/* ================================================================== */
 
 const SEVERITY_STYLE: Record<Severity, { tag: string; cls: string }> = {
   info: { tag: "INFO", cls: "text-slate-400" },
@@ -598,28 +856,52 @@ const SEVERITY_STYLE: Record<Severity, { tag: string; cls: string }> = {
   critical: { tag: "CRIT", cls: "text-rose-400" },
 };
 
-function EventLog({ events }: { events: MeshEvent[] }) {
+function EventTerminal({
+  events,
+  onClear,
+}: {
+  events: MeshEvent[];
+  onClear: () => void;
+}) {
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [events]);
 
   return (
-    <section className="glass absolute inset-x-4 bottom-4 z-20 h-40 rounded-sm">
+    <section className="event-terminal absolute inset-x-4 bottom-4 z-20 rounded-sm">
       <div className="flex h-7 items-center justify-between border-b border-slate-700/50 px-3">
-        <h2 className="text-[10px] font-semibold tracking-[0.25em] text-slate-400">
-          LIVE EVENT LOG
-        </h2>
-        <span className="font-mono text-[9px] text-slate-600">
-          {events.length}/{MAX_EVENTS} · AUTO-SCROLL
-        </span>
+        <div className="flex items-center gap-3">
+          <h2 className="text-[10px] font-semibold tracking-[0.25em] text-slate-400">
+            EVENT TERMINAL
+          </h2>
+          <div className="flex gap-1">
+            <span className="h-1.5 w-1.5 rounded-full bg-rose-500/80" />
+            <span className="h-1.5 w-1.5 rounded-full bg-amber-500/80" />
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500/80" />
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="font-mono text-[9px] text-slate-600">
+            {events.length}/{MAX_EVENTS}
+          </span>
+          <button
+            onClick={onClear}
+            className="rounded border border-slate-700/60 px-2 py-0.5 font-mono text-[9px] tracking-wider text-slate-500 transition-all hover:border-slate-500 hover:text-slate-300"
+          >
+            CLEAR
+          </button>
+        </div>
       </div>
       <div
         ref={scrollRef}
-        className="terminal-scroll h-[calc(100%-1.75rem)] overflow-y-auto px-3 py-1.5 font-mono text-[11px] leading-5"
+        className="terminal-scroll overflow-y-auto px-3 py-1.5 font-mono text-[11px] leading-5"
+        style={{ height: "calc(100% - 1.75rem)" }}
       >
         {events.length === 0 && (
-          <p className="text-slate-600">-- no events recorded --</p>
+          <p className="text-slate-600">
+            root@aeromesh:~$ <span className="animate-pulse text-slate-500">_</span>
+          </p>
         )}
         {events.map((e) => (
           <p key={e.id} className="whitespace-pre-wrap">

@@ -59,9 +59,3 @@ export const DEFAULT_ZOOM = 16;
 
 /** The first TOPOLOGY node is always the gateway (GATEWAY_ID in bridge.py). */
 export const GATEWAY_ID = 1693866525;
-
-/** How long after receiving a dispatch payload the UAV marker is injected (ms). */
-export const UAV_INJECT_DELAY_MS = 3000;
-
-/** How long the tactical alert panel stays visible (ms). */
-export const DISPATCH_PANEL_DURATION_MS = 15000;
