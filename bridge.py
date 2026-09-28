@@ -1,21 +1,18 @@
 """
-AeroMesh Bridge -- Serial-to-WebSocket relay for the Self-Healing Ad-Hoc
-Wireless Network with UAV Bridge project.
+AeroMesh Bridge (C2 NetworkX Edition) -- Serial-to-WebSocket relay for the 
+Self-Healing Ad-Hoc Wireless Network with UAV Bridge project.
 
-Reads JSON lines from the painlessMesh Gateway ESP32 (USB serial) and
-broadcasts every valid JSON line to all connected WebSocket clients
-(the Next.js dashboard).
+Reads JSON lines from the painlessMesh Gateway ESP32 (USB serial), processes
+the topology and Free Space Path Loss (FSPL) using NetworkX and Geopy, and
+broadcasts tactical mapping data to all connected WebSocket clients.
 
 Setup:
-    pip install pyserial websockets
+    pip install pyserial websockets networkx geopy
 
 Run:
     python bridge.py                       # defaults: COM9 @ 115200, ws://localhost:8765
     python bridge.py --port COM5           # custom serial port
     python bridge.py --port COM9 --baud 115200 --ws-port 8765
-
-Note: default WS port is 8765 (not 8080) because Apache/XAMPP commonly
-occupies 8080. Keep it in sync with WS_URL in dashboard/app/page.tsx.
 """
 
 import argparse
@@ -24,9 +21,12 @@ import json
 import logging
 import sys
 import time
+import math
 
 import serial  # pyserial
 import websockets
+import networkx as nx
+from geopy.distance import geodesic
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +42,33 @@ SILENCE_WARN_S = 10.0
 # After this many silent seconds, cycle the port (DTR pulse resets the ESP32).
 SILENCE_RESET_S = 30.0
 
+# ------------------------------------------------------------------ #
+# NetworkX & Geospatial Configuration
+# ------------------------------------------------------------------ #
+GATEWAY_LAT = 12.8406
+GATEWAY_LON = 80.1534
+GATEWAY_ID = 1693866525 # IMPORTANT: Replace with your actual Gateway Node ID
+
+TX_POWER = -50  # dBm at 1 meter
+PATH_LOSS_EXPONENT = 2.5 # Environmental factor
+
+def rssi_to_meters(rssi):
+    """Converts RSSI to distance in meters using Free Space Path Loss."""
+    try:
+        val = float(rssi)
+        if val >= 0:
+            return 0
+        return 10 ** ((TX_POWER - val) / (10 * PATH_LOSS_EXPONENT))
+    except (ValueError, TypeError):
+        return 0
+
+def calculate_projected_gps(parent_lat, parent_lon, distance_meters, node_id):
+    """Calculates a GPS coordinate based on distance and a pseudo-random fixed bearing."""
+    bearing = (node_id % 360) 
+    origin = (parent_lat, parent_lon)
+    destination = geodesic(meters=distance_meters).destination(origin, bearing)
+    return destination.latitude, destination.longitude
+
 
 class Bridge:
     def __init__(self, serial_port: str, baud: int, ws_host: str, ws_port: int):
@@ -49,19 +76,21 @@ class Bridge:
         self.baud = baud
         self.ws_host = ws_host
         self.ws_port = ws_port
-        # Set of connected WebSocket client connections.
         self.clients = set()
+        
+        # Initialize System State
+        self.mesh_graph = nx.Graph()
+        self.mesh_graph.add_node(GATEWAY_ID, status="online")
+        self.node_locations = {GATEWAY_ID: (GATEWAY_LAT, GATEWAY_LON)}
 
     # ------------------------------------------------------------------ #
     # WebSocket side
     # ------------------------------------------------------------------ #
     async def handle_client(self, websocket):
-        """Register a dashboard client and keep the connection open."""
         self.clients.add(websocket)
         peer = websocket.remote_address
         log.info("Dashboard connected: %s (total clients: %d)", peer, len(self.clients))
         try:
-            # We never expect inbound messages; just wait until the client leaves.
             async for _ in websocket:
                 pass
         except websockets.exceptions.ConnectionClosed:
@@ -71,10 +100,9 @@ class Bridge:
             log.info("Dashboard disconnected: %s (total clients: %d)", peer, len(self.clients))
 
     async def broadcast(self, message: str):
-        """Send a message to every connected client, dropping dead sockets."""
         if not self.clients:
             return
-        clients = list(self.clients)  # snapshot: the set may change while we await
+        clients = list(self.clients)
         results = await asyncio.gather(
             *(client.send(message) for client in clients),
             return_exceptions=True,
@@ -83,16 +111,36 @@ class Bridge:
             if isinstance(result, Exception):
                 self.clients.discard(client)
 
+    async def broadcast_topology(self):
+        """Generates the mapped graph state and sends it to the frontend."""
+        if not self.clients:
+            return
+            
+        nodes = []
+        links = []
+        
+        for node in self.mesh_graph.nodes(data=True):
+            n_id = node[0]
+            lat, lon = self.node_locations.get(n_id, (0,0))
+            nodes.append({
+                "id": n_id,
+                "status": node[1].get("status", "online"),
+                "lat": lat,
+                "lon": lon
+            })
+            
+        for edge in self.mesh_graph.edges():
+            links.append({"source": edge[0], "target": edge[1]})
+            
+        payload = json.dumps({"type": "TOPOLOGY", "nodes": nodes, "links": links})
+        await self.broadcast(payload)
+
     # ------------------------------------------------------------------ #
     # Serial side
     # ------------------------------------------------------------------ #
     def _open_serial(self) -> serial.Serial:
-        """
-        Open the serial port and hard-reset the ESP32 into run mode
-        (same DTR/RTS pulse that esptool performs). Blocking; run in executor.
-        """
         ser = serial.Serial(self.serial_port, self.baud, timeout=1)
-        ser.dtr = False   # GPIO0 high -> normal boot (not download mode)
+        ser.dtr = False   # GPIO0 high -> normal boot
         ser.rts = True    # EN low -> hold chip in reset
         time.sleep(0.2)
         ser.rts = False   # release reset -> chip boots
@@ -100,17 +148,10 @@ class Bridge:
         return ser
 
     def _read_line(self, ser: serial.Serial) -> bytes:
-        """Blocking line read (run in executor). Returns b'' on timeout."""
         return ser.readline()
 
     @staticmethod
     def _extract_json(line: str) -> str | None:
-        """
-        Return the JSON payload contained in a serial line, or None.
-
-        Accepts both bare JSON lines and lines with a prefix/suffix around the
-        JSON, e.g. 'TOPOLOGY: {"nodeId":123,"subs":[]}'.
-        """
         try:
             json.loads(line)
             return line
@@ -129,10 +170,6 @@ class Bridge:
         return None
 
     async def serial_loop(self):
-        """
-        Continuously read lines from the serial port and broadcast valid JSON.
-        Survives unplugged cables / port errors by retrying forever.
-        """
         loop = asyncio.get_running_loop()
         while True:
             ser = None
@@ -147,18 +184,15 @@ class Bridge:
                 while True:
                     raw = await loop.run_in_executor(None, self._read_line, ser)
                     if not raw:
-                        # Read timeout -- watch for a hung/crashed gateway.
                         now = asyncio.get_event_loop().time()
                         silent_for = now - last_data
                         if silent_for > SILENCE_RESET_S:
-                            # Cycling the port pulses DTR, hard-resetting the
-                            # ESP32 -- recovers a hung/crashed gateway sketch.
                             log.warning(
                                 "No serial data for %.0fs -- cycling %s to "
                                 "auto-reset the gateway ESP32.",
                                 silent_for, self.serial_port,
                             )
-                            break  # close + reopen via the outer loop
+                            break 
                         if not warned_silent and silent_for > SILENCE_WARN_S:
                             log.warning(
                                 "No serial data for %.0fs. Is the gateway sketch "
@@ -177,12 +211,46 @@ class Bridge:
 
                     payload = self._extract_json(line)
                     if payload is None:
-                        # Show raw output so firmware issues are visible.
                         log.info("Serial (non-JSON, ignored): %s", line[:200])
                         continue
 
-                    log.info("MESH -> WS: %s", payload)
-                    await self.broadcast(payload)
+                    # NetworkX Processing Logic
+                    try:
+                        data = json.loads(payload)
+                        
+                        if "node_id" in data and "status" in data:
+                            node_id = data["node_id"]
+                            status = data["status"]
+                            rssi = data.get("parent_rssi", "disconnected")
+                            
+                            self.mesh_graph.add_node(node_id, status=status)
+                            
+                            parent_id = GATEWAY_ID 
+                            if node_id != GATEWAY_ID:
+                                self.mesh_graph.add_edge(parent_id, node_id)
+                                
+                                dist = rssi_to_meters(rssi)
+                                p_lat, p_lon = self.node_locations.get(parent_id, (GATEWAY_LAT, GATEWAY_LON))
+                                self.node_locations[node_id] = calculate_projected_gps(p_lat, p_lon, dist, node_id)
+                            
+                            if status == "JAMMED":
+                                log.warning(f"[NETWORKX] TACTICAL ALERT: Node {node_id} jammed.")
+                                mid_lat = (self.node_locations[parent_id][0] + self.node_locations[node_id][0]) / 2.0
+                                mid_lon = (self.node_locations[parent_id][1] + self.node_locations[node_id][1]) / 2.0
+                                
+                                dispatch_payload = json.dumps({
+                                    "type": "UAV_DISPATCH",
+                                    "target_node": node_id,
+                                    "midpoint": [mid_lat, mid_lon]
+                                })
+                                await self.broadcast(dispatch_payload)
+                                log.info(f"[NETWORKX] Dispatching UAV to {mid_lat}, {mid_lon}...")
+                            
+                            # Broadcast the calculated mapping to the UI
+                            await self.broadcast_topology()
+                            
+                    except Exception as e:
+                        log.error("Error mapping payload: %s", e)
 
             except serial.SerialException as exc:
                 log.error("Serial error (%s). Retrying in %.0fs...", exc, SERIAL_RETRY_DELAY)
@@ -197,13 +265,10 @@ class Bridge:
 
             await asyncio.sleep(SERIAL_RETRY_DELAY)
 
-    # ------------------------------------------------------------------ #
-    # Entry point
-    # ------------------------------------------------------------------ #
     async def run(self):
         async with websockets.serve(self.handle_client, self.ws_host, self.ws_port):
-            log.info("WebSocket server listening on ws://%s:%d", self.ws_host, self.ws_port)
-            await self.serial_loop()  # runs forever
+            log.info("WebSocket C2 server listening on ws://%s:%d", self.ws_host, self.ws_port)
+            await self.serial_loop() 
 
 
 def main():
@@ -220,7 +285,6 @@ def main():
     except KeyboardInterrupt:
         log.info("Bridge stopped by user.")
         sys.exit(0)
-
 
 if __name__ == "__main__":
     main()

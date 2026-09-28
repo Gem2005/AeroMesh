@@ -1,71 +1,60 @@
 "use client";
 
 /**
- * AeroMesh Command — C2-style dashboard for the Self-Healing Ad-Hoc
- * Wireless Network with UAV Bridge.
+ * AeroMesh Command — Palantir-inspired C2 tactical dashboard.
  *
- * Setup:
- *   cd dashboard
- *   npm install
- *   npm run dev                 # dashboard at http://localhost:3000
+ * Replaces the abstract physics graph with a real-time Leaflet map
+ * showing GPS-projected mesh nodes. All FSPL math and graph topology
+ * lives in the Python/NetworkX bridge; this frontend strictly renders
+ * the map and UI panels based on WebSocket instructions.
  *
- * Requires the Python bridge to be running first:
- *   pip install pyserial websockets
- *   python ../bridge.py         # serves ws://localhost:8765 from COM9
- *
- * Performance strategy for rapid WebSocket updates:
- *   - The graphData object identity changes ONLY on structural changes
- *     (join / drop / reroute), never on telemetry ticks.
- *   - Telemetry is mirrored into a ref that canvas callbacks read every
- *     animation frame — live dBm labels & link colors without re-renders.
- *   - Node lifecycle transitions (healthy/degraded/failed) are detected in
- *     the WS handlers, not during render; panels derive via useMemo.
+ * WebSocket payloads:
+ *   TOPOLOGY    → full node/link snapshot with GPS coords
+ *   UAV_DISPATCH → jamming event, triggers tactical alert + UAV injection
  */
 
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  DEGRADED_RSSI,
-  DROP_LINGER_MS,
-  STALE_MS,
-  flattenTopology,
-  idOf,
-  rssiPercent,
-  type GraphData,
-  type GraphLink,
-  type GraphNode,
-  type TelemetryEntry,
-  type TelemetryMap,
-  type TelemetryPacket,
-  type TopologyPacket,
+  type TopoNode,
+  type TopoLink,
+  type TopologyPayload,
+  type DispatchPayload,
+  type AerialRelay,
+  type BridgeMessage,
+  DEFAULT_CENTER,
+  DEFAULT_ZOOM,
+  GATEWAY_ID,
+  UAV_INJECT_DELAY_MS,
+  DISPATCH_PANEL_DURATION_MS,
 } from "@/lib/mesh";
 
-const MeshGraph = dynamic(() => import("@/components/MeshGraph"), {
+/* ------------------------------------------------------------------ */
+/* Dynamic import — Leaflet requires DOM, cannot SSR                   */
+/* ------------------------------------------------------------------ */
+
+const TacticalMap = dynamic(() => import("@/components/TacticalMap"), {
   ssr: false,
   loading: () => (
-    <div className="flex h-full items-center justify-center font-mono text-xs tracking-[0.3em] text-slate-600">
-      INITIALIZING PHYSICS ENGINE
+    <div className="flex h-full w-full items-center justify-center bg-slate-950 font-mono text-xs tracking-[0.3em] text-slate-600">
+      INITIALIZING TACTICAL MAP ENGINE
     </div>
   ),
 });
 
+/* ------------------------------------------------------------------ */
+/* Config                                                              */
+/* ------------------------------------------------------------------ */
+
 const WS_URL = "ws://localhost:8765"; // must match bridge.py --ws-port
 const WS_RETRY_MS = 2000;
-const MAX_EVENTS = 50;
-/** UAV panel stays in critical mode this long after a fracture. */
-const FRACTURE_HOLD_MS = 10000;
+const MAX_EVENTS = 60;
 
 /* ------------------------------------------------------------------ */
-/* Local types                                                         */
+/* Types                                                               */
 /* ------------------------------------------------------------------ */
 
-function isTelemetry(msg: unknown): msg is TelemetryPacket {
-  return typeof msg === "object" && msg !== null && "node_id" in msg;
-}
-function isTopology(msg: unknown): msg is TopologyPacket {
-  return typeof msg === "object" && msg !== null && "nodeId" in msg;
-}
-
+type WsStatus = "connecting" | "connected" | "disconnected";
 type Severity = "info" | "ok" | "warn" | "critical";
 
 interface MeshEvent {
@@ -75,40 +64,43 @@ interface MeshEvent {
   text: string;
 }
 
-type NodeLifecycle = "healthy" | "degraded" | "failed";
-
-interface Fracture {
-  nodeId: number;
-  mid: { x: number; y: number } | null;
-  at: number;
+interface DispatchAlert {
+  targetNode: number;
+  midpoint: [number, number];
+  receivedAt: number;
 }
 
-type WsStatus = "connecting" | "connected" | "disconnected";
-
-const timestamp = () => new Date().toLocaleTimeString("en-GB", { hour12: false });
+const timestamp = () =>
+  new Date().toLocaleTimeString("en-GB", { hour12: false });
 
 /* ================================================================== */
 /* Page                                                                */
 /* ================================================================== */
 
 export default function Home() {
-  const [graphData, setGraphData] = useState<GraphData>({ nodes: [], links: [] });
-  const [telemetry, setTelemetry] = useState<TelemetryMap>({});
+  /* ---- Core state ---- */
+  const [mapCenter, setMapCenter] = useState<[number, number]>(DEFAULT_CENTER);
+  const [nodes, setNodes] = useState<TopoNode[]>([]);
+  const [links, setLinks] = useState<TopoLink[]>([]);
+  const [relay, setRelay] = useState<AerialRelay | null>(null);
   const [wsStatus, setWsStatus] = useState<WsStatus>("connecting");
   const [events, setEvents] = useState<MeshEvent[]>([]);
-  const [fracture, setFracture] = useState<Fracture | null>(null);
-  const [hasTopology, setHasTopology] = useState(false);
+  const [dispatchAlert, setDispatchAlert] = useState<DispatchAlert | null>(null);
 
-  // Refs readable from canvas callbacks / imperative handlers.
-  const telemetryRef = useRef<TelemetryMap>({});
-  const graphRef = useRef<GraphData>({ nodes: [], links: [] });
-  const nodeStateRef = useRef<Record<number, NodeLifecycle>>({});
-  const hasTopologyRef = useRef(false);
   const eventIdRef = useRef(0);
-  const purgeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const dispatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const panelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  /* ---------------- Event log ring buffer ---------------- */
+  /* ---- Geolocation on mount ---- */
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(
+      (pos) => setMapCenter([pos.coords.latitude, pos.coords.longitude]),
+      () => { /* denied — keep DEFAULT_CENTER */ }
+    );
+  }, []);
 
+  /* ---- Event log ring buffer ---- */
   const addEvent = useCallback((severity: Severity, text: string) => {
     const event: MeshEvent = {
       id: ++eventIdRef.current,
@@ -119,193 +111,62 @@ export default function Home() {
     setEvents((prev) =>
       prev.length >= MAX_EVENTS
         ? [...prev.slice(prev.length - MAX_EVENTS + 1), event]
-        : [...prev, event],
+        : [...prev, event]
     );
   }, []);
 
-  /* ---------------- Graph structural updates ---------------- */
+  /* ---- Handle TOPOLOGY payload ---- */
+  const handleTopology = useCallback(
+    (payload: TopologyPayload) => {
+      setNodes(payload.nodes);
+      setLinks(payload.links);
+    },
+    []
+  );
 
-  const linksSignature = (links: GraphLink[]) =>
-    links
-      .map((l) => `${idOf(l.source)}>${idOf(l.target)}`)
-      .sort()
-      .join(",");
+  /* ---- Handle UAV_DISPATCH payload ---- */
+  const handleDispatch = useCallback(
+    (payload: DispatchPayload) => {
+      const alert: DispatchAlert = {
+        targetNode: payload.target_node,
+        midpoint: payload.midpoint,
+        receivedAt: Date.now(),
+      };
+      setDispatchAlert(alert);
 
-  /**
-   * Single entry point for structural changes (real topology packets AND the
-   * telemetry-inferred fallback). Detects joins, drops, and self-heals;
-   * emits events; keeps failed nodes lingering for the drift animation.
-   */
-  const updateGraph = useCallback(
-    (liveNodes: { id: number; isRoot: boolean }[], links: GraphLink[]) => {
-      const prev = graphRef.current;
-      const prevById = new Map(prev.nodes.map((n) => [n.id, n]));
-      const liveIds = new Set(liveNodes.map((n) => n.id));
-      const now = Date.now();
+      addEvent(
+        "critical",
+        `JAMMING DETECTED: Node ${payload.target_node}. UAV dispatch required.`
+      );
 
-      // Skip commit entirely when nothing structural changed — the force
-      // simulation is never reheated by routine telemetry sweeps.
-      const prevOnline = prev.nodes.filter((n) => n.status === "online");
-      const unchanged =
-        prevOnline.length === liveNodes.length &&
-        liveNodes.every(({ id, isRoot }) => {
-          const ex = prevById.get(id);
-          return ex !== undefined && ex.status === "online" && ex.isRoot === isRoot;
-        }) &&
-        linksSignature(prev.links) === linksSignature(links) &&
-        prev.nodes.every(
-          (n) =>
-            n.status !== "dropped" ||
-            now - (n.droppedAt ?? 0) < DROP_LINGER_MS,
+      // Clear any pending timers
+      if (dispatchTimerRef.current) clearTimeout(dispatchTimerRef.current);
+      if (panelTimerRef.current) clearTimeout(panelTimerRef.current);
+
+      // Inject UAV relay marker after 3 seconds
+      dispatchTimerRef.current = setTimeout(() => {
+        const newRelay: AerialRelay = {
+          lat: payload.midpoint[0],
+          lon: payload.midpoint[1],
+          targetNodeId: payload.target_node,
+          injectedAt: Date.now(),
+        };
+        setRelay(newRelay);
+        addEvent(
+          "ok",
+          `AERIAL_RELAY deployed at [${payload.midpoint[0].toFixed(4)}, ${payload.midpoint[1].toFixed(4)}]. Network gap bridged.`
         );
-      if (unchanged) return;
+      }, UAV_INJECT_DELAY_MS);
 
-      // Live nodes: reuse objects so the physics engine keeps positions.
-      const nodes: GraphNode[] = liveNodes.map(({ id, isRoot }) => {
-        const existing = prevById.get(id);
-        if (existing) {
-          if (existing.status === "dropped") {
-            addEvent("ok", `SELF-HEAL: Node ${id} re-established. Topology restored.`);
-            nodeStateRef.current[id] = "healthy";
-            delete existing.droppedAt;
-            existing.kicked = false;
-          }
-          existing.isRoot = isRoot;
-          existing.status = "online";
-          return existing;
-        }
-        if (nodeStateRef.current[id] === "failed") {
-          addEvent("ok", `SELF-HEAL: Node ${id} re-established. Topology restored.`);
-        } else {
-          addEvent("info", `Node ${id} joined the mesh.`);
-        }
-        nodeStateRef.current[id] = "healthy";
-        return { id, isRoot, status: "online" };
-      });
-
-      // Freshly dropped nodes: crimson, severed, linger for the drift.
-      const root = prev.nodes.find((n) => n.isRoot && n.status === "online");
-      for (const node of prev.nodes) {
-        if (liveIds.has(node.id)) continue;
-        if (node.status !== "dropped") {
-          node.status = "dropped";
-          node.droppedAt = now;
-          node.kicked = false;
-          nodeStateRef.current[node.id] = "failed";
-          addEvent(
-            "critical",
-            `CRITICAL: Node ${node.id} lost. Topology fractured. Rerouting…`,
-          );
-          setFracture({
-            nodeId: node.id,
-            mid:
-              node.x !== undefined && root?.x !== undefined
-                ? {
-                    x: (node.x + root.x) / 2,
-                    y: ((node.y ?? 0) + (root.y ?? 0)) / 2,
-                  }
-                : null,
-            at: now,
-          });
-        }
-        if (now - (node.droppedAt ?? now) < DROP_LINGER_MS) nodes.push(node);
-      }
-
-      graphRef.current = { nodes, links };
-      setGraphData({ nodes: [...nodes], links });
-
-      // Purge drifted-out failed nodes after the linger window.
-      if (purgeTimer.current) clearTimeout(purgeTimer.current);
-      purgeTimer.current = setTimeout(() => {
-        const g = graphRef.current;
-        const kept = g.nodes.filter(
-          (n) =>
-            n.status !== "dropped" ||
-            Date.now() - (n.droppedAt ?? 0) < DROP_LINGER_MS,
-        );
-        if (kept.length !== g.nodes.length) {
-          graphRef.current = { nodes: kept, links: g.links };
-          setGraphData({ nodes: [...kept], links: g.links });
-        }
-      }, DROP_LINGER_MS + 250);
+      // Auto-dismiss alert panel
+      panelTimerRef.current = setTimeout(() => {
+        setDispatchAlert(null);
+      }, DISPATCH_PANEL_DURATION_MS);
     },
-    [addEvent],
+    [addEvent]
   );
 
-  /** Real painlessMesh topology packet. */
-  const applyTopology = useCallback(
-    (packet: TopologyPacket) => {
-      if (!hasTopologyRef.current) {
-        hasTopologyRef.current = true;
-        setHasTopology(true);
-      }
-      const { nodes, links } = flattenTopology(packet);
-      updateGraph(nodes, links);
-    },
-    [updateGraph],
-  );
-
-  /**
-   * Fallback while the firmware doesn't print subConnectionJson(): infer a
-   * star topology from telemetry. The node reporting "disconnected" is the
-   * root; entries silent for STALE_MS are treated as lost.
-   */
-  const applyTelemetryFallback = useCallback(() => {
-    const now = Date.now();
-    const entries = Object.values(telemetryRef.current).filter(
-      (e) => now - e.lastSeen < STALE_MS,
-    );
-    const rootId = entries.find((e) => e.parent_rssi === "disconnected")?.node_id;
-    const liveNodes = entries.map((e) => ({
-      id: e.node_id,
-      isRoot: e.node_id === rootId,
-    }));
-    const links: GraphLink[] =
-      rootId === undefined
-        ? []
-        : entries
-            .filter((e) => e.node_id !== rootId)
-            .map((e) => ({ source: rootId, target: e.node_id }));
-    updateGraph(liveNodes, links);
-  }, [updateGraph]);
-
-  /* ---------------- Telemetry + lifecycle transitions ---------------- */
-
-  const handleTelemetry = useCallback(
-    (msg: TelemetryPacket) => {
-      const id = msg.node_id;
-      const entry: TelemetryEntry = { ...msg, lastSeen: Date.now() };
-      telemetryRef.current = { ...telemetryRef.current, [id]: entry };
-      setTelemetry(telemetryRef.current);
-
-      const prevState = nodeStateRef.current[id];
-      if (typeof msg.parent_rssi === "number") {
-        if (msg.parent_rssi < DEGRADED_RSSI) {
-          if (prevState !== "degraded" && prevState !== "failed") {
-            nodeStateRef.current[id] = "degraded";
-            addEvent("warn", `WARN: Node ${id} signal degraded (${msg.parent_rssi} dBm).`);
-          }
-        } else if (prevState === "degraded") {
-          nodeStateRef.current[id] = "healthy";
-          addEvent("ok", `Node ${id} signal restored (${msg.parent_rssi} dBm).`);
-        }
-      }
-
-      if (!hasTopologyRef.current) applyTelemetryFallback();
-    },
-    [addEvent, applyTelemetryFallback],
-  );
-
-  // Periodic stale sweep so silent nodes drop out even with no packets at all.
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (!hasTopologyRef.current) applyTelemetryFallback();
-    }, 2000);
-    return () => clearInterval(interval);
-  }, [applyTelemetryFallback]);
-
-  /* ---------------- WebSocket lifecycle ---------------- */
-
+  /* ---- WebSocket lifecycle ---- */
   useEffect(() => {
     let ws: WebSocket | null = null;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -323,20 +184,25 @@ export default function Home() {
       };
 
       ws.onmessage = (event) => {
-        let msg: unknown;
+        let msg: BridgeMessage;
         try {
           msg = JSON.parse(event.data as string);
         } catch {
           return;
         }
-        if (isTelemetry(msg)) handleTelemetry(msg);
-        else if (isTopology(msg)) applyTopology(msg);
+
+        if (msg.type === "TOPOLOGY") {
+          handleTopology(msg as TopologyPayload);
+        } else if (msg.type === "UAV_DISPATCH") {
+          handleDispatch(msg as DispatchPayload);
+        }
       };
 
       ws.onclose = () => {
         if (disposed) return;
         setWsStatus("disconnected");
-        if (wasConnected) addEvent("warn", "WARN: Bridge uplink lost. Reconnecting…");
+        if (wasConnected)
+          addEvent("warn", "WARN: Bridge uplink lost. Reconnecting…");
         retryTimer = setTimeout(connect, WS_RETRY_MS);
       };
 
@@ -347,126 +213,76 @@ export default function Home() {
     return () => {
       disposed = true;
       if (retryTimer) clearTimeout(retryTimer);
-      if (purgeTimer.current) clearTimeout(purgeTimer.current);
+      if (dispatchTimerRef.current) clearTimeout(dispatchTimerRef.current);
+      if (panelTimerRef.current) clearTimeout(panelTimerRef.current);
       ws?.close();
     };
-  }, [addEvent, applyTopology, handleTelemetry]);
+  }, [addEvent, handleTopology, handleDispatch]);
 
-  /* ---------------- Graph sizing ---------------- */
-
-  const graphContainer = useRef<HTMLDivElement>(null);
-  const [dims, setDims] = useState({ width: 800, height: 600 });
-
-  useEffect(() => {
-    const el = graphContainer.current;
-    if (!el) return;
-    const observer = new ResizeObserver(() =>
-      setDims({ width: el.clientWidth, height: el.clientHeight }),
-    );
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
-
-  /* ---------------- Derived metrics (memoized) ---------------- */
-
+  /* ---- Derived metrics ---- */
   const metrics = useMemo(() => {
-    const onlineNodes = graphData.nodes.filter((n) => n.status === "online");
-    const rssis = onlineNodes
-      .map((n) => telemetry[n.id]?.parent_rssi)
-      .filter((r): r is number => typeof r === "number");
-    const health = rssis.length
-      ? Math.round(rssis.reduce((sum, r) => sum + rssiPercent(r), 0) / rssis.length)
-      : null;
-    const degradedIds = onlineNodes
-      .filter((n) => {
-        const r = telemetry[n.id]?.parent_rssi;
-        return typeof r === "number" && r < DEGRADED_RSSI;
-      })
-      .map((n) => n.id);
-    const droppedNodes = graphData.nodes.filter((n) => n.status === "dropped");
-    return { onlineNodes, health, degradedIds, droppedNodes };
-  }, [graphData, telemetry]);
+    const online = nodes.filter((n) => n.status === "online");
+    const jammed = nodes.filter((n) => n.status === "JAMMED");
+    const gateway = nodes.find((n) => n.id === GATEWAY_ID);
+    return { online, jammed, gateway, total: nodes.length };
+  }, [nodes]);
 
-  const uav = useMemo(() => {
-    const recentFracture =
-      fracture && Date.now() - fracture.at < FRACTURE_HOLD_MS ? fracture : null;
-
-    if (metrics.droppedNodes.length > 0 || recentFracture) {
-      return {
-        level: "critical" as const,
-        targetId: metrics.droppedNodes[0]?.id ?? recentFracture?.nodeId,
-        mid: recentFracture?.mid ?? null,
-      };
-    }
-    if (metrics.degradedIds.length > 0) {
-      const nodeId = metrics.degradedIds[0];
-      const node = graphData.nodes.find((n) => n.id === nodeId);
-      const root = graphData.nodes.find((n) => n.isRoot && n.status === "online");
-      const mid =
-        node?.x !== undefined && root?.x !== undefined
-          ? { x: (node.x + root.x) / 2, y: ((node.y ?? 0) + (root.y ?? 0)) / 2 }
-          : null;
-      return { level: "warn" as const, targetId: nodeId, mid };
-    }
-    return { level: "standby" as const, targetId: undefined, mid: null };
-  }, [metrics, fracture, graphData]);
-
-  const telemetryRows = useMemo(() => {
-    const ids = new Set<number>(graphData.nodes.map((n) => n.id));
-    Object.keys(telemetry).forEach((id) => ids.add(Number(id)));
-    return [...ids]
-      .map((id) => {
-        const node = graphData.nodes.find((n) => n.id === id);
-        const rssi = telemetry[id]?.parent_rssi;
-        const dropped = node === undefined || node.status === "dropped";
-        const degraded =
-          !dropped && typeof rssi === "number" && rssi < DEGRADED_RSSI;
-        return { id, isRoot: node?.isRoot ?? false, dropped, degraded, rssi };
-      })
-      .sort((a, b) => Number(b.isRoot) - Number(a.isRoot) || a.id - b.id);
-  }, [graphData, telemetry]);
-
-  /* ---------------- Render ---------------- */
-
+  /* ---- Render ---- */
   return (
-    <main className="bg-grid relative h-screen w-screen overflow-hidden bg-slate-950 text-slate-300">
-      {/* Full-viewport physics graph */}
-      <div ref={graphContainer} className="absolute inset-0">
-        <MeshGraph
-          graphData={graphData}
-          telemetryRef={telemetryRef}
-          width={dims.width}
-          height={dims.height}
+    <main className="relative h-screen w-screen overflow-hidden bg-slate-950 text-slate-300">
+      {/* Full-viewport tactical map */}
+      <div className="absolute inset-0 z-0">
+        <TacticalMap
+          center={mapCenter}
+          zoom={DEFAULT_ZOOM}
+          nodes={nodes}
+          links={links}
+          relay={relay}
         />
       </div>
 
+      {/* Top bar */}
       <TopBar
         wsStatus={wsStatus}
-        nodeCount={metrics.onlineNodes.length}
-        linkCount={graphData.links.length}
-        inferred={!hasTopology && graphData.nodes.length > 0}
+        nodeCount={metrics.total}
+        linkCount={links.length}
+        onlineCount={metrics.online.length}
+        jammedCount={metrics.jammed.length}
       />
 
-      {/* Top-left: Network Health Index */}
-      <HealthPanel health={metrics.health} />
+      {/* Tactical status panel — top left */}
+      <StatusPanel metrics={metrics} relay={relay} />
 
-      {/* Right column: UAV intervention + telemetry rail */}
-      <div className="pointer-events-none absolute top-16 right-4 bottom-48 flex w-72 flex-col gap-3">
-        <UavPanel uav={uav} />
-        <TelemetryRail rows={telemetryRows} />
-      </div>
+      {/* UAV Dispatch tactical alert — top right, glassmorphism overlay */}
+      {dispatchAlert && (
+        <DispatchPanel
+          alert={dispatchAlert}
+          relay={relay}
+          onDismiss={() => setDispatchAlert(null)}
+        />
+      )}
+
+      {/* Node roster — right side */}
+      <NodeRoster nodes={nodes} />
 
       {/* Bottom: live event log */}
       <EventLog events={events} />
 
       {/* Empty-state hint */}
-      {graphData.nodes.length === 0 && (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-          <p className="font-mono text-xs tracking-[0.35em] text-slate-600">
-            {wsStatus === "connected"
-              ? "AWAITING MESH TELEMETRY"
-              : `NO UPLINK — ${WS_URL}`}
-          </p>
+      {nodes.length === 0 && (
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
+          <div className="glass rounded-lg px-8 py-6 text-center">
+            <div className="mb-2 font-mono text-sm tracking-[0.3em] text-slate-500">
+              {wsStatus === "connected"
+                ? "AWAITING MESH TELEMETRY"
+                : wsStatus === "connecting"
+                  ? "ESTABLISHING UPLINK"
+                  : `NO UPLINK — ${WS_URL}`}
+            </div>
+            <div className="font-mono text-[10px] text-slate-600">
+              Ensure bridge.py is running on the gateway ESP32
+            </div>
+          </div>
         </div>
       )}
     </main>
@@ -481,32 +297,43 @@ function TopBar({
   wsStatus,
   nodeCount,
   linkCount,
-  inferred,
+  onlineCount,
+  jammedCount,
 }: {
   wsStatus: WsStatus;
   nodeCount: number;
   linkCount: number;
-  inferred: boolean;
+  onlineCount: number;
+  jammedCount: number;
 }) {
   return (
-    <header className="glass absolute inset-x-0 top-0 flex h-12 items-center justify-between border-x-0 border-t-0 px-4">
+    <header className="glass absolute inset-x-0 top-0 z-30 flex h-12 items-center justify-between border-x-0 border-t-0 px-4">
       <div className="flex items-baseline gap-3">
         <h1 className="text-sm font-semibold tracking-[0.2em] text-slate-100">
-          AEROMESH <span className="text-sky-400">COMMAND</span>
+          AEROMESH <span className="text-cyan-400">COMMAND</span>
         </h1>
         <span className="hidden font-mono text-[10px] tracking-wider text-slate-500 sm:inline">
-          SELF-HEALING AD-HOC MESH · UAV BRIDGE
+          TACTICAL C2 · SELF-HEALING MESH
         </span>
       </div>
       <div className="flex items-center gap-4 font-mono text-[11px]">
         <span className="text-slate-400">
-          NODES <span className="text-slate-100">{nodeCount}</span>
+          NODES{" "}
+          <span className="text-slate-100">{nodeCount}</span>
         </span>
         <span className="text-slate-400">
-          LINKS <span className="text-slate-100">{linkCount}</span>
+          LINKS{" "}
+          <span className="text-slate-100">{linkCount}</span>
         </span>
-        {inferred && (
-          <span className="text-amber-400/80">TOPOLOGY: INFERRED</span>
+        <span className="text-emerald-400/80">
+          ONLINE{" "}
+          <span className="text-emerald-300">{onlineCount}</span>
+        </span>
+        {jammedCount > 0 && (
+          <span className="animate-pulse text-rose-400">
+            JAMMED{" "}
+            <span className="text-rose-300">{jammedCount}</span>
+          </span>
         )}
         <MissionClock />
         <span
@@ -549,34 +376,37 @@ function MissionClock() {
   return <span className="tracking-widest text-slate-300">{now}</span>;
 }
 
-function HealthPanel({ health }: { health: number | null }) {
+function StatusPanel({
+  metrics,
+  relay,
+}: {
+  metrics: {
+    online: TopoNode[];
+    jammed: TopoNode[];
+    gateway: TopoNode | undefined;
+    total: number;
+  };
+  relay: AerialRelay | null;
+}) {
+  const healthPct = metrics.total > 0
+    ? Math.round((metrics.online.length / metrics.total) * 100)
+    : null;
+
   const SEGMENTS = 24;
-  const active = health === null ? 0 : Math.round((health / 100) * SEGMENTS);
-  const tone =
-    health === null
-      ? "text-slate-500"
-      : health >= 60
-        ? "text-emerald-400"
-        : health >= 30
-          ? "text-amber-400"
-          : "text-rose-400";
-  const barTone =
-    health === null
-      ? "bg-slate-700"
-      : health >= 60
-        ? "bg-emerald-400"
-        : health >= 30
-          ? "bg-amber-400"
-          : "bg-rose-400";
+  const active = healthPct === null ? 0 : Math.round((healthPct / 100) * SEGMENTS);
+  const tone = healthPct === null ? "text-slate-500" : healthPct >= 80 ? "text-emerald-400" : healthPct >= 50 ? "text-amber-400" : "text-rose-400";
+  const barTone = healthPct === null ? "bg-slate-700" : healthPct >= 80 ? "bg-emerald-400" : healthPct >= 50 ? "bg-amber-400" : "bg-rose-400";
 
   return (
-    <section className="glass absolute top-16 left-4 w-64 rounded-sm p-4">
+    <section className="glass absolute top-16 left-4 z-20 w-72 rounded-sm p-4">
       <h2 className="text-[10px] font-semibold tracking-[0.25em] text-slate-400">
-        NETWORK HEALTH INDEX
+        NETWORK STATUS
       </h2>
+
       <p className={`mt-2 font-mono text-4xl font-bold ${tone}`}>
-        {health === null ? "--" : `${health}%`}
+        {healthPct === null ? "--" : `${healthPct}%`}
       </p>
+
       <div className="mt-3 flex gap-[2px]">
         {Array.from({ length: SEGMENTS }).map((_, i) => (
           <div
@@ -585,155 +415,169 @@ function HealthPanel({ health }: { health: number | null }) {
           />
         ))}
       </div>
-      <p className="mt-2 font-mono text-[10px] text-slate-500">
-        MEAN RSSI QUALITY · −100…−40 dBm
-      </p>
+
+      <div className="mt-3 space-y-1 border-t border-slate-700/50 pt-3 font-mono text-[11px]">
+        <div className="flex justify-between">
+          <span className="text-slate-500">GATEWAY</span>
+          <span className={metrics.gateway ? "text-cyan-400" : "text-slate-600"}>
+            {metrics.gateway ? metrics.gateway.id.toString(16).toUpperCase() : "—"}
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-slate-500">ONLINE</span>
+          <span className="text-emerald-400">{metrics.online.length}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-slate-500">JAMMED</span>
+          <span className={metrics.jammed.length > 0 ? "text-rose-400" : "text-slate-600"}>
+            {metrics.jammed.length}
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-slate-500">AERIAL RELAY</span>
+          <span className={relay ? "text-cyan-400" : "text-slate-600"}>
+            {relay ? "ACTIVE" : "STANDBY"}
+          </span>
+        </div>
+      </div>
     </section>
   );
 }
 
-function UavPanel({
-  uav,
+function DispatchPanel({
+  alert,
+  relay,
+  onDismiss,
 }: {
-  uav: {
-    level: "standby" | "warn" | "critical";
-    targetId: number | undefined;
-    mid: { x: number; y: number } | null;
-  };
+  alert: DispatchAlert;
+  relay: AerialRelay | null;
+  onDismiss: () => void;
 }) {
-  const critical = uav.level === "critical";
-  const warn = uav.level === "warn";
+  const elapsed = Date.now() - alert.receivedAt;
+  const injecting = elapsed < UAV_INJECT_DELAY_MS && !relay;
 
   return (
-    <section
-      className={`pointer-events-auto rounded-sm border p-4 ${
-        critical
-          ? "animate-flash-critical"
-          : warn
-            ? "glass border-amber-500/50"
-            : "glass"
-      }`}
-    >
-      <h2 className="text-[10px] font-semibold tracking-[0.25em] text-slate-400">
-        UAV BRIDGE INTERVENTION
-      </h2>
-      {critical ? (
-        <>
-          <p className="mt-2 font-mono text-lg font-bold tracking-wider text-rose-300">
-            UAV DISPATCH REQUIRED
-          </p>
-          <p className="mt-1 font-mono text-[11px] text-rose-200/80">
-            TARGET NODE {uav.targetId ?? "—"} · LINK SEVERED
-          </p>
-        </>
-      ) : warn ? (
-        <>
-          <p className="mt-2 font-mono text-lg font-bold tracking-wider text-amber-300">
-            LINK STRAIN DETECTED
-          </p>
-          <p className="mt-1 font-mono text-[11px] text-amber-200/80">
-            NODE {uav.targetId} BELOW {DEGRADED_RSSI} dBm
-          </p>
-        </>
-      ) : (
-        <>
-          <p className="mt-2 font-mono text-lg font-bold tracking-wider text-emerald-400">
-            STANDBY
-          </p>
-          <p className="mt-1 font-mono text-[11px] text-slate-500">
-            MESH NOMINAL · NO INTERVENTION
-          </p>
-        </>
-      )}
-      <div className="mt-3 border-t border-slate-700/50 pt-2 font-mono text-[11px] text-slate-400">
-        <span className="text-slate-500">DEPLOY MIDPOINT </span>
-        {uav.mid ? (
-          <span className={critical ? "text-rose-300" : warn ? "text-amber-300" : ""}>
-            X {uav.mid.x.toFixed(1)} · Y {uav.mid.y.toFixed(1)}
+    <section className="dispatch-panel absolute top-16 right-4 z-30 w-80 rounded-sm border-2 border-rose-500/80 p-5">
+      {/* Close button */}
+      <button
+        onClick={onDismiss}
+        className="absolute top-2 right-3 font-mono text-[10px] text-slate-500 transition-colors hover:text-slate-300"
+        aria-label="Dismiss"
+      >
+        ✕
+      </button>
+
+      {/* Flash header */}
+      <div className="dispatch-flash mb-3 flex items-center gap-2">
+        <span className="h-2.5 w-2.5 rounded-full bg-rose-500 shadow-[0_0_12px_rgba(244,63,94,0.8)]" />
+        <h2 className="font-mono text-sm font-bold tracking-[0.2em] text-rose-300">
+          UAV DISPATCH REQUIRED
+        </h2>
+      </div>
+
+      {/* Target info */}
+      <div className="space-y-2 font-mono text-[11px]">
+        <div className="flex justify-between">
+          <span className="text-slate-500">TARGET NODE</span>
+          <span className="text-rose-300">
+            {alert.targetNode.toString(16).toUpperCase()}
           </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-slate-500">NODE ID (DEC)</span>
+          <span className="text-rose-300">{alert.targetNode}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-slate-500">DEPLOY COORDS</span>
+          <span className="text-cyan-300">
+            {alert.midpoint[0].toFixed(4)}, {alert.midpoint[1].toFixed(4)}
+          </span>
+        </div>
+      </div>
+
+      {/* Status bar */}
+      <div className="mt-4 border-t border-rose-800/50 pt-3">
+        {injecting ? (
+          <div className="flex items-center gap-2">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-amber-400" />
+            <span className="font-mono text-[10px] tracking-wider text-amber-300">
+              DEPLOYING AERIAL RELAY…
+            </span>
+          </div>
+        ) : relay ? (
+          <div className="flex items-center gap-2">
+            <span className="h-2 w-2 animate-pulse-glow rounded-full bg-cyan-400" />
+            <span className="font-mono text-[10px] tracking-wider text-cyan-300">
+              AERIAL_RELAY ACTIVE — GAP BRIDGED
+            </span>
+          </div>
         ) : (
-          <span>—</span>
+          <div className="flex items-center gap-2">
+            <span className="h-2 w-2 rounded-full bg-rose-500" />
+            <span className="font-mono text-[10px] tracking-wider text-rose-300">
+              AWAITING RELAY DEPLOYMENT
+            </span>
+          </div>
         )}
       </div>
     </section>
   );
 }
 
-function TelemetryRail({
-  rows,
-}: {
-  rows: {
-    id: number;
-    isRoot: boolean;
-    dropped: boolean;
-    degraded: boolean;
-    rssi: number | "disconnected" | undefined;
-  }[];
-}) {
+function NodeRoster({ nodes }: { nodes: TopoNode[] }) {
+  if (nodes.length === 0) return null;
+
+  const sorted = [...nodes].sort((a, b) => {
+    // Gateway first
+    if (a.id === GATEWAY_ID) return -1;
+    if (b.id === GATEWAY_ID) return 1;
+    // Jammed nodes next
+    if (a.status === "JAMMED" && b.status !== "JAMMED") return -1;
+    if (a.status !== "JAMMED" && b.status === "JAMMED") return 1;
+    return a.id - b.id;
+  });
+
   return (
-    <aside className="glass terminal-scroll pointer-events-auto min-h-0 flex-1 overflow-y-auto rounded-sm p-3">
+    <aside className="glass terminal-scroll pointer-events-auto absolute top-64 right-4 bottom-48 z-20 w-72 overflow-y-auto rounded-sm p-3">
       <h2 className="mb-2 text-[10px] font-semibold tracking-[0.25em] text-slate-400">
-        NODE TELEMETRY
+        NODE ROSTER
       </h2>
-      {rows.length === 0 && (
-        <p className="font-mono text-[11px] text-slate-600">NO CONTACTS</p>
-      )}
       <div className="space-y-2">
-        {rows.map((row) => {
-          const dot = row.dropped
-            ? "bg-rose-500"
-            : row.isRoot
-              ? "bg-sky-400"
-              : row.degraded
-                ? "bg-amber-400"
-                : "bg-emerald-400";
-          const pct = typeof row.rssi === "number" ? rssiPercent(row.rssi) : 0;
-          const barColor =
-            pct >= 60 ? "bg-emerald-400" : pct >= 30 ? "bg-amber-400" : "bg-rose-400";
+        {sorted.map((node) => {
+          const isGateway = node.id === GATEWAY_ID;
+          const isJammed = node.status === "JAMMED";
+          const dot = isGateway
+            ? "bg-cyan-400 shadow-[0_0_6px_rgba(34,211,238,0.6)]"
+            : isJammed
+              ? "bg-rose-500 shadow-[0_0_6px_rgba(244,63,94,0.6)]"
+              : "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]";
+
           return (
             <div
-              key={row.id}
+              key={node.id}
               className={`rounded-sm border px-2.5 py-2 ${
-                row.dropped
+                isJammed
                   ? "border-rose-900/60 bg-rose-950/30"
-                  : row.degraded
-                    ? "border-amber-800/50 bg-amber-950/20"
-                    : "border-slate-800 bg-slate-900/50"
+                  : "border-slate-800 bg-slate-900/50"
               }`}
             >
               <div className="flex items-center justify-between">
                 <span className="flex items-center gap-2 font-mono text-[11px] text-slate-200">
                   <span className={`h-1.5 w-1.5 rounded-full ${dot}`} />
-                  {row.id}
+                  {node.id.toString(16).toUpperCase()}
                 </span>
-                <span className="font-mono text-[9px] tracking-wider text-slate-500">
-                  {row.isRoot
-                    ? "GATEWAY"
-                    : row.dropped
-                      ? "LOST"
-                      : row.degraded
-                        ? "DEGRADED"
-                        : "NODE"}
+                <span className={`font-mono text-[9px] tracking-wider ${
+                  isGateway
+                    ? "text-cyan-400"
+                    : isJammed
+                      ? "text-rose-400"
+                      : "text-emerald-400/70"
+                }`}>
+                  {isGateway ? "GATEWAY" : isJammed ? "JAMMED" : "ONLINE"}
                 </span>
               </div>
-              <div className="mt-1.5 flex items-center gap-2">
-                {typeof row.rssi === "number" ? (
-                  <>
-                    <div className="h-1 flex-1 overflow-hidden rounded-full bg-slate-800">
-                      <div
-                        className={`h-full rounded-full transition-all duration-300 ${barColor}`}
-                        style={{ width: `${pct}%` }}
-                      />
-                    </div>
-                    <span className="w-14 text-right font-mono text-[11px] text-slate-300">
-                      {row.rssi} dBm
-                    </span>
-                  </>
-                ) : (
-                  <span className="font-mono text-[10px] text-slate-600">
-                    {row.rssi === "disconnected" ? "ROOT · NO PARENT LINK" : "NO TELEMETRY"}
-                  </span>
-                )}
+              <div className="mt-1 font-mono text-[10px] text-slate-500">
+                {node.lat.toFixed(4)}, {node.lon.toFixed(4)}
               </div>
             </div>
           );
@@ -742,6 +586,10 @@ function TelemetryRail({
     </aside>
   );
 }
+
+/* ------------------------------------------------------------------ */
+/* Event Log                                                           */
+/* ------------------------------------------------------------------ */
 
 const SEVERITY_STYLE: Record<Severity, { tag: string; cls: string }> = {
   info: { tag: "INFO", cls: "text-slate-400" },
@@ -757,7 +605,7 @@ function EventLog({ events }: { events: MeshEvent[] }) {
   }, [events]);
 
   return (
-    <section className="glass absolute inset-x-4 bottom-4 h-40 rounded-sm">
+    <section className="glass absolute inset-x-4 bottom-4 z-20 h-40 rounded-sm">
       <div className="flex h-7 items-center justify-between border-b border-slate-700/50 px-3">
         <h2 className="text-[10px] font-semibold tracking-[0.25em] text-slate-400">
           LIVE EVENT LOG
@@ -779,7 +627,11 @@ function EventLog({ events }: { events: MeshEvent[] }) {
             <span className={SEVERITY_STYLE[e.severity].cls}>
               {SEVERITY_STYLE[e.severity].tag}
             </span>{" "}
-            <span className={e.severity === "critical" ? "text-rose-200" : "text-slate-300"}>
+            <span
+              className={
+                e.severity === "critical" ? "text-rose-200" : "text-slate-300"
+              }
+            >
               {e.text}
             </span>
           </p>

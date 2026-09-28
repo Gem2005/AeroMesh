@@ -12,20 +12,6 @@ body {
 }
 
 /* ------------------------------------------------------------------ */
-/* Tactical grid backdrop                                              */
-/* ------------------------------------------------------------------ */
-.bg-grid {
-  background-image:
-    linear-gradient(rgba(148, 163, 184, 0.055) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(148, 163, 184, 0.055) 1px, transparent 1px),
-    radial-gradient(ellipse at center, rgba(56, 189, 248, 0.05), transparent 65%);
-  background-size:
-    42px 42px,
-    42px 42px,
-    100% 100%;
-}
-
-/* ------------------------------------------------------------------ */
 /* Glassmorphism panels                                                */
 /* ------------------------------------------------------------------ */
 .glass {
@@ -35,12 +21,344 @@ body {
   border: 1px solid rgba(51, 65, 85, 0.45);
 }
 
-/* ------------------------------------------------------------------ */
-/* Alert / glow animations                                             */
-/* ------------------------------------------------------------------ */
-@keyframes flash-critical {
-  0%,
+/* ================================================================== */
+/* TACTICAL MAP MARKER SYSTEM                                          */
+/* ================================================================== */
+
+/* Base marker container */
+.tactical-marker {
+  position: relative;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Core dot */
+.marker-core {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-jetbrains-mono), ui-monospace, monospace;
+  font-size: 6px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  position: relative;
+  z-index: 3;
+}
+
+/* Precision ring */
+.marker-ring {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 1px solid;
+  transform: translate(-50%, -50%);
+  z-index: 2;
+}
+
+/* Animated pulse ring */
+.marker-pulse {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid;
+  transform: translate(-50%, -50%);
+  z-index: 1;
+  opacity: 0;
+}
+
+/* ---- GATEWAY: Glowing Cyan ---- */
+.marker-gateway .marker-core {
+  background: #22d3ee;
+  color: #0a0f1a;
+  box-shadow:
+    0 0 10px rgba(34, 211, 238, 0.6),
+    0 0 25px rgba(34, 211, 238, 0.3),
+    0 0 50px rgba(34, 211, 238, 0.15);
+}
+.marker-gateway .marker-ring {
+  border-color: rgba(34, 211, 238, 0.45);
+  box-shadow: 0 0 8px rgba(34, 211, 238, 0.2);
+}
+.marker-gateway .marker-pulse {
+  border-color: rgba(34, 211, 238, 0.3);
+  animation: gateway-pulse 3s ease-out infinite;
+}
+
+@keyframes gateway-pulse {
+  0% {
+    width: 26px;
+    height: 26px;
+    opacity: 0.6;
+    border-color: rgba(34, 211, 238, 0.5);
+  }
   100% {
+    width: 50px;
+    height: 50px;
+    opacity: 0;
+    border-color: rgba(34, 211, 238, 0);
+  }
+}
+
+/* ---- ONLINE: Glowing Emerald ---- */
+.marker-online .marker-core {
+  background: #34d399;
+  color: #0a0f1a;
+  box-shadow:
+    0 0 8px rgba(52, 211, 153, 0.5),
+    0 0 20px rgba(52, 211, 153, 0.2);
+}
+.marker-online .marker-ring {
+  border-color: rgba(52, 211, 153, 0.35);
+}
+.marker-online .marker-pulse {
+  border-color: rgba(52, 211, 153, 0.2);
+  animation: online-pulse 4s ease-out infinite;
+}
+
+@keyframes online-pulse {
+  0% {
+    width: 22px;
+    height: 22px;
+    opacity: 0.4;
+  }
+  100% {
+    width: 42px;
+    height: 42px;
+    opacity: 0;
+  }
+}
+
+/* ---- JAMMED: Pulsing Crimson ---- */
+.marker-jammed .marker-core {
+  background: #f43f5e;
+  color: #fff;
+  animation: jammed-core-pulse 0.8s ease-in-out infinite alternate;
+  box-shadow:
+    0 0 12px rgba(244, 63, 94, 0.7),
+    0 0 30px rgba(244, 63, 94, 0.4),
+    0 0 60px rgba(244, 63, 94, 0.2);
+}
+.marker-jammed .marker-ring {
+  border-color: rgba(244, 63, 94, 0.6);
+  animation: jammed-ring-pulse 0.8s ease-in-out infinite alternate;
+}
+.marker-jammed .marker-pulse {
+  border-color: rgba(244, 63, 94, 0.5);
+  animation: jammed-expand 1.2s ease-out infinite;
+}
+
+@keyframes jammed-core-pulse {
+  0% {
+    box-shadow:
+      0 0 12px rgba(244, 63, 94, 0.7),
+      0 0 30px rgba(244, 63, 94, 0.4);
+    transform: scale(1);
+  }
+  100% {
+    box-shadow:
+      0 0 20px rgba(244, 63, 94, 1),
+      0 0 50px rgba(244, 63, 94, 0.6),
+      0 0 80px rgba(244, 63, 94, 0.3);
+    transform: scale(1.15);
+  }
+}
+
+@keyframes jammed-ring-pulse {
+  0% {
+    border-color: rgba(244, 63, 94, 0.4);
+    box-shadow: none;
+  }
+  100% {
+    border-color: rgba(244, 63, 94, 0.9);
+    box-shadow: 0 0 12px rgba(244, 63, 94, 0.4);
+  }
+}
+
+@keyframes jammed-expand {
+  0% {
+    width: 28px;
+    height: 28px;
+    opacity: 0.7;
+    border-color: rgba(244, 63, 94, 0.6);
+  }
+  100% {
+    width: 56px;
+    height: 56px;
+    opacity: 0;
+    border-color: rgba(244, 63, 94, 0);
+  }
+}
+
+/* ---- AERIAL RELAY: Pulsing Cyan Triangle ---- */
+.marker-relay .marker-core {
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  background: #22d3ee;
+  color: #0a0f1a;
+  font-size: 10px;
+  transform: rotate(0deg);
+  animation: relay-rotate 6s linear infinite;
+  box-shadow:
+    0 0 14px rgba(34, 211, 238, 0.7),
+    0 0 35px rgba(34, 211, 238, 0.4),
+    0 0 70px rgba(34, 211, 238, 0.2);
+}
+.marker-relay .marker-ring {
+  border-color: rgba(34, 211, 238, 0.5);
+  border-style: dashed;
+  animation: relay-ring-spin 8s linear infinite reverse;
+}
+.marker-relay .marker-pulse {
+  border-color: rgba(34, 211, 238, 0.4);
+  animation: relay-pulse 2s ease-out infinite;
+}
+
+@keyframes relay-rotate {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+@keyframes relay-ring-spin {
+  0% { transform: translate(-50%, -50%) rotate(0deg); }
+  100% { transform: translate(-50%, -50%) rotate(360deg); }
+}
+
+@keyframes relay-pulse {
+  0% {
+    width: 30px;
+    height: 30px;
+    opacity: 0.6;
+    border-color: rgba(34, 211, 238, 0.5);
+  }
+  100% {
+    width: 60px;
+    height: 60px;
+    opacity: 0;
+    border-color: rgba(34, 211, 238, 0);
+  }
+}
+
+/* ================================================================== */
+/* MAP TOOLTIP STYLING                                                 */
+/* ================================================================== */
+
+.tactical-tooltip {
+  background: rgba(15, 23, 42, 0.85) !important;
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(51, 65, 85, 0.6) !important;
+  border-radius: 4px !important;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5) !important;
+  padding: 0 !important;
+  color: #e2e8f0 !important;
+}
+
+.tactical-tooltip::before {
+  border-bottom-color: rgba(51, 65, 85, 0.6) !important;
+}
+
+.relay-tooltip {
+  border-color: rgba(34, 211, 238, 0.4) !important;
+}
+
+.tooltip-content {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 10px;
+  font-family: var(--font-jetbrains-mono), ui-monospace, monospace;
+}
+
+.tooltip-id {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  color: #94a3b8;
+}
+
+.tooltip-hex {
+  font-size: 10px;
+  color: #e2e8f0;
+}
+
+.tooltip-coords {
+  font-size: 9px;
+  color: #64748b;
+}
+
+.relay-label {
+  color: #22d3ee !important;
+}
+
+/* ================================================================== */
+/* DISPATCH PANEL                                                      */
+/* ================================================================== */
+
+.dispatch-panel {
+  background: rgba(15, 23, 42, 0.82);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  animation: dispatch-panel-enter 0.3s ease-out;
+  box-shadow:
+    0 0 30px rgba(244, 63, 94, 0.2),
+    0 0 60px rgba(244, 63, 94, 0.1),
+    inset 0 1px 0 rgba(244, 63, 94, 0.1);
+}
+
+@keyframes dispatch-panel-enter {
+  0% {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.dispatch-flash {
+  animation: dispatch-text-flash 1s ease-in-out infinite;
+}
+
+@keyframes dispatch-text-flash {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* ================================================================== */
+/* SHARED ANIMATIONS                                                   */
+/* ================================================================== */
+
+@keyframes pulse-glow {
+  0%, 100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.animate-pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+@keyframes flash-critical {
+  0%, 100% {
     background-color: rgba(159, 18, 57, 0.22);
     border-color: rgba(244, 63, 94, 0.65);
     box-shadow: 0 0 18px rgba(244, 63, 94, 0.3);
@@ -55,21 +373,48 @@ body {
   animation: flash-critical 0.9s ease-in-out infinite;
 }
 
-@keyframes pulse-glow {
-  0%,
-  100% {
-    opacity: 0.55;
-  }
-  50% {
-    opacity: 1;
-  }
+/* ================================================================== */
+/* LEAFLET OVERRIDES — dark-mode compatibility                         */
+/* ================================================================== */
+
+.leaflet-container {
+  background: #0a0f1a !important;
+  font-family: var(--font-jetbrains-mono), ui-monospace, monospace !important;
 }
-.animate-pulse-glow {
-  animation: pulse-glow 2s ease-in-out infinite;
+
+.leaflet-control-zoom {
+  border: 1px solid rgba(51, 65, 85, 0.5) !important;
+  border-radius: 4px !important;
+  overflow: hidden;
+}
+
+.leaflet-control-zoom a {
+  background: rgba(15, 23, 42, 0.8) !important;
+  color: #94a3b8 !important;
+  border-color: rgba(51, 65, 85, 0.3) !important;
+  backdrop-filter: blur(8px);
+}
+
+.leaflet-control-zoom a:hover {
+  background: rgba(30, 41, 59, 0.9) !important;
+  color: #e2e8f0 !important;
+}
+
+/* Hide default Leaflet attribution */
+.leaflet-control-attribution {
+  display: none !important;
+}
+
+/* Make sure Leaflet tooltip arrows work with dark theme */
+.leaflet-tooltip-top::before {
+  border-top-color: rgba(15, 23, 42, 0.85) !important;
+}
+.leaflet-tooltip-bottom::before {
+  border-bottom-color: rgba(15, 23, 42, 0.85) !important;
 }
 
 /* ------------------------------------------------------------------ */
-/* Terminal-style scrollbars (event log, telemetry rail)               */
+/* Terminal-style scrollbars (event log, node roster)                  */
 /* ------------------------------------------------------------------ */
 .terminal-scroll {
   scrollbar-width: thin;
