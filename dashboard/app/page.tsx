@@ -48,6 +48,8 @@ const TacticalMap = dynamic(() => import("@/components/TacticalMap"), {
   ),
 });
 
+import LeftSidebar from "@/components/LeftSidebar";
+
 /* ------------------------------------------------------------------ */
 /* Config                                                              */
 /* ------------------------------------------------------------------ */
@@ -88,7 +90,8 @@ const timestamp = () =>
 
 export default function Home() {
   /* ---- Core state ---- */
-  const [mapCenter, setMapCenter] = useState<[number, number]>(DEFAULT_CENTER);
+  const [mapCenter] = useState<[number, number]>(DEFAULT_CENTER);
+  const [operatorPosition, setOperatorPosition] = useState<[number, number] | null>(null);
   const [nodes, setNodes] = useState<TopoNode[]>([]);
   const [links, setLinks] = useState<TopoLink[]>([]);
   const [relay, setRelay] = useState<AerialRelay | null>(null);
@@ -101,16 +104,10 @@ export default function Home() {
   /* Feature 2: Human-in-the-loop dispatch */
   const [pendingDispatch, setPendingDispatch] = useState<PendingDispatch | null>(null);
 
-  const eventIdRef = useRef(0);
+  /* Sidebar state: expanded vs contracted */
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
-  /* ---- Geolocation on mount ---- */
-  useEffect(() => {
-    if (!navigator.geolocation) return;
-    navigator.geolocation.getCurrentPosition(
-      (pos) => setMapCenter([pos.coords.latitude, pos.coords.longitude]),
-      () => { /* denied — keep DEFAULT_CENTER */ }
-    );
-  }, []);
+  const eventIdRef = useRef(0);
 
   /* ---- Event log ---- */
   const addEvent = useCallback((severity: Severity, text: string) => {
@@ -128,6 +125,39 @@ export default function Home() {
   }, []);
 
   const clearEvents = useCallback(() => setEvents([]), []);
+
+  /* ---- Geolocation on mount & live watch (operator position) ---- */
+  useEffect(() => {
+    if (!navigator.geolocation) {
+      addEvent("warn", "Geolocation API not supported by browser");
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const coords: [number, number] = [pos.coords.latitude, pos.coords.longitude];
+        setOperatorPosition(coords);
+        addEvent("ok", `OPERATOR GPS LOCK: ${coords[0].toFixed(4)}, ${coords[1].toFixed(4)}`);
+      },
+      (err) => {
+        addEvent("warn", `Operator GPS pending/denied: ${err.message}`);
+      },
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+
+    const watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        const coords: [number, number] = [pos.coords.latitude, pos.coords.longitude];
+        setOperatorPosition(coords);
+      },
+      () => {},
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000 }
+    );
+
+    return () => {
+      navigator.geolocation.clearWatch(watchId);
+    };
+  }, [addEvent]);
 
   /* ---- Handle TOPOLOGY payload ---- */
   const handleTopology = useCallback(
@@ -302,26 +332,20 @@ export default function Home() {
   /* ---- Render ---- */
   return (
     <main className="relative h-screen w-screen overflow-hidden bg-slate-950 text-slate-300">
-      {/* Full-viewport tactical map */}
+      {/* Tactical Leaflet Map Engine - Full Screen Base Layer under Glass HUD */}
       <div className="absolute inset-0 z-0">
         <TacticalMap
-          center={mapCenter}
+          center={operatorPosition ?? mapCenter}
           zoom={DEFAULT_ZOOM}
           nodes={nodes}
           links={links}
           relay={relay}
+          operatorPosition={operatorPosition}
           onNodeClick={handleNodeClick}
         />
       </div>
 
-      {/* Feature 1: Node Inspector — sliding left panel (outside MapContainer) */}
-      <NodeInspector
-        node={inspectedNode}
-        onClose={() => setSelectedNode(null)}
-        onForceSignalLoss={forceSignalLoss}
-      />
-
-      {/* Top bar */}
+      {/* Top bar (Header - Frosted Glass HUD) */}
       <TopBar
         wsStatus={wsStatus}
         nodeCount={metrics.total}
@@ -330,42 +354,82 @@ export default function Home() {
         jammedCount={metrics.jammed.length}
       />
 
-      {/* Tactical status panel — top left */}
-      <StatusPanel metrics={metrics} relay={relay} />
+      {/* Main split viewport: Left Sidebar (Image 1) | Map & Tactical Space (Image 2) */}
+      <div className="pointer-events-none relative flex h-[calc(100vh-3rem)] w-full overflow-hidden">
+        {/* Left Column: Dedicated Tactical Sidebar (Frosted Glass Panel) */}
+        <div className="pointer-events-auto h-full shrink-0">
+          <LeftSidebar
+            metrics={metrics}
+            nodes={nodes}
+            linksCount={links.length}
+            relay={relay}
+            operatorPosition={operatorPosition}
+            onSelectNode={setSelectedNode}
+            collapsed={sidebarCollapsed}
+            onToggleCollapse={() => setSidebarCollapsed((prev) => !prev)}
+          />
+        </div>
 
-      {/* Feature 2: Human-in-the-loop dispatch panel — top right */}
-      {pendingDispatch && (
-        <DispatchPanel
-          dispatch={pendingDispatch}
-          relay={relay}
-          onAuthorize={authorizeDeployment}
-          onDismiss={() => setPendingDispatch(null)}
-        />
-      )}
+        {/* Feature 1: Node Inspector (slides in over left sidebar when a node is clicked) */}
+        <div className="pointer-events-auto">
+          <NodeInspector
+            node={inspectedNode}
+            onClose={() => setSelectedNode(null)}
+            onForceSignalLoss={forceSignalLoss}
+          />
+        </div>
 
-      {/* Node roster — right side */}
-      <NodeRoster nodes={nodes} />
-
-      {/* Feature 3: Live event terminal — bottom anchored */}
-      <EventTerminal events={events} onClear={clearEvents} />
-
-      {/* Empty-state hint */}
-      {nodes.length === 0 && (
-        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
-          <div className="glass rounded-lg px-8 py-6 text-center">
-            <div className="mb-2 font-mono text-sm tracking-[0.3em] text-slate-500">
-              {wsStatus === "connected"
-                ? "AWAITING MESH TELEMETRY"
-                : wsStatus === "connecting"
-                  ? "ESTABLISHING UPLINK"
-                  : `NO UPLINK — ${WS_URL}`}
+        {/* Right Column: Tactical Map HUD Area (Flexes and increases size to the left when sidebar contracts!) */}
+        <div className="pointer-events-none relative flex-1 h-full overflow-hidden">
+          {/* Telemetry status hint banner — docked at top-center of map area */}
+          {nodes.length === 0 && (
+            <div className="pointer-events-auto absolute top-4 inset-x-0 z-20 flex justify-center px-4">
+              <div className="glass flex items-center gap-3 rounded-full border border-white/15 px-5 py-2 shadow-2xl backdrop-blur-md">
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    wsStatus === "connected"
+                      ? "animate-pulse bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.9)]"
+                      : wsStatus === "connecting"
+                        ? "animate-pulse bg-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.9)]"
+                        : "bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.9)]"
+                  }`}
+                />
+                <div className="flex flex-col text-left">
+                  <span className="font-mono text-[11px] font-semibold tracking-[0.2em] text-slate-200">
+                    {wsStatus === "connected"
+                      ? "AWAITING MESH TELEMETRY"
+                      : wsStatus === "connecting"
+                        ? "ESTABLISHING UPLINK"
+                        : `NO UPLINK — ${WS_URL}`}
+                  </span>
+                  <span className="font-mono text-[9px] tracking-wider text-slate-400">
+                    {wsStatus === "connected"
+                      ? "Operator GPS locked · Listening for ESP32 gateway telemetry"
+                      : "Ensure bridge.py is running on the gateway ESP32"}
+                  </span>
+                </div>
+              </div>
             </div>
-            <div className="font-mono text-[10px] text-slate-600">
-              Ensure bridge.py is running on the gateway ESP32
+          )}
+
+          {/* Feature 2: Human-in-the-loop dispatch panel — alert when dispatch requested */}
+          {pendingDispatch && (
+            <div className="pointer-events-auto">
+              <DispatchPanel
+                dispatch={pendingDispatch}
+                relay={relay}
+                onAuthorize={authorizeDeployment}
+                onDismiss={() => setPendingDispatch(null)}
+              />
             </div>
+          )}
+
+          {/* Feature 3: Live event terminal — docked at bottom of map area */}
+          <div className="pointer-events-auto">
+            <EventTerminal events={events} onClear={clearEvents} />
           </div>
         </div>
-      )}
+      </div>
     </main>
   );
 }
@@ -389,8 +453,10 @@ function NodeInspector({
 
   return (
     <div
-      className={`inspector-panel absolute top-12 bottom-0 left-0 z-40 w-80 border-r border-slate-800 transition-transform duration-300 ease-out ${
-        isOpen ? "translate-x-0" : "-translate-x-full"
+      className={`inspector-panel absolute top-0 bottom-0 left-0 z-40 w-80 border-r border-slate-800 transition-all duration-300 ease-out ${
+        isOpen
+          ? "translate-x-0 opacity-100 pointer-events-auto"
+          : "-translate-x-full opacity-0 pointer-events-none"
       }`}
     >
       {node && (
@@ -532,42 +598,40 @@ function TopBar({
   jammedCount: number;
 }) {
   return (
-    <header className="glass absolute inset-x-0 top-0 z-30 flex h-12 items-center justify-between border-x-0 border-t-0 px-4">
+    <header className="glass relative z-30 flex h-12 w-full shrink-0 items-center justify-between border-b border-white/10 px-4">
       <div className="flex items-baseline gap-3">
         <h1 className="text-sm font-semibold tracking-[0.2em] text-slate-100">
           AEROMESH <span className="text-cyan-400">COMMAND</span>
         </h1>
-        <span className="hidden font-mono text-[10px] tracking-wider text-slate-500 sm:inline">
+        <span className="hidden font-mono text-[10px] tracking-wider text-slate-400 sm:inline">
           TACTICAL C2 · SELF-HEALING MESH
         </span>
       </div>
-      <div className="flex items-center gap-4 font-mono text-[11px]">
-        <span className="text-slate-400">
-          NODES{" "}
-          <span className="text-slate-100">{nodeCount}</span>
+      <div className="flex items-center gap-3 font-mono text-[11px]">
+        <span className="glass-pill rounded px-2 py-0.5 text-slate-300">
+          NODES <span className="text-white font-bold">{nodeCount}</span>
         </span>
-        <span className="text-slate-400">
-          LINKS{" "}
-          <span className="text-slate-100">{linkCount}</span>
+        <span className="glass-pill rounded px-2 py-0.5 text-slate-300">
+          LINKS <span className="text-cyan-300 font-bold">{linkCount}</span>
         </span>
-        <span className="text-emerald-400/80">
-          ONLINE{" "}
-          <span className="text-emerald-300">{onlineCount}</span>
+        <span className="glass-pill rounded px-2 py-0.5 border-emerald-500/30 text-emerald-300">
+          ONLINE <span className="text-emerald-200 font-bold">{onlineCount}</span>
         </span>
         {jammedCount > 0 && (
-          <span className="animate-pulse text-rose-400">
-            JAMMED{" "}
-            <span className="text-rose-300">{jammedCount}</span>
+          <span className="glass-pill animate-pulse rounded px-2 py-0.5 border-rose-500/40 text-rose-300 shadow-[0_0_10px_rgba(244,63,94,0.3)]">
+            JAMMED <span className="text-rose-200 font-bold">{jammedCount}</span>
           </span>
         )}
-        <MissionClock />
+        <span className="glass-pill rounded px-2.5 py-0.5">
+          <MissionClock />
+        </span>
         <span
-          className={`flex items-center gap-1.5 rounded-sm border px-2 py-0.5 tracking-wider ${
+          className={`glass-pill flex items-center gap-1.5 rounded px-2.5 py-0.5 tracking-wider font-semibold ${
             wsStatus === "connected"
-              ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+              ? "border-emerald-500/50 text-emerald-300 shadow-[0_0_12px_rgba(52,211,153,0.25)]"
               : wsStatus === "connecting"
-                ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
-                : "border-rose-500/40 bg-rose-500/10 text-rose-300"
+                ? "border-amber-500/50 text-amber-300 shadow-[0_0_12px_rgba(251,191,36,0.25)]"
+                : "border-rose-500/50 text-rose-300 shadow-[0_0_12px_rgba(244,63,94,0.25)]"
           }`}
         >
           <span
@@ -601,73 +665,7 @@ function MissionClock() {
   return <span className="tracking-widest text-slate-300">{now}</span>;
 }
 
-function StatusPanel({
-  metrics,
-  relay,
-}: {
-  metrics: {
-    online: TopoNode[];
-    jammed: TopoNode[];
-    gateway: TopoNode | undefined;
-    total: number;
-  };
-  relay: AerialRelay | null;
-}) {
-  const healthPct = metrics.total > 0
-    ? Math.round((metrics.online.length / metrics.total) * 100)
-    : null;
 
-  const SEGMENTS = 24;
-  const active = healthPct === null ? 0 : Math.round((healthPct / 100) * SEGMENTS);
-  const tone = healthPct === null ? "text-slate-500" : healthPct >= 80 ? "text-emerald-400" : healthPct >= 50 ? "text-amber-400" : "text-rose-400";
-  const barTone = healthPct === null ? "bg-slate-700" : healthPct >= 80 ? "bg-emerald-400" : healthPct >= 50 ? "bg-amber-400" : "bg-rose-400";
-
-  return (
-    <section className="glass absolute top-16 left-4 z-20 w-72 rounded-sm p-4">
-      <h2 className="text-[10px] font-semibold tracking-[0.25em] text-slate-400">
-        NETWORK STATUS
-      </h2>
-
-      <p className={`mt-2 font-mono text-4xl font-bold ${tone}`}>
-        {healthPct === null ? "--" : `${healthPct}%`}
-      </p>
-
-      <div className="mt-3 flex gap-[2px]">
-        {Array.from({ length: SEGMENTS }).map((_, i) => (
-          <div
-            key={i}
-            className={`h-3 flex-1 rounded-[1px] ${i < active ? barTone : "bg-slate-800"}`}
-          />
-        ))}
-      </div>
-
-      <div className="mt-3 space-y-1 border-t border-slate-700/50 pt-3 font-mono text-[11px]">
-        <div className="flex justify-between">
-          <span className="text-slate-500">GATEWAY</span>
-          <span className={metrics.gateway ? "text-cyan-400" : "text-slate-600"}>
-            {metrics.gateway ? metrics.gateway.id.toString(16).toUpperCase() : "—"}
-          </span>
-        </div>
-        <div className="flex justify-between">
-          <span className="text-slate-500">ONLINE</span>
-          <span className="text-emerald-400">{metrics.online.length}</span>
-        </div>
-        <div className="flex justify-between">
-          <span className="text-slate-500">JAMMED</span>
-          <span className={metrics.jammed.length > 0 ? "text-rose-400" : "text-slate-600"}>
-            {metrics.jammed.length}
-          </span>
-        </div>
-        <div className="flex justify-between">
-          <span className="text-slate-500">AERIAL RELAY</span>
-          <span className={relay ? "text-cyan-400" : "text-slate-600"}>
-            {relay ? "ACTIVE" : "STANDBY"}
-          </span>
-        </div>
-      </div>
-    </section>
-  );
-}
 
 /* ================================================================== */
 /* Feature 2: Human-in-the-Loop Dispatch Panel                         */
@@ -689,7 +687,7 @@ function DispatchPanel({
   const isDeployed = relay !== null;
 
   return (
-    <section className="dispatch-panel absolute top-16 right-4 z-30 w-80 rounded-sm border-2 border-rose-500/80 p-5">
+    <section className="dispatch-panel glass absolute top-16 right-4 z-30 w-80 rounded-md border border-rose-500/80 p-5 shadow-[0_8px_32px_rgba(244,63,94,0.35)]">
       {/* Close button */}
       <button
         onClick={onDismiss}
@@ -784,8 +782,14 @@ function DispatchPanel({
 /* Node Roster                                                         */
 /* ================================================================== */
 
-function NodeRoster({ nodes }: { nodes: TopoNode[] }) {
-  if (nodes.length === 0) return null;
+function NodeRoster({
+  nodes,
+  operatorPosition,
+}: {
+  nodes: TopoNode[];
+  operatorPosition: [number, number] | null;
+}) {
+  if (nodes.length === 0 && !operatorPosition) return null;
 
   const sorted = [...nodes].sort((a, b) => {
     if (a.id === GATEWAY_ID) return -1;
@@ -798,9 +802,26 @@ function NodeRoster({ nodes }: { nodes: TopoNode[] }) {
   return (
     <aside className="glass terminal-scroll pointer-events-auto absolute top-64 right-4 bottom-48 z-20 w-72 overflow-y-auto rounded-sm p-3">
       <h2 className="mb-2 text-[10px] font-semibold tracking-[0.25em] text-slate-400">
-        NODE ROSTER
+        NETWORK ROSTER
       </h2>
       <div className="space-y-2">
+        {/* Operator Workstation */}
+        {operatorPosition && (
+          <div className="rounded-sm border border-amber-900/50 bg-amber-950/20 px-2.5 py-2">
+            <div className="flex items-center justify-between">
+              <span className="flex items-center gap-2 font-mono text-[11px] text-amber-200">
+                <span className="h-1.5 w-1.5 rotate-45 bg-amber-400 shadow-[0_0_6px_rgba(245,158,11,0.8)]" />
+                OPERATOR (C2)
+              </span>
+              <span className="font-mono text-[9px] tracking-wider text-amber-400">
+                STATION
+              </span>
+            </div>
+            <div className="mt-1 font-mono text-[10px] text-slate-400">
+              {operatorPosition[0].toFixed(4)}, {operatorPosition[1].toFixed(4)}
+            </div>
+          </div>
+        )}
         {sorted.map((node) => {
           const isGateway = node.id === GATEWAY_ID;
           const isJammed = node.status === "JAMMED";
@@ -869,25 +890,25 @@ function EventTerminal({
   }, [events]);
 
   return (
-    <section className="event-terminal absolute inset-x-4 bottom-4 z-20 rounded-sm">
-      <div className="flex h-7 items-center justify-between border-b border-slate-700/50 px-3">
+    <section className="event-terminal glass-terminal absolute inset-x-4 bottom-4 z-20 rounded-md overflow-hidden">
+      <div className="flex h-7 items-center justify-between border-b border-white/10 px-3">
         <div className="flex items-center gap-3">
-          <h2 className="text-[10px] font-semibold tracking-[0.25em] text-slate-400">
+          <h2 className="text-[10px] font-semibold tracking-[0.25em] text-slate-200">
             EVENT TERMINAL
           </h2>
-          <div className="flex gap-1">
-            <span className="h-1.5 w-1.5 rounded-full bg-rose-500/80" />
-            <span className="h-1.5 w-1.5 rounded-full bg-amber-500/80" />
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500/80" />
+          <div className="flex gap-1.5">
+            <span className="h-1.5 w-1.5 rounded-full bg-rose-500/90 shadow-[0_0_6px_rgba(244,63,94,0.7)]" />
+            <span className="h-1.5 w-1.5 rounded-full bg-amber-500/90 shadow-[0_0_6px_rgba(251,191,36,0.7)]" />
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500/90 shadow-[0_0_6px_rgba(52,211,153,0.7)]" />
           </div>
         </div>
         <div className="flex items-center gap-3">
-          <span className="font-mono text-[9px] text-slate-600">
+          <span className="glass-pill rounded px-1.5 py-0.2 font-mono text-[9px] text-slate-300">
             {events.length}/{MAX_EVENTS}
           </span>
           <button
             onClick={onClear}
-            className="rounded border border-slate-700/60 px-2 py-0.5 font-mono text-[9px] tracking-wider text-slate-500 transition-all hover:border-slate-500 hover:text-slate-300"
+            className="glass-pill rounded px-2 py-0.5 font-mono text-[9px] tracking-wider text-slate-300 transition-all hover:border-white/30 hover:text-white"
           >
             CLEAR
           </button>
