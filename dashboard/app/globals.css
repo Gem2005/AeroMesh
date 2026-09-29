@@ -145,7 +145,7 @@ body {
 /* ================================================================== */
 
 .inspector-panel {
-  background: linear-gradient(135deg, rgba(255, 255, 255, 0.04) 0%, rgba(255, 255, 255, 0.01) 100%), rgba(2, 6, 23, 0.82);
+  background: linear-gradient(135deg, rgba(15, 23, 42, 1) 0%, rgba(2, 6, 23, 1) 100%);
   backdrop-filter: blur(24px) saturate(200%);
   -webkit-backdrop-filter: blur(24px) saturate(200%);
   border-right: 1px solid rgba(255, 255, 255, 0.12);
@@ -415,6 +415,22 @@ body {
     opacity: 0;
     border-color: rgba(244, 63, 94, 0);
   }
+}
+
+/* ---- OFFLINE: Dim Slate (telemetry lost) ---- */
+.marker-offline .marker-core {
+  background: #475569;
+  color: #cbd5e1;
+  font-size: 8px;
+  box-shadow: 0 0 6px rgba(71, 85, 105, 0.5);
+  opacity: 0.9;
+}
+.marker-offline .marker-ring {
+  border-color: rgba(100, 116, 139, 0.4);
+  border-style: dashed;
+}
+.marker-offline .marker-pulse {
+  display: none;
 }
 
 /* ---- AERIAL RELAY: Pulsing Cyan Triangle ---- */

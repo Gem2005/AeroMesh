@@ -108,6 +108,13 @@ export default function Home() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   const eventIdRef = useRef(0);
+  const wsRef = useRef<WebSocket | null>(null);
+  const operatorPositionRef = useRef<[number, number] | null>(null);
+
+  // Keep the ref in sync with state so the WS onopen handler can access it
+  useEffect(() => {
+    operatorPositionRef.current = operatorPosition;
+  }, [operatorPosition]);
 
   /* ---- Event log ---- */
   const addEvent = useCallback((severity: Severity, text: string) => {
@@ -133,10 +140,19 @@ export default function Home() {
       return;
     }
 
+    const sendGpsToBridge = (coords: [number, number]) => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({ type: "OPERATOR_GPS", lat: coords[0], lon: coords[1] })
+        );
+      }
+    };
+
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         const coords: [number, number] = [pos.coords.latitude, pos.coords.longitude];
         setOperatorPosition(coords);
+        sendGpsToBridge(coords);
         addEvent("ok", `OPERATOR GPS LOCK: ${coords[0].toFixed(4)}, ${coords[1].toFixed(4)}`);
       },
       (err) => {
@@ -149,6 +165,7 @@ export default function Home() {
       (pos) => {
         const coords: [number, number] = [pos.coords.latitude, pos.coords.longitude];
         setOperatorPosition(coords);
+        sendGpsToBridge(coords);
       },
       () => {},
       { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000 }
@@ -163,11 +180,31 @@ export default function Home() {
   const handleTopology = useCallback(
     (payload: TopologyPayload) => {
       setNodes((prev) => {
-        // Log new nodes joining
-        const prevIds = new Set(prev.map((n) => n.id));
+        const prevById = new Map(prev.map((n) => [n.id, n]));
         for (const n of payload.nodes) {
-          if (!prevIds.has(n.id)) {
-            addEvent("info", `NODE JOINED: ${n.id.toString(16).toUpperCase()} (${n.id})`);
+          const before = prevById.get(n.id);
+          if (!before) {
+            // New node joined
+            const sigInfo = n.rssi != null
+              ? ` | RSSI: ${n.rssi} dBm | DIST: ${n.distance_m?.toFixed(1)}m`
+              : "";
+            addEvent("info", `NODE JOINED: ${n.id.toString(16).toUpperCase()} (${n.id})${sigInfo}`);
+          } else if (before.status !== n.status) {
+            // Status transition — the self-healing story
+            const hex = n.id.toString(16).toUpperCase();
+            if (n.status === "OFFLINE") {
+              addEvent("critical", `NODE LOST: ${hex} — telemetry timeout. Topology fractured.`);
+            } else if (n.status === "online" && before.status === "OFFLINE") {
+              addEvent("ok", `SELF-HEAL: ${hex} re-established. Topology restored.`);
+            } else if (n.status === "online" && before.status === "JAMMED") {
+              addEvent("ok", `SIGNAL RESTORED: ${hex} back online.`);
+            }
+          }
+        }
+        // Nodes removed from the topology entirely
+        for (const old of prev) {
+          if (!payload.nodes.some((n) => n.id === old.id)) {
+            addEvent("warn", `NODE REMOVED: ${old.id.toString(16).toUpperCase()} dropped from topology.`);
           }
         }
         return payload.nodes;
@@ -279,6 +316,18 @@ export default function Home() {
         wasConnected = true;
         setWsStatus("connected");
         addEvent("info", `WS CONNECTED (${WS_URL})`);
+        wsRef.current = ws;
+
+        // Send current operator GPS to bridge immediately on connect
+        if (operatorPositionRef.current) {
+          ws?.send(
+            JSON.stringify({
+              type: "OPERATOR_GPS",
+              lat: operatorPositionRef.current[0],
+              lon: operatorPositionRef.current[1],
+            })
+          );
+        }
       };
 
       ws.onmessage = (event) => {
@@ -299,6 +348,7 @@ export default function Home() {
       ws.onclose = () => {
         if (disposed) return;
         setWsStatus("disconnected");
+        wsRef.current = null;
         if (wasConnected)
           addEvent("warn", "Bridge uplink lost. Reconnecting…");
         retryTimer = setTimeout(connect, WS_RETRY_MS);
@@ -318,15 +368,22 @@ export default function Home() {
   /* ---- Keep selectedNode in sync with live topology ---- */
   const inspectedNode = useMemo(() => {
     if (!selectedNode) return null;
-    return nodes.find((n) => n.id === selectedNode.id) ?? selectedNode;
+    return nodes.find((n) => n.id === selectedNode.id) ?? null;
   }, [selectedNode, nodes]);
+
+  useEffect(() => {
+    if (selectedNode && !nodes.some((n) => n.id === selectedNode.id)) {
+      setSelectedNode(null);
+    }
+  }, [nodes, selectedNode]);
 
   /* ---- Derived metrics ---- */
   const metrics = useMemo(() => {
     const online = nodes.filter((n) => n.status === "online");
     const jammed = nodes.filter((n) => n.status === "JAMMED");
+    const offline = nodes.filter((n) => n.status === "OFFLINE");
     const gateway = nodes.find((n) => n.id === GATEWAY_ID);
-    return { online, jammed, gateway, total: nodes.length };
+    return { online, jammed, offline, gateway, total: nodes.length };
   }, [nodes]);
 
   /* ---- Render ---- */
@@ -352,9 +409,10 @@ export default function Home() {
         linkCount={links.length}
         onlineCount={metrics.online.length}
         jammedCount={metrics.jammed.length}
+        offlineCount={metrics.offline.length}
       />
 
-      {/* Main split viewport: Left Sidebar (Image 1) | Map & Tactical Space (Image 2) */}
+      {/* Main split viewport: Left Sidebar | Node Inspector | Map & Tactical Space */}
       <div className="pointer-events-none relative flex h-[calc(100vh-3rem)] w-full overflow-hidden">
         {/* Left Column: Dedicated Tactical Sidebar (Frosted Glass Panel) */}
         <div className="pointer-events-auto h-full shrink-0">
@@ -364,14 +422,14 @@ export default function Home() {
             linksCount={links.length}
             relay={relay}
             operatorPosition={operatorPosition}
-            onSelectNode={setSelectedNode}
+            onSelectNode={handleNodeClick}
             collapsed={sidebarCollapsed}
             onToggleCollapse={() => setSidebarCollapsed((prev) => !prev)}
           />
         </div>
 
-        {/* Feature 1: Node Inspector (slides in over left sidebar when a node is clicked) */}
-        <div className="pointer-events-auto">
+        {/* Feature 1: Node Inspector — slides in beside the sidebar, not on top */}
+        <div className="pointer-events-auto h-full shrink-0">
           <NodeInspector
             node={inspectedNode}
             onClose={() => setSelectedNode(null)}
@@ -379,7 +437,7 @@ export default function Home() {
           />
         </div>
 
-        {/* Right Column: Tactical Map HUD Area (Flexes and increases size to the left when sidebar contracts!) */}
+        {/* Right Column: Tactical Map HUD Area */}
         <div className="pointer-events-none relative flex-1 h-full overflow-hidden">
           {/* Telemetry status hint banner — docked at top-center of map area */}
           {nodes.length === 0 && (
@@ -450,17 +508,16 @@ function NodeInspector({
   const isOpen = node !== null;
   const isGateway = node?.id === GATEWAY_ID;
   const isJammed = node?.status === "JAMMED";
+  const isOffline = node?.status === "OFFLINE";
 
   return (
     <div
-      className={`inspector-panel absolute top-0 bottom-0 left-0 z-40 w-80 border-r border-slate-800 transition-all duration-300 ease-out ${
-        isOpen
-          ? "translate-x-0 opacity-100 pointer-events-auto"
-          : "-translate-x-full opacity-0 pointer-events-none"
+      className={`inspector-panel h-full border-r border-slate-800 transition-all duration-300 ease-out overflow-hidden ${
+        isOpen ? "w-80 opacity-100" : "w-0 opacity-0"
       }`}
     >
       {node && (
-        <div className="flex h-full flex-col p-5">
+        <div className="flex h-full w-80 flex-col p-5">
           {/* Header */}
           <div className="mb-5 flex items-start justify-between">
             <div>
@@ -474,7 +531,9 @@ function NodeInspector({
                       ? "bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.6)]"
                       : isJammed
                         ? "bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.6)] animate-pulse"
-                        : "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]"
+                        : isOffline
+                          ? "bg-slate-500"
+                          : "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]"
                   }`}
                 />
                 <span
@@ -483,10 +542,18 @@ function NodeInspector({
                       ? "text-cyan-400"
                       : isJammed
                         ? "text-rose-400"
-                        : "text-emerald-400"
+                        : isOffline
+                          ? "text-slate-400"
+                          : "text-emerald-400"
                   }`}
                 >
-                  {isGateway ? "GATEWAY" : isJammed ? "JAMMED" : "ONLINE"}
+                  {isGateway
+                    ? "GATEWAY"
+                    : isJammed
+                      ? "JAMMED"
+                      : isOffline
+                        ? "OFFLINE"
+                        : "ONLINE"}
                 </span>
               </div>
             </div>
@@ -523,10 +590,18 @@ function NodeInspector({
                     ? "text-cyan-400"
                     : isJammed
                       ? "text-rose-400"
-                      : "text-emerald-400"
+                      : isOffline
+                        ? "text-slate-400"
+                        : "text-emerald-400"
                 }`}
               >
-                {isGateway ? "GATEWAY (ROOT)" : isJammed ? "JAMMED — SIGNAL LOST" : "ONLINE — NOMINAL"}
+                {isGateway
+                  ? "GATEWAY (ROOT)"
+                  : isJammed
+                    ? "JAMMED — SIGNAL LOST"
+                    : isOffline
+                      ? "OFFLINE — TELEMETRY LOST"
+                      : "ONLINE — NOMINAL"}
               </div>
             </div>
 
@@ -554,13 +629,97 @@ function NodeInspector({
                 {isGateway ? "Mesh Root · Serial Bridge" : "Mesh Endpoint · Sensor Node"}
               </div>
             </div>
+
+            {/* RSSI & Signal Monitoring */}
+            {!isGateway && (
+              <div className="rounded border border-slate-800 bg-slate-900/60 p-3">
+                <div className="mb-2 text-[9px] font-bold tracking-[0.2em] text-slate-500">
+                  SIGNAL MONITORING
+                </div>
+                <div className="space-y-2">
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">RSSI</span>
+                    <span className={`font-bold ${
+                      node.rssi == null ? "text-slate-500"
+                        : node.rssi > -50 ? "text-emerald-400"
+                        : node.rssi > -70 ? "text-cyan-400"
+                        : node.rssi > -85 ? "text-amber-400"
+                        : "text-rose-400"
+                    }`}>
+                      {node.rssi != null ? `${node.rssi} dBm` : "N/A"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">QUALITY</span>
+                    <span className={`font-bold text-[10px] ${
+                      node.rssi == null ? "text-slate-500"
+                        : node.rssi > -50 ? "text-emerald-400"
+                        : node.rssi > -70 ? "text-cyan-400"
+                        : node.rssi > -85 ? "text-amber-400"
+                        : "text-rose-400"
+                    }`}>
+                      {node.rssi == null ? "NO SIGNAL"
+                        : node.rssi > -50 ? "EXCELLENT"
+                        : node.rssi > -70 ? "GOOD"
+                        : node.rssi > -85 ? "FAIR"
+                        : "WEAK"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">FSPL DIST</span>
+                    <span className="text-slate-200">
+                      {node.distance_m != null ? `${node.distance_m.toFixed(1)} m` : "N/A"}
+                    </span>
+                  </div>
+                  {/* Signal Strength Bar */}
+                  {node.rssi != null && (() => {
+                    // Map RSSI (-100 to -30 range) to 0-10 segments
+                    const clamped = Math.max(-100, Math.min(-30, node.rssi));
+                    const pct = ((clamped + 100) / 70);
+                    const segments = Math.round(pct * 10);
+                    const barColor = node.rssi > -50
+                      ? "bg-emerald-400 shadow-[0_0_4px_rgba(52,211,153,0.6)]"
+                      : node.rssi > -70
+                        ? "bg-cyan-400 shadow-[0_0_4px_rgba(34,211,238,0.6)]"
+                        : node.rssi > -85
+                          ? "bg-amber-400 shadow-[0_0_4px_rgba(251,191,36,0.6)]"
+                          : "bg-rose-400 shadow-[0_0_4px_rgba(244,63,94,0.6)]";
+                    return (
+                      <div className="pt-1">
+                        <div className="flex gap-[2px]">
+                          {Array.from({ length: 10 }).map((_, i) => (
+                            <div
+                              key={i}
+                              className={`h-1.5 flex-1 rounded-[1px] transition-all duration-200 ${
+                                i < segments ? barColor : "bg-slate-800/60"
+                              }`}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            )}
+            {isGateway && (
+              <div className="rounded border border-slate-800 bg-slate-900/60 p-3">
+                <div className="mb-2 text-[9px] font-bold tracking-[0.2em] text-slate-500">
+                  SIGNAL MONITORING
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">RSSI</span>
+                  <span className="text-cyan-400 font-bold">ROOT (LOCAL)</span>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Spacer */}
           <div className="flex-1" />
 
-          {/* Force Signal Loss button — only for non-gateway, non-jammed nodes */}
-          {!isGateway && !isJammed && (
+          {/* Force Signal Loss button — only for online non-gateway nodes */}
+          {!isGateway && !isJammed && !isOffline && (
             <button
               onClick={() => onForceSignalLoss(node.id)}
               className="force-loss-btn mt-4 w-full rounded border-2 border-rose-600/60 bg-rose-950/30 px-4 py-3 font-mono text-xs font-bold tracking-[0.15em] text-rose-400 transition-all hover:border-rose-500 hover:bg-rose-950/60 hover:text-rose-300 hover:shadow-[0_0_20px_rgba(244,63,94,0.2)]"
@@ -572,6 +731,12 @@ function NodeInspector({
           {isJammed && (
             <div className="mt-4 rounded border border-rose-800/40 bg-rose-950/20 px-4 py-3 text-center font-mono text-[10px] tracking-wider text-rose-400/80">
               NODE INTERFERENCE ACTIVE
+            </div>
+          )}
+
+          {isOffline && (
+            <div className="mt-4 rounded border border-slate-700/60 bg-slate-900/40 px-4 py-3 text-center font-mono text-[10px] tracking-wider text-slate-400">
+              NODE UNREACHABLE — AWAITING SELF-HEAL
             </div>
           )}
         </div>
@@ -590,12 +755,14 @@ function TopBar({
   linkCount,
   onlineCount,
   jammedCount,
+  offlineCount,
 }: {
   wsStatus: WsStatus;
   nodeCount: number;
   linkCount: number;
   onlineCount: number;
   jammedCount: number;
+  offlineCount: number;
 }) {
   return (
     <header className="glass relative z-30 flex h-12 w-full shrink-0 items-center justify-between border-b border-white/10 px-4">
@@ -620,6 +787,11 @@ function TopBar({
         {jammedCount > 0 && (
           <span className="glass-pill animate-pulse rounded px-2 py-0.5 border-rose-500/40 text-rose-300 shadow-[0_0_10px_rgba(244,63,94,0.3)]">
             JAMMED <span className="text-rose-200 font-bold">{jammedCount}</span>
+          </span>
+        )}
+        {offlineCount > 0 && (
+          <span className="glass-pill rounded px-2 py-0.5 border-slate-500/40 text-slate-300">
+            OFFLINE <span className="text-slate-200 font-bold">{offlineCount}</span>
           </span>
         )}
         <span className="glass-pill rounded px-2.5 py-0.5">
@@ -778,93 +950,7 @@ function DispatchPanel({
   );
 }
 
-/* ================================================================== */
-/* Node Roster                                                         */
-/* ================================================================== */
 
-function NodeRoster({
-  nodes,
-  operatorPosition,
-}: {
-  nodes: TopoNode[];
-  operatorPosition: [number, number] | null;
-}) {
-  if (nodes.length === 0 && !operatorPosition) return null;
-
-  const sorted = [...nodes].sort((a, b) => {
-    if (a.id === GATEWAY_ID) return -1;
-    if (b.id === GATEWAY_ID) return 1;
-    if (a.status === "JAMMED" && b.status !== "JAMMED") return -1;
-    if (a.status !== "JAMMED" && b.status === "JAMMED") return 1;
-    return a.id - b.id;
-  });
-
-  return (
-    <aside className="glass terminal-scroll pointer-events-auto absolute top-64 right-4 bottom-48 z-20 w-72 overflow-y-auto rounded-sm p-3">
-      <h2 className="mb-2 text-[10px] font-semibold tracking-[0.25em] text-slate-400">
-        NETWORK ROSTER
-      </h2>
-      <div className="space-y-2">
-        {/* Operator Workstation */}
-        {operatorPosition && (
-          <div className="rounded-sm border border-amber-900/50 bg-amber-950/20 px-2.5 py-2">
-            <div className="flex items-center justify-between">
-              <span className="flex items-center gap-2 font-mono text-[11px] text-amber-200">
-                <span className="h-1.5 w-1.5 rotate-45 bg-amber-400 shadow-[0_0_6px_rgba(245,158,11,0.8)]" />
-                OPERATOR (C2)
-              </span>
-              <span className="font-mono text-[9px] tracking-wider text-amber-400">
-                STATION
-              </span>
-            </div>
-            <div className="mt-1 font-mono text-[10px] text-slate-400">
-              {operatorPosition[0].toFixed(4)}, {operatorPosition[1].toFixed(4)}
-            </div>
-          </div>
-        )}
-        {sorted.map((node) => {
-          const isGateway = node.id === GATEWAY_ID;
-          const isJammed = node.status === "JAMMED";
-          const dot = isGateway
-            ? "bg-cyan-400 shadow-[0_0_6px_rgba(34,211,238,0.6)]"
-            : isJammed
-              ? "bg-rose-500 shadow-[0_0_6px_rgba(244,63,94,0.6)]"
-              : "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]";
-
-          return (
-            <div
-              key={node.id}
-              className={`rounded-sm border px-2.5 py-2 ${
-                isJammed
-                  ? "border-rose-900/60 bg-rose-950/30"
-                  : "border-slate-800 bg-slate-900/50"
-              }`}
-            >
-              <div className="flex items-center justify-between">
-                <span className="flex items-center gap-2 font-mono text-[11px] text-slate-200">
-                  <span className={`h-1.5 w-1.5 rounded-full ${dot}`} />
-                  {node.id.toString(16).toUpperCase()}
-                </span>
-                <span className={`font-mono text-[9px] tracking-wider ${
-                  isGateway
-                    ? "text-cyan-400"
-                    : isJammed
-                      ? "text-rose-400"
-                      : "text-emerald-400/70"
-                }`}>
-                  {isGateway ? "GATEWAY" : isJammed ? "JAMMED" : "ONLINE"}
-                </span>
-              </div>
-              <div className="mt-1 font-mono text-[10px] text-slate-500">
-                {node.lat.toFixed(4)}, {node.lon.toFixed(4)}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </aside>
-  );
-}
 
 /* ================================================================== */
 /* Feature 3: Live Event Terminal                                      */
@@ -890,7 +976,7 @@ function EventTerminal({
   }, [events]);
 
   return (
-    <section className="event-terminal glass-terminal absolute inset-x-4 bottom-4 z-20 rounded-md overflow-hidden">
+    <section className="event-terminal glass-terminal absolute left-4 right-4 bottom-4 z-20 rounded-md overflow-hidden">
       <div className="flex h-7 items-center justify-between border-b border-white/10 px-3">
         <div className="flex items-center gap-3">
           <h2 className="text-[10px] font-semibold tracking-[0.25em] text-slate-200">

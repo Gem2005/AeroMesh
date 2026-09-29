@@ -13,13 +13,22 @@ export interface TopoNode {
   id: number;
   lat: number;
   lon: number;
-  status: "online" | "JAMMED";
+  /** OFFLINE = telemetry stale/lost (set by the bridge watchdog). */
+  status: "online" | "JAMMED" | "OFFLINE";
+  /** RSSI in dBm from parent node (null for gateway) */
+  rssi: number | null;
+  /** FSPL-calculated distance from parent in meters (null for gateway) */
+  distance_m: number | null;
 }
 
 /** A link between two mesh nodes. */
 export interface TopoLink {
   source: number;
   target: number;
+  /** RSSI in dBm for this link (null if unavailable) */
+  rssi: number | null;
+  /** FSPL-calculated distance for this link in meters (null if unavailable) */
+  distance_m: number | null;
 }
 
 /** Full topology snapshot from the bridge. */

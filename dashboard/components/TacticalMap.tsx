@@ -38,12 +38,13 @@ import {
 /* ------------------------------------------------------------------ */
 
 function createNodeIcon(
-  type: "gateway" | "online" | "jammed" | "relay" | "operator"
+  type: "gateway" | "online" | "jammed" | "offline" | "relay" | "operator"
 ): L.DivIcon {
   const classes: Record<string, string> = {
     gateway: "marker-gateway",
     online: "marker-online",
     jammed: "marker-jammed",
+    offline: "marker-offline",
     relay: "marker-relay",
     operator: "marker-operator",
   };
@@ -52,6 +53,7 @@ function createNodeIcon(
     gateway: "GW",
     online: "",
     jammed: "JAM",
+    offline: "✕",
     relay: "▲",
     operator: "OP",
   };
@@ -72,6 +74,7 @@ const ICONS = {
   gateway: createNodeIcon("gateway"),
   online: createNodeIcon("online"),
   jammed: createNodeIcon("jammed"),
+  offline: createNodeIcon("offline"),
   relay: createNodeIcon("relay"),
   operator: createNodeIcon("operator"),
 };
@@ -264,12 +267,13 @@ function TacticalMap({
 
   /* Resolve link endpoints to LatLng pairs. */
   const linkLines = useMemo(() => {
-    const result: { key: string; positions: [number, number][]; isJammed: boolean }[] = [];
+    const result: { key: string; positions: [number, number][]; isJammed: boolean; isOffline: boolean; rssi: number | null; distance_m: number | null }[] = [];
     for (const link of links) {
       const src = nodeMap.get(link.source);
       const tgt = nodeMap.get(link.target);
       if (!src || !tgt) continue;
       const isJammed = src.status === "JAMMED" || tgt.status === "JAMMED";
+      const isOffline = src.status === "OFFLINE" || tgt.status === "OFFLINE";
       result.push({
         key: `${link.source}-${link.target}`,
         positions: [
@@ -277,6 +281,9 @@ function TacticalMap({
           [tgt.lat, tgt.lon],
         ],
         isJammed,
+        isOffline,
+        rssi: link.rssi,
+        distance_m: link.distance_m,
       });
     }
     return result;
@@ -335,29 +342,56 @@ function TacticalMap({
         <OperatorMarker position={operatorPosition} />
       )}
 
-      {/* Mesh topology links */}
+      {/* Mesh topology links with RSSI/distance tooltips */}
       {linkLines.map((line) => (
         <Polyline
           key={line.key}
           positions={line.positions}
           pathOptions={{
-            color: line.isJammed ? "#f43f5e" : "#34d39988",
+            color: line.isJammed
+              ? "#f43f5e"
+              : line.isOffline
+                ? "#64748b"
+                : "#34d39988",
             weight: line.isJammed ? 2 : 1.5,
-            opacity: line.isJammed ? 0.7 : 0.5,
-            dashArray: line.isJammed ? "8 6" : undefined,
+            opacity: line.isJammed ? 0.7 : line.isOffline ? 0.35 : 0.5,
+            dashArray: line.isJammed ? "8 6" : line.isOffline ? "4 8" : undefined,
           }}
-        />
+        >
+          {(line.rssi != null || line.distance_m != null) && (
+            <Tooltip
+              sticky
+              className="tactical-tooltip"
+            >
+              <div className="tooltip-content">
+                {line.rssi != null && (
+                  <span className="tooltip-id" style={{ color: line.rssi > -50 ? '#34d399' : line.rssi > -70 ? '#22d3ee' : line.rssi > -85 ? '#fbbf24' : '#f43f5e' }}>
+                    RSSI: {line.rssi} dBm
+                  </span>
+                )}
+                {line.distance_m != null && (
+                  <span className="tooltip-coords">
+                    DIST: {line.distance_m.toFixed(1)}m
+                  </span>
+                )}
+              </div>
+            </Tooltip>
+          )}
+        </Polyline>
       ))}
 
       {/* Node markers */}
       {nodes.map((node) => {
         const isGateway = node.id === GATEWAY_ID;
         const isJammed = node.status === "JAMMED";
+        const isOffline = node.status === "OFFLINE";
         const icon = isGateway
           ? ICONS.gateway
           : isJammed
             ? ICONS.jammed
-            : ICONS.online;
+            : isOffline
+              ? ICONS.offline
+              : ICONS.online;
 
         return (
           <Marker
@@ -376,9 +410,20 @@ function TacticalMap({
             >
               <div className="tooltip-content">
                 <span className="tooltip-id">
-                  {isGateway ? "GATEWAY" : isJammed ? "JAMMED" : "NODE"}
+                  {isGateway
+                    ? "GATEWAY"
+                    : isJammed
+                      ? "JAMMED"
+                      : isOffline
+                        ? "OFFLINE"
+                        : "NODE"}
                 </span>
                 <span className="tooltip-hex">{node.id.toString(16).toUpperCase()}</span>
+                {node.rssi != null && (
+                  <span className="tooltip-coords" style={{ color: node.rssi > -50 ? '#34d399' : node.rssi > -70 ? '#22d3ee' : node.rssi > -85 ? '#fbbf24' : '#f43f5e' }}>
+                    {node.rssi} dBm · {node.distance_m?.toFixed(1)}m
+                  </span>
+                )}
                 <span className="tooltip-coords">
                   {node.lat.toFixed(4)}, {node.lon.toFixed(4)}
                 </span>

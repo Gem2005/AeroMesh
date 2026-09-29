@@ -29,12 +29,28 @@ function LeftSidebar({
   collapsed,
   onToggleCollapse,
 }: LeftSidebarProps) {
-  // Calculate network strength % — strictly based on connected mesh nodes
-  // When no nodes are connected (total = 0), healthPct is null (displays "--" and "STANDBY · NO NODES")
+  // Network strength % — availability (online/total) scaled by mean child
+  // signal quality (RSSI -90 dBm -> 0%, -30 dBm -> 100%), so the index
+  // responds to signal degradation instead of sitting at 100% whenever all
+  // nodes are merely present. Null when no nodes are connected.
+  const childRssis = nodes
+    .filter((n) => n.id !== GATEWAY_ID && n.status === "online" && n.rssi != null)
+    .map((n) => n.rssi as number);
+  const signalPct = childRssis.length
+    ? childRssis
+        .map((r) => Math.max(0, Math.min(100, ((r + 90) / 60) * 100)))
+        .reduce((sum, v) => sum + v, 0) / childRssis.length
+    : null;
+  const availabilityPct =
+    metrics.total > 0 ? (metrics.online.length / metrics.total) * 100 : null;
   const healthPct =
-    metrics.total > 0
-      ? Math.round((metrics.online.length / metrics.total) * 100)
-      : null;
+    availabilityPct === null
+      ? null
+      : Math.round(
+          signalPct === null
+            ? availabilityPct
+            : (availabilityPct / 100) * signalPct,
+        );
 
   const SEGMENTS = 20;
   const activeSegments =
@@ -418,7 +434,7 @@ function LeftSidebar({
               <span>
                 GPS: {gatewayNode.lat.toFixed(4)}, {gatewayNode.lon.toFixed(4)}
               </span>
-              <span className="font-semibold text-emerald-400">100% HEALTH</span>
+              <span className="font-semibold text-emerald-400">SERIAL C2 LINK</span>
             </div>
           </div>
         )}
@@ -426,12 +442,17 @@ function LeftSidebar({
         {/* 3. CHILD NODES */}
         {childNodes.map((node) => {
           const isJammed = node.status === "JAMMED";
+          const isOffline = node.status === "OFFLINE";
           return (
             <div
               key={node.id}
               onClick={() => onSelectNode(node)}
               className={`group cursor-pointer rounded-md p-2.5 ${
-                isJammed ? "glass-card-jammed" : "glass-card"
+                isJammed
+                  ? "glass-card-jammed"
+                  : isOffline
+                    ? "glass-card opacity-60"
+                    : "glass-card"
               }`}
             >
               <div className="flex items-center justify-between">
@@ -440,10 +461,12 @@ function LeftSidebar({
                     className={`flex h-5 w-5 items-center justify-center rounded text-[10px] ${
                       isJammed
                         ? "animate-pulse bg-rose-500/25 text-rose-400 shadow-[0_0_8px_rgba(244,63,94,0.6)]"
-                        : "bg-emerald-500/25 text-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.4)]"
+                        : isOffline
+                          ? "bg-slate-600/25 text-slate-400"
+                          : "bg-emerald-500/25 text-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.4)]"
                     }`}
                   >
-                    {isJammed ? "⚠" : "⬢"}
+                    {isJammed ? "⚠" : isOffline ? "✕" : "⬢"}
                   </div>
                   <div>
                     <div className="font-mono text-[11px] font-bold text-slate-200 group-hover:text-white">
@@ -458,18 +481,43 @@ function LeftSidebar({
                   className={`glass-pill rounded px-1.5 py-0.5 font-mono text-[8px] font-bold tracking-wider ${
                     isJammed
                       ? "animate-pulse border-rose-500/50 bg-rose-500/20 text-rose-300"
-                      : "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                      : isOffline
+                        ? "border-slate-500/40 bg-slate-500/10 text-slate-300"
+                        : "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
                   }`}
                 >
-                  {isJammed ? "JAMMED" : "ONLINE"}
+                  {isJammed ? "JAMMED" : isOffline ? "OFFLINE" : "ONLINE"}
                 </span>
               </div>
               <div className="mt-1.5 flex items-center justify-between font-mono text-[9px] text-slate-300">
                 <span>
                   GPS: {node.lat.toFixed(4)}, {node.lon.toFixed(4)}
                 </span>
-                <span className={isJammed ? "font-semibold text-rose-400" : "text-slate-400"}>
-                  {isJammed ? "LINK LOST" : "FSPL ACTIVE"}
+                <span
+                  className={
+                    isJammed
+                      ? "font-semibold text-rose-400"
+                      : isOffline
+                        ? "font-semibold text-slate-400"
+                        : "text-slate-400"
+                  }
+                >
+                  {isJammed ? "LINK LOST" : isOffline ? "NO TELEMETRY" : "FSPL ACTIVE"}
+                </span>
+              </div>
+              {/* RSSI & Distance row */}
+              <div className="mt-1 flex items-center justify-between font-mono text-[9px]">
+                <span className={`font-semibold ${
+                  node.rssi == null ? "text-slate-500"
+                    : node.rssi > -50 ? "text-emerald-400"
+                    : node.rssi > -70 ? "text-cyan-400"
+                    : node.rssi > -85 ? "text-amber-400"
+                    : "text-rose-400"
+                }`}>
+                  {node.rssi != null ? `${node.rssi} dBm` : "NO RSSI"}
+                </span>
+                <span className="text-slate-400">
+                  {node.distance_m != null ? `${node.distance_m.toFixed(1)}m` : ""}
                 </span>
               </div>
             </div>
