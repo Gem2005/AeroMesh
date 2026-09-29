@@ -50,7 +50,14 @@ export interface DispatchPayload {
   midpoint: [number, number]; // [lat, lon]
 }
 
-export type BridgeMessage = TopologyPayload | DispatchPayload;
+/** Reply from a field operator relayed through the mesh. */
+export interface ManualReplyPayload {
+  type?: undefined; // replies have no type discriminator — identified by "reply" key
+  node_id: number;
+  reply: string;
+}
+
+export type BridgeMessage = TopologyPayload | DispatchPayload | ManualReplyPayload;
 
 /* ------------------------------------------------------------------ */
 /* Aerial relay (injected UAV marker)                                  */
@@ -61,6 +68,20 @@ export interface AerialRelay {
   lon: number;
   targetNodeId: number;
   injectedAt: number;
+}
+
+/* ------------------------------------------------------------------ */
+/* Packet flow animation (triggered by bridge on C2 uplink/downlink)   */
+/* ------------------------------------------------------------------ */
+
+/** Transient animation overlay showing packet routing hops on the map. */
+export interface PacketAnimation {
+  /** Unique ID for React key + cleanup tracking. */
+  id: number;
+  /** "outbound" = C2 command (GW → Node), "inbound" = field reply (Node → GW). */
+  direction: "outbound" | "inbound";
+  /** Ordered array of node IDs representing exact relay hops. */
+  path: number[];
 }
 
 /* ------------------------------------------------------------------ */

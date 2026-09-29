@@ -29,7 +29,7 @@ import {
   type TopologyPayload,
   type DispatchPayload,
   type AerialRelay,
-  type BridgeMessage,
+  type PacketAnimation,
   DEFAULT_CENTER,
   DEFAULT_ZOOM,
   GATEWAY_ID,
@@ -57,6 +57,7 @@ import LeftSidebar from "@/components/LeftSidebar";
 const WS_URL = "ws://localhost:8765"; // must match bridge.py --ws-port
 const WS_RETRY_MS = 2000;
 const MAX_EVENTS = 80;
+const ANIM_DURATION_MS = 1500; // how long packet flow animations live before cleanup
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -69,6 +70,14 @@ interface MeshEvent {
   id: number;
   ts: string;
   severity: Severity;
+  text: string;
+}
+
+/** Incoming field transmission from an operator node. */
+interface CommsMessage {
+  id: number;
+  ts: string;
+  nodeId: number;
   text: string;
 }
 
@@ -108,7 +117,15 @@ export default function Home() {
   /* Sidebar state: expanded vs contracted */
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
+  /* C2 Comms state (isolated from map — TacticalMap does not depend on these) */
+  const [commsMessages, setCommsMessages] = useState<CommsMessage[]>([]);
+
+  /* Packet flow animations (passed to TacticalMap — triggers map re-render only on anim start/end) */
+  const [packetAnimations, setPacketAnimations] = useState<PacketAnimation[]>([]);
+
   const eventIdRef = useRef(0);
+  const commsIdRef = useRef(0);
+  const animIdRef = useRef(0);
   const wsRef = useRef<WebSocket | null>(null);
   const operatorPositionRef = useRef<[number, number] | null>(null);
 
@@ -300,6 +317,23 @@ export default function Home() {
     [nodes, addEvent]
   );
 
+  /* ---- Send manual C2 packet to a specific node ---- */
+  const sendManualPacket = useCallback(
+    (targetNode: number, payload: string) => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: "MANUAL_PACKET",
+            target_node: targetNode,
+            payload: payload,
+          })
+        );
+        addEvent("info", `UPLINK TX → ${targetNode.toString(16).toUpperCase()}: "${payload}"`);
+      }
+    },
+    [addEvent]
+  );
+
   /* ---- Node click handler (stable ref for TacticalMap memo) ---- */
   const handleNodeClick = useCallback((node: TopoNode) => {
     setSelectedNode((prev) => (prev?.id === node.id ? null : node));
@@ -335,17 +369,47 @@ export default function Home() {
       };
 
       ws.onmessage = (event) => {
-        let msg: BridgeMessage;
+        let raw: Record<string, unknown>;
         try {
-          msg = JSON.parse(event.data as string);
+          raw = JSON.parse(event.data as string);
         } catch {
           return;
         }
 
-        if (msg.type === "TOPOLOGY") {
-          handleTopology(msg as TopologyPayload);
-        } else if (msg.type === "UAV_DISPATCH") {
-          handleDispatch(msg as DispatchPayload);
+        if (raw.type === "TOPOLOGY") {
+          handleTopology(raw as unknown as TopologyPayload);
+        } else if (raw.type === "UAV_DISPATCH") {
+          handleDispatch(raw as unknown as DispatchPayload);
+        } else if (raw.type === "PACKET_ANIMATION") {
+          // Transient packet flow visualization
+          const path = raw.path as number[];
+          const direction = raw.direction as "outbound" | "inbound";
+          if (Array.isArray(path) && path.length >= 2) {
+            const animId = ++animIdRef.current;
+            const anim: PacketAnimation = { id: animId, direction, path };
+            setPacketAnimations((prev) => [...prev, anim]);
+            // Auto-remove after animation completes
+            setTimeout(() => {
+              setPacketAnimations((prev) => prev.filter((a) => a.id !== animId));
+            }, ANIM_DURATION_MS);
+            addEvent(
+              direction === "outbound" ? "info" : "ok",
+              `PACKET ${direction.toUpperCase()}: ${path.map((id) => id.toString(16).toUpperCase()).join(" → ")}`
+            );
+          }
+        }
+
+        // Field operator reply (no "type" key — identified by "reply" key)
+        if ("reply" in raw && "node_id" in raw) {
+          setCommsMessages((prev) => [
+            ...prev,
+            {
+              id: ++commsIdRef.current,
+              ts: timestamp(),
+              nodeId: raw.node_id as number,
+              text: raw.reply as string,
+            },
+          ]);
         }
       };
 
@@ -403,6 +467,7 @@ export default function Home() {
           relay={relay}
           operatorPosition={operatorPosition}
           onNodeClick={handleNodeClick}
+          packetAnimations={packetAnimations}
         />
       </div>
 
@@ -440,6 +505,7 @@ export default function Home() {
             node={inspectedNode}
             onClose={() => setSelectedNode(null)}
             onForceSignalLoss={forceSignalLoss}
+            onSendManualPacket={sendManualPacket}
           />
         </div>
 
@@ -492,6 +558,14 @@ export default function Home() {
           <div className="pointer-events-auto">
             <EventTerminal events={events} onClear={clearEvents} />
           </div>
+
+          {/* Feature 4: Incoming field transmissions — comms downlink terminal */}
+          <div className="pointer-events-auto">
+            <CommsTerminal
+              messages={commsMessages}
+              onClear={() => setCommsMessages([])}
+            />
+          </div>
         </div>
       </div>
     </main>
@@ -506,11 +580,24 @@ function NodeInspector({
   node,
   onClose,
   onForceSignalLoss,
+  onSendManualPacket,
 }: {
   node: TopoNode | null;
   onClose: () => void;
   onForceSignalLoss: (nodeId: number) => void;
+  onSendManualPacket: (targetNode: number, payload: string) => void;
 }) {
+  /* Local state for the uplink input — kept here to prevent map re-renders */
+  const [uplinkText, setUplinkText] = useState("");
+  const [sentFlash, setSentFlash] = useState(false);
+
+  const handleTransmit = useCallback(() => {
+    if (!uplinkText.trim() || !node) return;
+    onSendManualPacket(node.id, uplinkText.trim());
+    setUplinkText("");
+    setSentFlash(true);
+    setTimeout(() => setSentFlash(false), 2000);
+  }, [uplinkText, node, onSendManualPacket]);
   const isOpen = node !== null;
   const isGateway = node?.id === GATEWAY_ID;
   const isJammed = node?.status === "JAMMED";
@@ -718,6 +805,52 @@ function NodeInspector({
                   <span className="text-cyan-400 font-bold">ROOT (LOCAL)</span>
                 </div>
               </div>
+            )}
+          </div>
+
+          {/* TACTICAL C2 UPLINK — Message input for field operators */}
+          <div className={`mt-3 rounded border p-3 transition-colors ${
+            isJammed || isOffline
+              ? "border-slate-800/40 bg-slate-950/20 opacity-50"
+              : "border-cyan-800/40 bg-cyan-950/20"
+          }`}>
+            <div className={`mb-2 text-[9px] font-bold tracking-[0.2em] ${
+              isJammed || isOffline ? "text-slate-600" : "text-cyan-500"
+            }`}>
+              TACTICAL C2 UPLINK
+            </div>
+            {isJammed || isOffline ? (
+              <div className="rounded border border-slate-800/60 bg-slate-900/30 px-2.5 py-2 text-center font-mono text-[9px] tracking-wider text-slate-600">
+                {isJammed ? "UPLINK BLOCKED — NODE JAMMED" : "UPLINK UNAVAILABLE — NODE OFFLINE"}
+              </div>
+            ) : (
+              <>
+                <input
+                  type="text"
+                  maxLength={32}
+                  value={uplinkText}
+                  onChange={(e) => setUplinkText(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleTransmit(); }}
+                  placeholder="ENTER COMMAND…"
+                  className="uplink-input w-full rounded border border-slate-700 bg-slate-950/80 px-2.5 py-1.5 font-mono text-[11px] text-slate-200 placeholder:text-slate-600 focus:border-cyan-600 focus:outline-none transition-all"
+                />
+                <div className="mt-1 flex items-center justify-between">
+                  <span className="text-[8px] tracking-wider text-slate-600">
+                    {uplinkText.length}/32
+                  </span>
+                </div>
+                <button
+                  onClick={handleTransmit}
+                  disabled={!uplinkText.trim()}
+                  className={`transmit-btn mt-1 w-full rounded px-3 py-2 font-mono text-[10px] font-bold tracking-[0.2em] transition-all duration-300 ${
+                    sentFlash
+                      ? "transmit-btn-sent border-2 border-emerald-400/60 bg-emerald-950/40 text-emerald-300 shadow-[0_0_16px_rgba(52,211,153,0.25)]"
+                      : "border border-cyan-600/50 bg-cyan-950/30 text-cyan-400 hover:border-cyan-500 hover:bg-cyan-900/40 hover:shadow-[0_0_12px_rgba(34,211,238,0.15)] disabled:opacity-30 disabled:cursor-not-allowed"
+                  }`}
+                >
+                  {sentFlash ? "[ SENT ✓ ]" : "[ TRANSMIT ]"}
+                </button>
+              </>
             )}
           </div>
 
@@ -997,7 +1130,7 @@ function EventTerminal({
   }, [events]);
 
   return (
-    <section className="event-terminal glass-terminal absolute left-4 right-4 bottom-4 z-20 rounded-md overflow-hidden">
+    <section className="event-terminal glass-terminal absolute left-4 right-4 bottom-[11.5rem] z-20 rounded-md overflow-hidden">
       <div className="flex h-7 items-center justify-between border-b border-white/10 px-3">
         <div className="flex items-center gap-3">
           <h2 className="text-[10px] font-semibold tracking-[0.25em] text-slate-200">
@@ -1047,6 +1180,75 @@ function EventTerminal({
           </p>
         ))}
       </div>
+    </section>
+  );
+}
+
+/* ================================================================== */
+/* Feature 4: Incoming Field Transmissions — Comms Downlink Terminal    */
+/* ================================================================== */
+
+const MAX_COMMS = 200;
+
+function CommsTerminal({
+  messages,
+  onClear,
+}: {
+  messages: CommsMessage[];
+  onClear: () => void;
+}) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+  }, [messages]);
+
+  return (
+    <section className="comms-terminal absolute left-4 right-4 bottom-4 z-20 rounded-md" style={{ height: "10rem" }}>
+      {/* Title bar */}
+      <div className="flex h-7 items-center justify-between border-b border-emerald-800/30 px-3">
+        <div className="flex items-center gap-3">
+          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400/80 shadow-[0_0_6px_rgba(52,211,153,0.7)] animate-pulse" />
+          <h2 className="text-[10px] font-semibold tracking-[0.25em] text-emerald-300/90">
+            INCOMING FIELD TRANSMISSIONS
+          </h2>
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="glass-pill rounded px-1.5 py-0.5 font-mono text-[9px] text-slate-400">
+            {messages.length} MSG{messages.length !== 1 ? "S" : ""}
+          </span>
+          <button
+            onClick={onClear}
+            className="glass-pill rounded px-2 py-0.5 font-mono text-[9px] tracking-wider text-slate-300 transition-all hover:border-emerald-500/40 hover:text-emerald-300"
+          >
+            CLEAR
+          </button>
+        </div>
+      </div>
+
+      {/* Message log */}
+      <div
+        ref={scrollRef}
+        className="terminal-scroll overflow-y-auto px-3 py-1.5 font-mono text-[11px] leading-5"
+        style={{ height: "calc(100% - 1.75rem)" }}
+      >
+        {messages.length === 0 && (
+          <p className="text-slate-600">
+            comms@aeromesh:~$ <span className="italic text-slate-700">awaiting field transmissions…</span>
+            <span className="animate-pulse text-emerald-800">▊</span>
+          </p>
+        )}
+        {messages.map((m) => (
+          <p key={m.id} className="comms-msg-enter whitespace-pre-wrap">
+            <span className="text-slate-600">[{m.ts}]</span>{" "}
+            <span className="text-cyan-400">NODE {m.nodeId.toString(16).toUpperCase()}</span>
+            <span className="text-slate-500">:</span>{" "}
+            <span className="text-emerald-300">&ldquo;{m.text}&rdquo;</span>
+          </p>
+        ))}
+      </div>
+
+      {/* Resize indicator bar */}
+      <div className="comms-resize-handle" />
     </section>
   );
 }

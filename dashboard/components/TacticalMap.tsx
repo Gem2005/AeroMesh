@@ -30,6 +30,7 @@ import {
   type TopoNode,
   type TopoLink,
   type AerialRelay,
+  type PacketAnimation,
   GATEWAY_ID,
 } from "@/lib/mesh";
 
@@ -250,6 +251,8 @@ interface TacticalMapProps {
   relay: AerialRelay | null;
   operatorPosition: [number, number] | null;
   onNodeClick?: (node: TopoNode) => void;
+  /** Transient packet flow animations to render on the map. */
+  packetAnimations?: PacketAnimation[];
 }
 
 function TacticalMap({
@@ -260,6 +263,7 @@ function TacticalMap({
   relay,
   operatorPosition,
   onNodeClick,
+  packetAnimations = [],
 }: TacticalMapProps) {
   /* Build a lookup for node positions by id. */
   const nodeMap = useMemo(() => {
@@ -329,6 +333,31 @@ function TacticalMap({
     }
     return lines;
   }, [relay, nodeMap]);
+
+  /* Resolve packet animation paths to LatLng segments. */
+  const animSegments = useMemo(() => {
+    const result: {
+      key: string;
+      positions: [number, number][];
+      direction: "outbound" | "inbound";
+    }[] = [];
+    for (const anim of packetAnimations) {
+      for (let i = 0; i < anim.path.length - 1; i++) {
+        const fromNode = nodeMap.get(anim.path[i]);
+        const toNode = nodeMap.get(anim.path[i + 1]);
+        if (!fromNode || !toNode) continue;
+        result.push({
+          key: `pkt-${anim.id}-${i}`,
+          positions: [
+            [fromNode.lat, fromNode.lon],
+            [toNode.lat, toNode.lon],
+          ],
+          direction: anim.direction,
+        });
+      }
+    }
+    return result;
+  }, [packetAnimations, nodeMap]);
 
   return (
     <MapContainer
@@ -496,6 +525,22 @@ function TacticalMap({
           ))}
         </>
       )}
+
+      {/* Packet flow animation overlays */}
+      {animSegments.map((seg) => (
+        <Polyline
+          key={seg.key}
+          positions={seg.positions}
+          pathOptions={{
+            color: seg.direction === "outbound" ? "#06b6d4" : "#10b981",
+            weight: 4,
+            opacity: 1,
+            className: seg.direction === "outbound"
+              ? "packet-flow-outbound"
+              : "packet-flow-inbound",
+          }}
+        />
+      ))}
     </MapContainer>
   );
 }

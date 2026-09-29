@@ -147,6 +147,7 @@ class Bridge:
         self.ws_host = ws_host
         self.ws_port = ws_port
         self.clients = set()
+        self.active_ser = None  # Global reference for writing C2 packets to serial
         
         # Initialize System State
         self.mesh_graph = nx.Graph()
@@ -201,6 +202,8 @@ class Bridge:
             async for raw_msg in websocket:
                 try:
                     msg = json.loads(raw_msg)
+                    
+                    # 1. Handle Operator GPS Relocation
                     if msg.get("type") == "OPERATOR_GPS":
                         lat = msg["lat"]
                         lon = msg["lon"]
@@ -227,6 +230,38 @@ class Bridge:
                             log.info("[BRIDGE] Operator GPS received: %.4f, %.4f — gateway re-anchored", lat, lon)
                         
                         await self.broadcast_topology()
+                        
+                    # 2. Handle Manual C2 Packet Injection
+                    elif msg.get("type") == "MANUAL_PACKET":
+                        target = msg.get("target_node")
+                        payload_text = msg.get("payload", "")
+                        
+                        if self.active_ser and self.active_ser.is_open:
+                            cmd = f"TARGET:{target}|{payload_text}\n"
+                            try:
+                                self.active_ser.write(cmd.encode('utf-8'))
+                                log.info(f"[C2 UPLINK] Routed packet to {target}: {payload_text}")
+                                
+                                # --- NEW: TRIGGER OUTBOUND UI ANIMATION ---
+                                if target in self.mesh_graph:
+                                    try:
+                                        # Calculate exact routing hops based on current topology
+                                        hop_path = nx.shortest_path(self.mesh_graph, source=GATEWAY_ID, target=target)
+                                        anim_payload = json.dumps({
+                                            "type": "PACKET_ANIMATION",
+                                            "direction": "outbound",
+                                            "path": hop_path
+                                        })
+                                        await self.broadcast(anim_payload)
+                                    except nx.NetworkXNoPath:
+                                        pass
+                                # ------------------------------------------
+                                
+                            except Exception as e:
+                                log.error(f"Failed to transmit manual packet: {e}")
+                        else:
+                            log.warning("Cannot route packet: Gateway Serial is disconnected.")
+                            
                 except (json.JSONDecodeError, KeyError):
                     pass
         except websockets.exceptions.ConnectionClosed:
@@ -333,6 +368,7 @@ class Bridge:
             try:
                 log.info("Opening serial port %s @ %d baud...", self.serial_port, self.baud)
                 ser = await loop.run_in_executor(None, self._open_serial)
+                self.active_ser = ser  # Assign to global reference for websocket writes
                 log.info("Serial port %s open. Streaming mesh data.", self.serial_port)
 
                 last_data = asyncio.get_event_loop().time()
@@ -394,6 +430,29 @@ class Bridge:
                     try:
                         data = json.loads(payload)
                         
+                        # --- INTERCEPT BIDIRECTIONAL REPLIES FROM SMARTPHONE ---
+                        if "reply" in data:
+                            log.info("[TACTICAL REPLY] Received from %s: %s", data.get("node_id"), data.get("reply"))
+                            await self.broadcast(payload) # Forward directly to Next.js
+                            
+                            # --- NEW: TRIGGER INBOUND UI ANIMATION ---
+                            reply_node = data.get("node_id")
+                            if reply_node in self.mesh_graph:
+                                try:
+                                    # Trace path from Edge back to Gateway
+                                    hop_path = nx.shortest_path(self.mesh_graph, source=reply_node, target=GATEWAY_ID)
+                                    anim_payload = json.dumps({
+                                        "type": "PACKET_ANIMATION",
+                                        "direction": "inbound",
+                                        "path": hop_path
+                                    })
+                                    await self.broadcast(anim_payload)
+                                except nx.NetworkXNoPath:
+                                    pass
+                            # -----------------------------------------
+                            continue
+                        # -------------------------------------------------------
+                        
                         if "node_id" in data and "status" in data:
                             node_id = data["node_id"]
                             status = data["status"]
@@ -409,6 +468,14 @@ class Bridge:
                             if node_id != GATEWAY_ID:
                                 # Case 1: Node has NO valid parent link
                                 if rssi_numeric is None and status != "JAMMED":
+                                    
+                                    # --- APPLY STREAK LIMIT TO PREVENT FLICKERING ---
+                                    self.null_rssi_streak[node_id] = self.null_rssi_streak.get(node_id, 0) + 1
+                                    if self.null_rssi_streak[node_id] < NULL_RSSI_STREAK_LIMIT:
+                                        # Tolerate the temporary glitch while painlessMesh syncs Native WiFi
+                                        continue
+                                    # ------------------------------------------------
+                                    
                                     prev_status = (
                                         self.mesh_graph.nodes[node_id].get("status")
                                         if node_id in self.mesh_graph
@@ -550,6 +617,7 @@ class Bridge:
             except OSError as exc:
                 log.error("OS error on serial port (%s). Retrying in %.0fs...", exc, SERIAL_RETRY_DELAY)
             finally:
+                self.active_ser = None  # Clear global reference on disconnect
                 if ser is not None:
                     try:
                         ser.close()
