@@ -38,7 +38,7 @@ import {
 /* ------------------------------------------------------------------ */
 
 function createNodeIcon(
-  type: "gateway" | "online" | "jammed" | "offline" | "relay" | "operator"
+  type: "gateway" | "online" | "jammed" | "offline" | "relay" | "operator" | "mesh_relay"
 ): L.DivIcon {
   const classes: Record<string, string> = {
     gateway: "marker-gateway",
@@ -47,6 +47,7 @@ function createNodeIcon(
     offline: "marker-offline",
     relay: "marker-relay",
     operator: "marker-operator",
+    mesh_relay: "marker-mesh-relay",
   };
 
   const labels: Record<string, string> = {
@@ -56,6 +57,7 @@ function createNodeIcon(
     offline: "✕",
     relay: "▲",
     operator: "OP",
+    mesh_relay: "RLY",
   };
 
   return L.divIcon({
@@ -77,6 +79,7 @@ const ICONS = {
   offline: createNodeIcon("offline"),
   relay: createNodeIcon("relay"),
   operator: createNodeIcon("operator"),
+  mesh_relay: createNodeIcon("mesh_relay"),
 };
 
 /* ------------------------------------------------------------------ */
@@ -267,13 +270,22 @@ function TacticalMap({
 
   /* Resolve link endpoints to LatLng pairs. */
   const linkLines = useMemo(() => {
-    const result: { key: string; positions: [number, number][]; isJammed: boolean; isOffline: boolean; rssi: number | null; distance_m: number | null }[] = [];
+    const result: {
+      key: string;
+      positions: [number, number][];
+      isJammed: boolean;
+      isOffline: boolean;
+      isRelay: boolean;
+      rssi: number | null;
+      distance_m: number | null;
+    }[] = [];
     for (const link of links) {
       const src = nodeMap.get(link.source);
       const tgt = nodeMap.get(link.target);
       if (!src || !tgt) continue;
       const isJammed = src.status === "JAMMED" || tgt.status === "JAMMED";
       const isOffline = src.status === "OFFLINE" || tgt.status === "OFFLINE";
+      const isRelay = link.is_relay ?? (link.source !== GATEWAY_ID && link.target !== GATEWAY_ID);
       result.push({
         key: `${link.source}-${link.target}`,
         positions: [
@@ -282,6 +294,7 @@ function TacticalMap({
         ],
         isJammed,
         isOffline,
+        isRelay,
         rssi: link.rssi,
         distance_m: link.distance_m,
       });
@@ -352,10 +365,13 @@ function TacticalMap({
               ? "#f43f5e"
               : line.isOffline
                 ? "#64748b"
-                : "#34d39988",
-            weight: line.isJammed ? 2 : 1.5,
-            opacity: line.isJammed ? 0.7 : line.isOffline ? 0.35 : 0.5,
-            dashArray: line.isJammed ? "8 6" : line.isOffline ? "4 8" : undefined,
+                : line.isRelay
+                  ? "#22d3ee"
+                  : "#34d39988",
+            weight: line.isRelay ? 2.5 : line.isJammed ? 2 : 1.5,
+            opacity: line.isJammed ? 0.7 : line.isOffline ? 0.35 : line.isRelay ? 0.95 : 0.6,
+            dashArray: line.isRelay ? "6 6" : line.isJammed ? "8 6" : line.isOffline ? "4 8" : undefined,
+            className: line.isRelay ? "relay-active-polyline" : undefined,
           }}
         >
           {(line.rssi != null || line.distance_m != null) && (
@@ -364,6 +380,11 @@ function TacticalMap({
               className="tactical-tooltip"
             >
               <div className="tooltip-content">
+                {line.isRelay && (
+                  <span className="tooltip-id" style={{ color: "#22d3ee" }}>
+                    RELAY LINK
+                  </span>
+                )}
                 {line.rssi != null && (
                   <span className="tooltip-id" style={{ color: line.rssi > -50 ? '#34d399' : line.rssi > -70 ? '#22d3ee' : line.rssi > -85 ? '#fbbf24' : '#f43f5e' }}>
                     RSSI: {line.rssi} dBm
@@ -385,13 +406,16 @@ function TacticalMap({
         const isGateway = node.id === GATEWAY_ID;
         const isJammed = node.status === "JAMMED";
         const isOffline = node.status === "OFFLINE";
+        const isRelayNode = !isGateway && (node.is_relay || links.some((l) => (l.source === node.id || l.target === node.id) && l.source !== GATEWAY_ID && l.target !== GATEWAY_ID));
         const icon = isGateway
           ? ICONS.gateway
           : isJammed
             ? ICONS.jammed
             : isOffline
               ? ICONS.offline
-              : ICONS.online;
+              : isRelayNode
+                ? ICONS.mesh_relay
+                : ICONS.online;
 
         return (
           <Marker
@@ -404,9 +428,9 @@ function TacticalMap({
           >
             <Tooltip
               permanent
-              direction="bottom"
-              offset={[0, 18]}
-              className="tactical-tooltip"
+              direction={isGateway ? "top" : "bottom"}
+              offset={isGateway ? [0, -18] : [0, 18]}
+              className={`tactical-tooltip ${isGateway ? "gateway-tooltip" : isRelayNode ? "relay-node-tooltip" : ""}`}
             >
               <div className="tooltip-content">
                 <span className="tooltip-id">
@@ -416,7 +440,9 @@ function TacticalMap({
                       ? "JAMMED"
                       : isOffline
                         ? "OFFLINE"
-                        : "NODE"}
+                        : isRelayNode
+                          ? "NODE (RELAY)"
+                          : "NODE"}
                 </span>
                 <span className="tooltip-hex">{node.id.toString(16).toUpperCase()}</span>
                 {node.rssi != null && (

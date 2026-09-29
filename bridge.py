@@ -55,12 +55,12 @@ TX_POWER = -40           # A: measured RSSI at 1 m for ESP32 (dBm)
 PATH_LOSS_EXPONENT = 2.7 # n: indoor/obstructed environment
 
 # Display-only constraints (do NOT affect the reported distance_m value):
-MIN_DISPLAY_SPREAD_M = 18   # keep child markers visually clear of the gateway
+MIN_DISPLAY_SPREAD_M = 45   # keep child markers visually clear of each other and gateway
 MAX_DISPLAY_DISTANCE_M = 500  # garbage RSSI must not fling nodes off the map
-UNKNOWN_SIGNAL_SPREAD_M = 25  # placement radius when a node has no valid RSSI
+UNKNOWN_SIGNAL_SPREAD_M = 45  # placement radius when a node has no valid RSSI
 
 # Keep the gateway marker visually clear of the operator marker.
-GATEWAY_OFFSET_M = 15
+GATEWAY_OFFSET_M = 35
 GATEWAY_OFFSET_BEARING = 90  # due east of the operator
 
 # Topology watchdog:
@@ -110,9 +110,31 @@ def offset_from(lat, lon, meters, bearing):
     destination = geodesic(meters=meters).destination((lat, lon), bearing)
     return destination.latitude, destination.longitude
 
-def calculate_projected_gps(parent_lat, parent_lon, distance_meters, node_id):
-    """Calculates a GPS coordinate based on distance and a pseudo-random fixed bearing."""
-    bearing = (node_id % 360) 
+def calculate_bearing(lat1, lon1, lat2, lon2):
+    """Calculates forward azimuth bearing in degrees from (lat1, lon1) to (lat2, lon2)."""
+    dlon = math.radians(lon2 - lon1)
+    lat1_r = math.radians(lat1)
+    lat2_r = math.radians(lat2)
+    x = math.sin(dlon) * math.cos(lat2_r)
+    y = math.cos(lat1_r) * math.sin(lat2_r) - math.sin(lat1_r) * math.cos(lat2_r) * math.cos(dlon)
+    initial_bearing = math.atan2(x, y)
+    return (math.degrees(initial_bearing) + 360) % 360
+
+def calculate_projected_gps(parent_lat, parent_lon, distance_meters, node_id, origin_lat=None, origin_lon=None):
+    """
+    Calculates a GPS coordinate based on distance and bearing.
+    If an origin (e.g. Gateway) is provided and parent != origin, the bearing is directed
+    radially outward from origin through parent to ensure relayed nodes never fold back.
+    """
+    if origin_lat is not None and origin_lon is not None and (abs(parent_lat - origin_lat) > 1e-6 or abs(parent_lon - origin_lon) > 1e-6):
+        base_bearing = calculate_bearing(origin_lat, origin_lon, parent_lat, parent_lon)
+        # Fan out slightly (+/- 25 degrees) based on node_id to prevent collision if multiple children relay
+        angle_offset = ((node_id % 5) - 2) * 12.5
+        bearing = (base_bearing + angle_offset) % 360
+    else:
+        # Direct parent (Gateway): distribute using golden ratio angular step to prevent clustering
+        bearing = (node_id * 137.5) % 360
+    
     origin = (parent_lat, parent_lon)
     destination = geodesic(meters=distance_meters).destination(origin, bearing)
     return destination.latitude, destination.longitude
@@ -145,24 +167,27 @@ class Bridge:
 
     def calculate_network_strength(self):
         """Calculates total network strength as a percentage (0-100%)."""
-        valid_rssis = []
-        for n_id, sig in self.node_signal.items():
-            if n_id != GATEWAY_ID and self.mesh_graph.nodes.get(n_id, {}).get("status") == "online":
+        edge_nodes = [n for n in self.mesh_graph.nodes if n != GATEWAY_ID]
+        if not edge_nodes:
+            return 0.0  # Standby / no active mesh nodes
+            
+        total_pct = 0.0
+        for n_id in edge_nodes:
+            status = self.mesh_graph.nodes[n_id].get("status", "online")
+            if status == "online":
+                sig = self.node_signal.get(n_id, {})
                 r = sig.get("rssi")
                 if r is not None:
-                    valid_rssis.append(r)
-        
-        if not valid_rssis:
-            return 100.0  # Default if no active edge nodes
-            
-        # Map -90 dBm (0%) to -40 dBm (100%)
-        total_pct = 0
-        for r in valid_rssis:
-            pct = (r + 90) * 2.0
-            pct = max(0.0, min(100.0, pct))
+                    # Map -90 dBm (0%) to -40 dBm (100%)
+                    pct = max(0.0, min(100.0, (r + 90) * 2.0))
+                else:
+                    pct = 50.0  # Default online node with unknown signal
+            else:
+                # JAMMED or OFFLINE nodes contribute 0%
+                pct = 0.0
             total_pct += pct
             
-        return total_pct / len(valid_rssis)
+        return total_pct / len(edge_nodes)
 
     # ------------------------------------------------------------------ #
     # WebSocket side
@@ -191,7 +216,12 @@ class Bridge:
                             if n_id != GATEWAY_ID:
                                 sig = self.node_signal.get(n_id, {})
                                 proj = display_distance(sig.get("distance_m"), n_id)
-                                self.node_locations[n_id] = calculate_projected_gps(gw_lat, gw_lon, proj, n_id)
+                                edges = list(self.mesh_graph.edges(n_id))
+                                parent_id = edges[0][0] if edges and edges[0][0] != n_id else (edges[0][1] if edges else GATEWAY_ID)
+                                p_lat, p_lon = self.node_locations.get(parent_id, (gw_lat, gw_lon))
+                                self.node_locations[n_id] = calculate_projected_gps(
+                                    p_lat, p_lon, proj, n_id, gw_lat, gw_lon
+                                )
                         
                         if old_gps is None:
                             log.info("[BRIDGE] Operator GPS received: %.4f, %.4f — gateway re-anchored", lat, lon)
@@ -229,6 +259,7 @@ class Bridge:
             n_id = node[0]
             lat, lon = self.node_locations.get(n_id, (0,0))
             sig = self.node_signal.get(n_id, {})
+            is_relay = (n_id != GATEWAY_ID and self.mesh_graph.degree(n_id) > 1)
             nodes.append({
                 "id": n_id,
                 "status": node[1].get("status", "online"),
@@ -236,16 +267,19 @@ class Bridge:
                 "lon": lon,
                 "rssi": sig.get("rssi", None),
                 "distance_m": sig.get("distance_m", None),
+                "is_relay": is_relay,
             })
             
         for edge in self.mesh_graph.edges():
             child_id = edge[1] if edge[0] == GATEWAY_ID else edge[0]
             sig = self.node_signal.get(child_id, {})
+            is_relay_link = (edge[0] != GATEWAY_ID and edge[1] != GATEWAY_ID)
             links.append({
                 "source": edge[0],
                 "target": edge[1],
                 "rssi": sig.get("rssi", None),
                 "distance_m": sig.get("distance_m", None),
+                "is_relay": is_relay_link,
             })
             
         # We append the backend network strength to the payload so the UI can sync if desired
@@ -478,12 +512,15 @@ class Bridge:
                                     self.node_signal[node_id]["distance_m"], parent_id
                                 )
 
-                                # Project the GPS coordinate relative to the active parent, not the Gateway
-                                p_lat, p_lon = self.node_locations.get(parent_id, (GATEWAY_LAT, GATEWAY_LON))
+                                # Project the GPS coordinate relative to the active parent, directed outward from gateway
+                                gw_pos = self.node_locations.get(GATEWAY_ID, (GATEWAY_LAT, GATEWAY_LON))
+                                p_lat, p_lon = self.node_locations.get(parent_id, gw_pos)
                                 proj = display_distance(
                                     self.node_signal[node_id]["distance_m"], node_id
                                 )
-                                self.node_locations[node_id] = calculate_projected_gps(p_lat, p_lon, proj, node_id)
+                                self.node_locations[node_id] = calculate_projected_gps(
+                                    p_lat, p_lon, proj, node_id, gw_pos[0], gw_pos[1]
+                                )
                                 # -------------------------------------------------------------
                                 
                             else:

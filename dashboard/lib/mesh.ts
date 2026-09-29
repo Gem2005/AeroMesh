@@ -19,6 +19,8 @@ export interface TopoNode {
   rssi: number | null;
   /** FSPL-calculated distance from parent in meters (null for gateway) */
   distance_m: number | null;
+  /** True if this node acts as a mesh relay for child nodes */
+  is_relay?: boolean;
 }
 
 /** A link between two mesh nodes. */
@@ -29,11 +31,14 @@ export interface TopoLink {
   rssi: number | null;
   /** FSPL-calculated distance for this link in meters (null if unavailable) */
   distance_m: number | null;
+  /** True if this link is a mesh relay link (child-to-child relay) */
+  is_relay?: boolean;
 }
 
 /** Full topology snapshot from the bridge. */
 export interface TopologyPayload {
   type: "TOPOLOGY";
+  network_strength?: number;
   nodes: TopoNode[];
   links: TopoLink[];
 }

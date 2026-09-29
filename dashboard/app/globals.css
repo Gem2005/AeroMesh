@@ -483,6 +483,57 @@ body {
   }
 }
 
+/* ---- MESH RELAY: Dual Cyan/Emerald Tactical Marker ---- */
+.marker-mesh-relay .marker-core {
+  background: #06b6d4;
+  color: #042f2e;
+  font-size: 6px;
+  font-weight: 800;
+  box-shadow:
+    0 0 10px rgba(6, 182, 212, 0.7),
+    0 0 25px rgba(6, 182, 212, 0.35);
+}
+.marker-mesh-relay .marker-ring {
+  border-color: rgba(6, 182, 212, 0.55);
+  border-style: dashed;
+  animation: relay-ring-spin 10s linear infinite;
+}
+.marker-mesh-relay .marker-pulse {
+  border-color: rgba(6, 182, 212, 0.45);
+  animation: mesh-relay-pulse 2.5s ease-out infinite;
+}
+
+@keyframes mesh-relay-pulse {
+  0% {
+    width: 24px;
+    height: 24px;
+    opacity: 0.7;
+    border-color: rgba(6, 182, 212, 0.6);
+  }
+  100% {
+    width: 48px;
+    height: 48px;
+    opacity: 0;
+    border-color: rgba(6, 182, 212, 0);
+  }
+}
+
+/* Active Mesh Relay Polyline animation (flowing dashed packets) */
+.relay-active-polyline {
+  stroke-dasharray: 6 6 !important;
+  animation: relay-packet-flow 1.2s linear infinite !important;
+  filter: drop-shadow(0 0 4px rgba(34, 211, 238, 0.7));
+}
+
+@keyframes relay-packet-flow {
+  from {
+    stroke-dashoffset: 24;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
 /* ---- OPERATOR: Warm Amber/Gold Diamond ---- */
 .marker-operator .marker-core {
   width: 16px;
@@ -618,6 +669,22 @@ body {
 
 .relay-tooltip {
   border-color: rgba(34, 211, 238, 0.4) !important;
+}
+
+.gateway-tooltip {
+  border-color: rgba(34, 211, 238, 0.5) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(34, 211, 238, 0.2),
+    0 8px 30px rgba(0, 0, 0, 0.7),
+    0 0 15px rgba(34, 211, 238, 0.25) !important;
+}
+
+.relay-node-tooltip {
+  border-color: rgba(6, 182, 212, 0.5) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(6, 182, 212, 0.2),
+    0 8px 30px rgba(0, 0, 0, 0.7),
+    0 0 15px rgba(6, 182, 212, 0.2) !important;
 }
 
 .operator-tooltip {

@@ -95,6 +95,7 @@ export default function Home() {
   const [nodes, setNodes] = useState<TopoNode[]>([]);
   const [links, setLinks] = useState<TopoLink[]>([]);
   const [relay, setRelay] = useState<AerialRelay | null>(null);
+  const [networkStrength, setNetworkStrength] = useState<number | null>(null);
   const [wsStatus, setWsStatus] = useState<WsStatus>("connecting");
   const [events, setEvents] = useState<MeshEvent[]>([]);
 
@@ -210,6 +211,9 @@ export default function Home() {
         return payload.nodes;
       });
       setLinks(payload.links);
+      if (typeof payload.network_strength === "number") {
+        setNetworkStrength(payload.network_strength);
+      }
     },
     [addEvent]
   );
@@ -410,6 +414,7 @@ export default function Home() {
         onlineCount={metrics.online.length}
         jammedCount={metrics.jammed.length}
         offlineCount={metrics.offline.length}
+        networkStrength={networkStrength}
       />
 
       {/* Main split viewport: Left Sidebar | Node Inspector | Map & Tactical Space */}
@@ -425,6 +430,7 @@ export default function Home() {
             onSelectNode={handleNodeClick}
             collapsed={sidebarCollapsed}
             onToggleCollapse={() => setSidebarCollapsed((prev) => !prev)}
+            networkStrength={networkStrength}
           />
         </div>
 
@@ -756,6 +762,7 @@ function TopBar({
   onlineCount,
   jammedCount,
   offlineCount,
+  networkStrength,
 }: {
   wsStatus: WsStatus;
   nodeCount: number;
@@ -763,6 +770,7 @@ function TopBar({
   onlineCount: number;
   jammedCount: number;
   offlineCount: number;
+  networkStrength?: number | null;
 }) {
   return (
     <header className="glass relative z-30 flex h-12 w-full shrink-0 items-center justify-between border-b border-white/10 px-4">
@@ -775,6 +783,19 @@ function TopBar({
         </span>
       </div>
       <div className="flex items-center gap-3 font-mono text-[11px]">
+        {networkStrength != null && nodeCount > 0 && (
+          <span
+            className={`glass-pill rounded px-2.5 py-0.5 border ${
+              networkStrength >= 80
+                ? "border-emerald-500/40 text-emerald-300"
+                : networkStrength >= 50
+                  ? "border-amber-500/40 text-amber-300"
+                  : "border-rose-500/40 text-rose-300"
+            }`}
+          >
+            NET STR <span className="font-bold text-white">{Math.round(networkStrength)}%</span>
+          </span>
+        )}
         <span className="glass-pill rounded px-2 py-0.5 text-slate-300">
           NODES <span className="text-white font-bold">{nodeCount}</span>
         </span>

@@ -17,6 +17,7 @@ export interface LeftSidebarProps {
   onSelectNode: (node: TopoNode) => void;
   collapsed: boolean;
   onToggleCollapse: () => void;
+  networkStrength?: number | null;
 }
 
 function LeftSidebar({
@@ -28,11 +29,10 @@ function LeftSidebar({
   onSelectNode,
   collapsed,
   onToggleCollapse,
+  networkStrength,
 }: LeftSidebarProps) {
-  // Network strength % — availability (online/total) scaled by mean child
-  // signal quality (RSSI -90 dBm -> 0%, -30 dBm -> 100%), so the index
-  // responds to signal degradation instead of sitting at 100% whenever all
-  // nodes are merely present. Null when no nodes are connected.
+  // Network strength % — synchronized with bridge.py backend network_strength
+  // when available, with client-side fallback calculation.
   const childRssis = nodes
     .filter((n) => n.id !== GATEWAY_ID && n.status === "online" && n.rssi != null)
     .map((n) => n.rssi as number);
@@ -43,7 +43,7 @@ function LeftSidebar({
     : null;
   const availabilityPct =
     metrics.total > 0 ? (metrics.online.length / metrics.total) * 100 : null;
-  const healthPct =
+  const fallbackHealthPct =
     availabilityPct === null
       ? null
       : Math.round(
@@ -51,6 +51,11 @@ function LeftSidebar({
             ? availabilityPct
             : (availabilityPct / 100) * signalPct,
         );
+
+  const healthPct =
+    networkStrength !== undefined && networkStrength !== null
+      ? (metrics.total > 0 ? Math.round(networkStrength) : null)
+      : fallbackHealthPct;
 
   const SEGMENTS = 20;
   const activeSegments =
