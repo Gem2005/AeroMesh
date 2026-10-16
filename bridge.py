@@ -6,11 +6,19 @@ serial) with a configurable virtual mesh swarm inside a single NetworkX
 directed graph, and streams a unified 1 Hz telemetry snapshot to every
 connected dashboard over WebSocket.
 
+Subsystems:
+    * SwarmSimulator     -- radial orbit / polygon infill kinematics for N virtual nodes
+    * RF attenuation     -- primary drop zone + fringe penalty, weighted centroid estimate
+    * Adaptive Channel Switching (ACS) -- confirmation timer, CH_SWITCH over serial
+    * RelayAutopilot     -- midpoint positioning of UAV-RELAY-01 over partitions
+    * MavlinkUdpSender   -- MAVLink v2 HEARTBEAT / position / waypoints to udp:127.0.0.1:14550
+
 All node movement and signal behaviour of the virtual nodes is a purely
 mathematical simulation for educational wireless sensor network research.
 
 Setup:
     pip install pyserial websockets networkx
+    pip install pymavlink   # optional; a standard-library MAVLink framer is used otherwise
 
 Run:
     python bridge.py                       # defaults: COM9 @ 115200, ws://localhost:8765
@@ -27,6 +35,8 @@ import logging
 import math
 import random
 import re
+import socket
+import struct
 import sys
 import time
 from dataclasses import dataclass, field
@@ -151,6 +161,42 @@ ACS_NON_OVERLAPPING = (1, 6, 11)
 ACS_MIN_SEPARATION = 5  # channels closer than this overlap on 2.4 GHz (20 MHz width)
 
 RF_ALERT_MIN_INTERVAL_S = 5.0
+
+# ------------------------------------------------------------------ #
+# Mobile relay (UAV-RELAY-01) & MAVLink telemetry
+# ------------------------------------------------------------------ #
+RELAY_ID = "UAV-RELAY-01"
+RELAY_ALT_M = 60.0
+RELAY_SPEED_MPS = 18.0
+RELAY_ARRIVAL_RADIUS_M = 10.0
+RELAY_HOME_OFFSET_M = 25.0
+RELAY_HOME_BEARING = 270.0          # loiter just west of the gateway marker
+RELAY_RTB_HOLD_S = 10.0             # partition must stay healed this long before returning
+RELAY_WAYPOINT_DEADBAND_M = 40.0    # ignore centroid drift smaller than this
+RELAY_DISPATCH_CONFIRM_TICKS = 2    # isolation must persist this many ticks before dispatch
+RELAY_ANTENNA_GAIN_DB = 10.0        # elevated high-gain relay antenna (air-to-ground LOS)
+RELAY_LINK_MAX_M = 450.0
+
+RELAY_LOITERING = "LOITERING"
+RELAY_DISPATCHED = "DISPATCHED"
+RELAY_BRIDGING = "BRIDGING_ACTIVE"
+
+MAVLINK_HOST = "127.0.0.1"
+MAVLINK_PORT = 14550
+MAVLINK_SYSID = 1
+MAVLINK_COMPID = 1
+MAV_TYPE_QUADROTOR = 2
+MAV_AUTOPILOT_GENERIC = 0
+MAV_MODE_FLAG_CUSTOM_MODE_ENABLED = 1
+MAV_MODE_FLAG_GUIDED_ENABLED = 8
+MAV_MODE_FLAG_SAFETY_ARMED = 128
+MAV_STATE_STANDBY = 3
+MAV_STATE_ACTIVE = 4
+MAV_FRAME_GLOBAL_RELATIVE_ALT_INT = 6
+MAV_CMD_NAV_WAYPOINT = 16
+MAVLINK_MSG_HEARTBEAT = (0, 50)            # (msg id, CRC_EXTRA)
+MAVLINK_MSG_GLOBAL_POSITION_INT = (33, 104)
+MAVLINK_MSG_MISSION_ITEM_INT = (73, 38)
 
 ACS_IDLE = "IDLE"
 ACS_CONFIRMING = "CONFIRMING"
@@ -508,6 +554,167 @@ class SwarmSimulator:
 
 
 # ------------------------------------------------------------------ #
+# MAVLink v2 UDP telemetry sender
+# ------------------------------------------------------------------ #
+def x25_crc(data: bytes, crc: int = 0xFFFF) -> int:
+    """CRC-16/MCRF4XX (X.25) as used by MAVLink."""
+    for byte in data:
+        tmp = byte ^ (crc & 0xFF)
+        tmp = (tmp ^ (tmp << 4)) & 0xFF
+        crc = ((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)) & 0xFFFF
+    return crc
+
+
+class MavlinkUdpSender:
+    """
+    Streams MAVLink v2 to a ground station on UDP (QGroundControl / Mission
+    Planner listen on 127.0.0.1:14550). Uses pymavlink when installed and a
+    hand-framed standard-library socket otherwise, so it never hard-fails.
+    """
+
+    def __init__(self, host: str = MAVLINK_HOST, port: int = MAVLINK_PORT):
+        self.addr = (host, port)
+        self.seq = 0
+        self.packet_count = 0
+        self.boot = time.monotonic()
+        self.conn = None
+        self.sock = None
+        try:
+            from pymavlink import mavutil  # type: ignore
+
+            self.conn = mavutil.mavlink_connection(
+                f"udpout:{host}:{port}", source_system=MAVLINK_SYSID, source_component=MAVLINK_COMPID
+            )
+            self.backend = "pymavlink"
+        except Exception:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.setblocking(False)
+            self.backend = "stdlib"
+        log.info("MAVLink v2 telemetry -> udp:%s:%d (%s backend)", host, port, self.backend)
+
+    def frame(self, msg: tuple[int, int], payload: bytes) -> bytes:
+        msgid, crc_extra = msg
+        body = payload.rstrip(b"\x00") or b"\x00"  # MAVLink v2 trailing-zero truncation
+        header = struct.pack(
+            "<BBBBBBB", 0xFD, len(body), 0, 0, self.seq, MAVLINK_SYSID, MAVLINK_COMPID
+        ) + msgid.to_bytes(3, "little")
+        crc = x25_crc(header[1:] + body)
+        crc = x25_crc(bytes([crc_extra]), crc)
+        self.seq = (self.seq + 1) & 0xFF
+        return header + body + struct.pack("<H", crc)
+
+    def _send_raw(self, msg: tuple[int, int], payload: bytes) -> None:
+        try:
+            self.sock.sendto(self.frame(msg, payload), self.addr)
+            self.packet_count += 1
+        except OSError as exc:
+            log.debug("MAVLink UDP send failed: %s", exc)
+
+    def _send_pymavlink(self, fn, *args) -> None:
+        try:
+            fn(*args)
+            self.packet_count += 1
+        except Exception as exc:
+            log.debug("pymavlink send failed: %s", exc)
+
+    def send_heartbeat(self, active: bool) -> None:
+        base_mode = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED | MAV_MODE_FLAG_GUIDED_ENABLED
+        if active:
+            base_mode |= MAV_MODE_FLAG_SAFETY_ARMED
+        state = MAV_STATE_ACTIVE if active else MAV_STATE_STANDBY
+        if self.conn is not None:
+            self._send_pymavlink(self.conn.mav.heartbeat_send, MAV_TYPE_QUADROTOR, MAV_AUTOPILOT_GENERIC, base_mode, 0, state)
+            return
+        payload = struct.pack("<IBBBBB", 0, MAV_TYPE_QUADROTOR, MAV_AUTOPILOT_GENERIC, base_mode, state, 3)
+        self._send_raw(MAVLINK_MSG_HEARTBEAT, payload)
+
+    def send_global_position(self, lat: float, lng: float, alt_m: float, speed_mps: float, bearing_deg: float) -> None:
+        time_boot_ms = int((time.monotonic() - self.boot) * 1000) & 0xFFFFFFFF
+        b = math.radians(bearing_deg)
+        vx = int(max(-32768, min(32767, round(speed_mps * math.cos(b) * 100))))
+        vy = int(max(-32768, min(32767, round(speed_mps * math.sin(b) * 100))))
+        hdg = int(round(bearing_deg * 100)) % 36000
+        lat_e7, lng_e7 = int(round(lat * 1e7)), int(round(lng * 1e7))
+        alt_mm = int(round(alt_m * 1000))
+        if self.conn is not None:
+            self._send_pymavlink(self.conn.mav.global_position_int_send, time_boot_ms, lat_e7, lng_e7, alt_mm, alt_mm, vx, vy, 0, hdg)
+            return
+        payload = struct.pack("<IiiiihhhH", time_boot_ms, lat_e7, lng_e7, alt_mm, alt_mm, vx, vy, 0, hdg)
+        self._send_raw(MAVLINK_MSG_GLOBAL_POSITION_INT, payload)
+
+    def send_waypoint(self, lat: float, lng: float, alt_m: float, seq: int = 0) -> None:
+        """MISSION_ITEM_INT carrying MAV_CMD_NAV_WAYPOINT (current=2: guided 'fly-to')."""
+        lat_e7, lng_e7 = int(round(lat * 1e7)), int(round(lng * 1e7))
+        hold_s, accept_m, pass_m, yaw = 0.0, RELAY_ARRIVAL_RADIUS_M, 0.0, float("nan")
+        seq &= 0xFFFF
+        if self.conn is not None:
+            self._send_pymavlink(
+                self.conn.mav.mission_item_int_send,
+                1, 1, seq, MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, MAV_CMD_NAV_WAYPOINT, 2, 1,
+                hold_s, accept_m, pass_m, yaw, lat_e7, lng_e7, alt_m,
+            )
+            return
+        payload = struct.pack(
+            "<ffffiifHHBBBBBB",
+            hold_s, accept_m, pass_m, yaw, lat_e7, lng_e7, alt_m,
+            seq, MAV_CMD_NAV_WAYPOINT, 1, 1, MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, 2, 1, 0,
+        )
+        self._send_raw(MAVLINK_MSG_MISSION_ITEM_INT, payload)
+
+
+# ------------------------------------------------------------------ #
+# Mobile relay autopilot
+# ------------------------------------------------------------------ #
+class RelayAutopilot:
+    """Midpoint-positioning mobile relay that bridges partitioned mesh islands."""
+
+    def __init__(self, home: tuple[float, float]):
+        self.home = home
+        self.node = MeshNode(id=RELAY_ID, type="virtual", lat=home[0], lng=home[1])
+        self.mission_state = RELAY_LOITERING
+        self.target_waypoint: tuple[float, float] | None = None
+        self.isolated_centroid: tuple[float, float] | None = None
+        self.ground_speed_mps = 0.0
+        self.bearing_deg = 0.0
+        self.eta_s: float | None = None
+        self.isolated_count = 0
+        self.bridged_count = 0
+        self.isolation_streak = 0
+        self.last_isolated_at = 0.0
+        self.waypoint_count = 0
+
+    def airborne_bridge(self) -> bool:
+        return self.mission_state in (RELAY_DISPATCHED, RELAY_BRIDGING)
+
+    def dispatch(self, waypoint: tuple[float, float]) -> None:
+        self.target_waypoint = waypoint
+        self.waypoint_count += 1
+        on_station = haversine_m(self.node.lat, self.node.lng, *waypoint) <= RELAY_ARRIVAL_RADIUS_M
+        if not (self.mission_state == RELAY_BRIDGING and on_station):
+            self.mission_state = RELAY_DISPATCHED
+
+    def return_home(self) -> None:
+        self.mission_state = RELAY_LOITERING
+        self.target_waypoint = None
+        self.isolated_centroid = None
+
+    def step(self, dt: float) -> bool:
+        """Advances the relay. Returns True on the DISPATCHED -> BRIDGING_ACTIVE transition."""
+        goal = self.target_waypoint if (self.airborne_bridge() and self.target_waypoint) else self.home
+        d = haversine_m(self.node.lat, self.node.lng, *goal)
+        if d > 0.5:
+            self.bearing_deg = calculate_bearing(self.node.lat, self.node.lng, *goal)
+        lat, lng, remaining = move_toward(self.node.lat, self.node.lng, goal[0], goal[1], RELAY_SPEED_MPS * dt)
+        self.node.lat, self.node.lng = lat, lng
+        self.ground_speed_mps = (d - remaining) / dt
+        self.eta_s = remaining / RELAY_SPEED_MPS
+        if self.mission_state == RELAY_DISPATCHED and remaining <= RELAY_ARRIVAL_RADIUS_M:
+            self.mission_state = RELAY_BRIDGING
+            return True
+        return False
+
+
+# ------------------------------------------------------------------ #
 # Bridge / Digital Twin engine
 # ------------------------------------------------------------------ #
 class Bridge:
@@ -568,6 +775,11 @@ class Bridge:
         self.self_heal_convergence_ms: float | None = None
         self._last_rf_counts = (0, 0)
         self._last_rf_alert_at = 0.0
+
+        # Mobile relay + MAVLink
+        self.isolated_ground: set[str] = set()
+        self.mavlink = MavlinkUdpSender(MAVLINK_HOST, MAVLINK_PORT)
+        self.relay = RelayAutopilot(self.relay_home())
 
         self.recompute_topology()
 
@@ -737,8 +949,13 @@ class Bridge:
                 hw.lat, hw.lng = destination(gw_lat, gw_lng, hw.proj_distance_m, bearing)
 
         nodes = self.all_nodes()
+        relay = self.relay.node
+        relay_in_graph = self.relay.airborne_bridge()
+        if relay_in_graph:
+            relay.channel = self.active_channel
+        graph_nodes = [*nodes, relay] if relay_in_graph else nodes
         self.spectrum_noise = self.compute_spectrum()
-        self.apply_rf_environment(nodes)
+        self.apply_rf_environment(graph_nodes)
 
         g = nx.DiGraph()
         for n in nodes:
@@ -748,28 +965,53 @@ class Bridge:
         for i in range(len(linkable)):
             a = linkable[i]
             for j in range(i + 1, len(linkable)):
-                b = linkable[j]
-                if a.channel != b.channel:
-                    continue
-                d = haversine_m(a.lat, a.lng, b.lat, b.lng)
-                nominal = self.link_rssi(a, b, d)
-                if nominal is None:
-                    continue
-                rssi = nominal - max(a.rf_penalty_db, b.rf_penalty_db)
-                if rssi <= LINK_RSSI_MIN:
-                    continue
-                w = (100.0 / abs(rssi)) + 2.0
-                attrs = {"weight": w, "rssi": rssi, "nominal_rssi": nominal, "distance_m": d}
-                g.add_edge(a.id, b.id, **attrs)
-                g.add_edge(b.id, a.id, **attrs)
-                best_neighbor[a.id] = max(best_neighbor.get(a.id, -999.0), rssi)
-                best_neighbor[b.id] = max(best_neighbor.get(b.id, -999.0), rssi)
+                self._try_link(g, a, linkable[j], best_neighbor)
 
-        _, paths = nx.single_source_dijkstra(g, GATEWAY_KEY, weight="weight")
+        # Ground-only Dijkstra decides which nodes the mobile relay must bridge.
+        _, ground_paths = nx.single_source_dijkstra(g, GATEWAY_KEY, weight="weight")
+        self.isolated_ground = {
+            n.id for n in nodes
+            if n.id not in ground_paths and self.node_can_link(n) and not n.is_gateway
+        }
+
+        paths = ground_paths
+        if not relay_in_graph:
+            relay.status, relay.rssi, relay.snr, relay.reachable = STATUS_ONLINE, None, None, False
+            relay.parent_id, relay.hop_path = None, []
+        else:
+            g.add_node(relay.id, type="relay")
+            if self.node_can_link(relay):
+                for n in linkable:
+                    self._try_link(g, relay, n, best_neighbor)
+            _, paths = nx.single_source_dijkstra(g, GATEWAY_KEY, weight="weight")
+
         self.mesh_graph = g
         self.paths = paths
-        self.update_node_states(nodes, best_neighbor)
+        self.update_node_states(graph_nodes, best_neighbor)
         self.compute_metrics(nodes)
+
+    def _try_link(self, g: nx.DiGraph, a: MeshNode, b: MeshNode, best_neighbor: dict[str, float]) -> None:
+        if a.channel != b.channel:
+            return
+        d = haversine_m(a.lat, a.lng, b.lat, b.lng)
+        if a.id == RELAY_ID or b.id == RELAY_ID:
+            d = math.hypot(d, RELAY_ALT_M)  # slant range to the airborne relay
+            if d > RELAY_LINK_MAX_M:
+                return
+            nominal = SIM_TX_POWER + RELAY_ANTENNA_GAIN_DB - 10 * SIM_PATH_LOSS_EXPONENT * math.log10(max(d, 1.0)) + self.rng.gauss(0, RSSI_SIGMA)
+        else:
+            nominal = self.link_rssi(a, b, d)
+            if nominal is None:
+                return
+        rssi = nominal - max(a.rf_penalty_db, b.rf_penalty_db)
+        if rssi <= LINK_RSSI_MIN:
+            return
+        w = (100.0 / abs(rssi)) + 2.0
+        attrs = {"weight": w, "rssi": rssi, "nominal_rssi": nominal, "distance_m": d}
+        g.add_edge(a.id, b.id, **attrs)
+        g.add_edge(b.id, a.id, **attrs)
+        best_neighbor[a.id] = max(best_neighbor.get(a.id, -999.0), rssi)
+        best_neighbor[b.id] = max(best_neighbor.get(b.id, -999.0), rssi)
 
     def update_node_states(self, nodes: list[MeshNode], best_neighbor: dict[str, float]) -> None:
         for n in nodes:
@@ -852,9 +1094,94 @@ class Bridge:
     def tick(self) -> None:
         self.tick_count += 1
         self.swarm.step(SIM_TICK_S, self.gateway_pos)
+        self.update_relay_kinematics()
         self.recompute_topology()
         self.evaluate_rf_alerts()
         self.evaluate_acs()
+        self.evaluate_relay()
+        self.stream_mavlink()
+
+    # ------------------------------------------------------------------ #
+    # Mobile relay (UAV-RELAY-01) + MAVLink
+    # ------------------------------------------------------------------ #
+    def relay_home(self) -> tuple[float, float]:
+        return destination(self.gateway_pos[0], self.gateway_pos[1], RELAY_HOME_OFFSET_M, RELAY_HOME_BEARING)
+
+    def update_relay_kinematics(self) -> None:
+        self.relay.home = self.relay_home()
+        arrived = self.relay.step(SIM_TICK_S)
+        if arrived:
+            wp = self.relay.target_waypoint
+            self.log_event(
+                "MAVLINK", "ok",
+                f"Relay Node on station at WP-ALPHA ({wp[0]:.5f}, {wp[1]:.5f}, {RELAY_ALT_M:.0f}m); BRIDGING_ACTIVE",
+            )
+
+    def evaluate_relay(self) -> None:
+        r = self.relay
+        isolated = [n for n in self.all_nodes() if n.id in self.isolated_ground]
+        r.isolated_count = len(isolated)
+        r.bridged_count = sum(1 for n in self.all_nodes() if RELAY_ID in n.hop_path)
+        now = self.tick_count * SIM_TICK_S
+        r.isolation_streak = r.isolation_streak + 1 if isolated else 0
+
+        if isolated and r.isolation_streak >= RELAY_DISPATCH_CONFIRM_TICKS:
+            r.last_isolated_at = now
+            iso_lat = sum(n.lat for n in isolated) / len(isolated)
+            iso_lng = sum(n.lng for n in isolated) / len(isolated)
+            gw_lat, gw_lng = self.gateway_pos
+            relay_lat = (gw_lat + iso_lat) / 2.0
+            relay_lng = (gw_lng + iso_lng) / 2.0
+            r.isolated_centroid = (iso_lat, iso_lng)
+            needs_new_wp = (
+                r.mission_state == RELAY_LOITERING
+                or r.target_waypoint is None
+                or haversine_m(relay_lat, relay_lng, *r.target_waypoint) > RELAY_WAYPOINT_DEADBAND_M
+            )
+            if needs_new_wp:
+                first_dispatch = r.mission_state == RELAY_LOITERING
+                r.dispatch((relay_lat, relay_lng))
+                self.mavlink.send_waypoint(relay_lat, relay_lng, RELAY_ALT_M, r.waypoint_count)
+                self.log_event(
+                    "MAVLINK", "warn",
+                    f"Relay Node -> WP-ALPHA ({relay_lat:.5f}, {relay_lng:.5f}, {RELAY_ALT_M:.0f}m) "
+                    f"bridging {len(isolated)} isolated node(s)",
+                )
+                if first_dispatch:
+                    self.notify_phones(f"[RELAY] {RELAY_ID} dispatched to bridge {len(isolated)} node(s)")
+        elif r.mission_state != RELAY_LOITERING and not isolated and now - r.last_isolated_at > RELAY_RTB_HOLD_S:
+            r.return_home()
+            self.log_event("MAVLINK", "info", f"Partition healed; {RELAY_ID} returning to LOITER over gateway")
+
+    def stream_mavlink(self) -> None:
+        r = self.relay
+        self.mavlink.send_heartbeat(active=r.mission_state != RELAY_LOITERING)
+        self.mavlink.send_global_position(r.node.lat, r.node.lng, RELAY_ALT_M, r.ground_speed_mps, r.bearing_deg)
+
+    def autopilot_dict(self) -> dict:
+        r = self.relay
+        return {
+            "id": RELAY_ID,
+            "coords": [round(r.node.lat, 7), round(r.node.lng, 7)],
+            "target_waypoint": [round(r.target_waypoint[0], 7), round(r.target_waypoint[1], 7)] if r.target_waypoint else None,
+            "home": [round(r.home[0], 7), round(r.home[1], 7)],
+            "isolated_centroid": [round(r.isolated_centroid[0], 7), round(r.isolated_centroid[1], 7)] if r.isolated_centroid else None,
+            "alt_m": RELAY_ALT_M,
+            "speed_mps": round(r.ground_speed_mps, 1),
+            "cruise_speed_mps": RELAY_SPEED_MPS,
+            "bearing_deg": round(r.bearing_deg, 1),
+            "eta_s": round(r.eta_s, 1) if r.eta_s is not None else None,
+            "mission_state": r.mission_state,
+            "status": r.node.status,
+            "isolated_count": r.isolated_count,
+            "bridged_count": r.bridged_count,
+            "waypoint_count": r.waypoint_count,
+            "mavlink_host": MAVLINK_HOST,
+            "mavlink_port": MAVLINK_PORT,
+            "mavlink_backend": self.mavlink.backend,
+            "last_command": "MAV_CMD_NAV_WAYPOINT" if r.waypoint_count else None,
+            "packet_count": self.mavlink.packet_count,
+        }
 
     # ------------------------------------------------------------------ #
     # RF attenuation zone & Adaptive Channel Switching
@@ -1150,6 +1477,7 @@ class Bridge:
             "nodes": [self.node_to_dict(n) for n in self.all_nodes()],
             "links": self.links_list(),
             "threat": self.threat_dict(),
+            "autopilot": self.autopilot_dict(),
         }
 
     async def broadcast_snapshot(self):
