@@ -133,6 +133,30 @@ NULL_RSSI_STREAK_LIMIT = 3
 
 LOG_HISTORY_MAX = 60
 
+# ------------------------------------------------------------------ #
+# RF attenuation zone & Adaptive Channel Switching (ACS)
+# ------------------------------------------------------------------ #
+ZONE_DEFAULT_KILL_M = 200.0
+ZONE_DEFAULT_BLEED_M = 450.0
+ZONE_MAX_RADIUS_M = 2000.0
+FRINGE_MAX_PENALTY_DB = 35.0
+FRINGE_RSSI_FLOOR_DBM = -92.0
+JAMMED_RSSI_DBM = -95.0
+JAMMED_SNR_DB = -12.0
+INTERFERED_NOISE_DBM = -45.0
+ACS_TRIGGER_COUNT = 2
+ACS_CONFIRM_S = 3.0
+ACS_SCAN_DELAY_S = 1.5
+ACS_NON_OVERLAPPING = (1, 6, 11)
+ACS_MIN_SEPARATION = 5  # channels closer than this overlap on 2.4 GHz (20 MHz width)
+
+RF_ALERT_MIN_INTERVAL_S = 5.0
+
+ACS_IDLE = "IDLE"
+ACS_CONFIRMING = "CONFIRMING"
+ACS_SWITCHING = "SWITCHING"
+ACS_SCANNING = "SCANNING"
+
 STATUS_ONLINE = "ONLINE"
 STATUS_DEGRADED = "DEGRADED"
 STATUS_JAMMED = "JAMMED"
@@ -311,6 +335,18 @@ class MeshNode:
         if self.is_gateway:
             return "gateway"
         return "edge" if self.type == "hardware" else "virtual"
+
+
+@dataclass
+class InterferenceZone:
+    """A simulated high-attenuation / interference area on one Wi-Fi channel."""
+    lat: float
+    lng: float
+    kill_radius_m: float
+    bleed_radius_m: float
+    channel: int
+    freq_mhz: int
+    deployed_at: float
 
 
 def virtual_id(index: int) -> str:
@@ -519,6 +555,20 @@ class Bridge:
             "reachable_count": 0,
         }
         self.log_history: list[dict] = []
+
+        # RF attenuation zone + ACS state
+        self.zone: InterferenceZone | None = None
+        self.interference_reports: list[dict] = []
+        self.estimated_epicenter: tuple[float, float] | None = None
+        self.acs_auto = True
+        self.acs_state = ACS_IDLE
+        self.acs_confirm_started: float | None = None
+        self.acs_confirm_token = 0
+        self.acs_target_channel: int | None = None
+        self.self_heal_convergence_ms: float | None = None
+        self._last_rf_counts = (0, 0)
+        self._last_rf_alert_at = 0.0
+
         self.recompute_topology()
 
     # ------------------------------------------------------------------ #
@@ -623,20 +673,58 @@ class Bridge:
         return SIM_TX_POWER - 10 * SIM_PATH_LOSS_EXPONENT * math.log10(max(d, 1.0)) + self.rng.gauss(0, RSSI_SIGMA)
 
     def compute_spectrum(self) -> dict[str, float]:
-        return {str(ch): BASE_NOISE_FLOOR_DBM + self.rng.uniform(-1.0, 1.0) for ch in WIFI_CHANNELS}
+        spectrum = {}
+        for ch in WIFI_CHANNELS:
+            if self.zone is not None and abs(ch - self.zone.channel) <= 1:
+                spectrum[str(ch)] = INTERFERED_NOISE_DBM + self.rng.uniform(-1.5, 1.5)
+            else:
+                spectrum[str(ch)] = BASE_NOISE_FLOOR_DBM + self.rng.uniform(-1.0, 1.0)
+        return spectrum
 
     def node_can_link(self, n: MeshNode) -> bool:
-        if n.is_gateway:
-            return True
-        if n.type == "hardware" and n.reported_status in (STATUS_OFFLINE, STATUS_JAMMED):
+        if n.type == "hardware" and not n.is_gateway and n.reported_status in (STATUS_OFFLINE, STATUS_JAMMED):
             return False
         return n.rf_state != STATUS_JAMMED
 
     def apply_rf_environment(self, nodes: list[MeshNode]) -> None:
-        """Hook for the interference engine; clears attenuation when no zone is active."""
+        """Dual-zone attenuation physics: primary drop zone + proportional fringe penalty."""
+        self.interference_reports = []
+        zone = self.zone
         for n in nodes:
             n.rf_state = "CLEAR"
             n.rf_penalty_db = 0.0
+            if zone is None or n.channel != zone.channel:
+                continue
+            d = haversine_m(n.lat, n.lng, zone.lat, zone.lng)
+            if d <= zone.kill_radius_m:
+                n.rf_state = STATUS_JAMMED
+            elif d <= zone.bleed_radius_m:
+                penalty = ((zone.bleed_radius_m - d) / (zone.bleed_radius_m - zone.kill_radius_m)) * FRINGE_MAX_PENALTY_DB
+                n.rf_state = STATUS_DEGRADED
+                n.rf_penalty_db = penalty
+                noise_floor = BASE_NOISE_FLOOR_DBM + (penalty / FRINGE_MAX_PENALTY_DB) * (INTERFERED_NOISE_DBM - BASE_NOISE_FLOOR_DBM)
+                self.interference_reports.append({
+                    "type": "INTERFERENCE_REPORT",
+                    "node_id": n.id,
+                    "coords": (n.lat, n.lng),
+                    "noise_floor_dbm": noise_floor,
+                    "penalty_db": penalty,
+                })
+        self.estimated_epicenter = self.estimate_epicenter(nodes)
+
+    def estimate_epicenter(self, nodes: list[MeshNode]) -> tuple[float, float] | None:
+        """Weighted centroid of degraded perimeter reports (weight = observed attenuation)."""
+        if self.zone is None:
+            return None
+        total_w = sum(r["penalty_db"] for r in self.interference_reports)
+        if total_w > 0:
+            lat = sum(r["coords"][0] * r["penalty_db"] for r in self.interference_reports) / total_w
+            lng = sum(r["coords"][1] * r["penalty_db"] for r in self.interference_reports) / total_w
+            return lat, lng
+        jammed = [n for n in nodes if n.rf_state == STATUS_JAMMED]
+        if jammed:
+            return sum(n.lat for n in jammed) / len(jammed), sum(n.lng for n in jammed) / len(jammed)
+        return None
 
     def recompute_topology(self) -> None:
         """Rebuilds the unified directed graph, Dijkstra tree, node states and metrics."""
@@ -690,7 +778,12 @@ class Bridge:
             n.hop_path = list(path) if path else []
             n.parent_id = path[-2] if path and len(path) >= 2 else None
             if n.is_gateway:
-                n.status = STATUS_ONLINE
+                if n.rf_state == STATUS_JAMMED:
+                    n.status = STATUS_JAMMED
+                elif n.rf_state == STATUS_DEGRADED:
+                    n.status = STATUS_DEGRADED
+                else:
+                    n.status = STATUS_ONLINE
                 n.rssi = None
                 n.snr = None
                 continue
@@ -706,18 +799,18 @@ class Bridge:
                 n.rssi = None
             elif n.rf_state == STATUS_JAMMED or (n.type == "hardware" and n.reported_status == STATUS_JAMMED):
                 n.status = STATUS_JAMMED
-                n.rssi = -95.0
+                n.rssi = JAMMED_RSSI_DBM
             elif n.rf_state == STATUS_DEGRADED:
                 n.status = STATUS_DEGRADED
                 if nominal is not None:
-                    n.rssi = max(-92.0, nominal - n.rf_penalty_db)
+                    n.rssi = max(FRINGE_RSSI_FLOOR_DBM, nominal - n.rf_penalty_db)
             elif not n.reachable:
                 n.status = STATUS_OFFLINE
             else:
                 n.status = STATUS_ONLINE
             noise = self.spectrum_noise.get(str(n.channel), BASE_NOISE_FLOOR_DBM)
             if n.status == STATUS_JAMMED:
-                n.snr = -12.0
+                n.snr = JAMMED_SNR_DB
             elif n.rssi is not None:
                 n.snr = n.rssi - noise
             else:
@@ -760,6 +853,213 @@ class Bridge:
         self.tick_count += 1
         self.swarm.step(SIM_TICK_S, self.gateway_pos)
         self.recompute_topology()
+        self.evaluate_rf_alerts()
+        self.evaluate_acs()
+
+    # ------------------------------------------------------------------ #
+    # RF attenuation zone & Adaptive Channel Switching
+    # ------------------------------------------------------------------ #
+    def rf_counts(self) -> tuple[int, int]:
+        nodes = self.all_nodes()
+        jammed = sum(1 for n in nodes if n.status == STATUS_JAMMED)
+        degraded = sum(1 for n in nodes if n.status == STATUS_DEGRADED)
+        return jammed, degraded
+
+    def evaluate_rf_alerts(self) -> None:
+        counts = self.rf_counts()
+        now = time.monotonic()
+        first_impact = self._last_rf_counts == (0, 0)
+        due = first_impact or now - self._last_rf_alert_at >= RF_ALERT_MIN_INTERVAL_S
+        if counts != self._last_rf_counts and self.zone is not None and due:
+            jammed, degraded = counts
+            if jammed or degraded:
+                self._last_rf_alert_at = now
+                est = self.estimated_epicenter
+                est_txt = f"; est. center {est[0]:.5f}, {est[1]:.5f}" if est else ""
+                self.log_event(
+                    "RF-ALERT", "critical" if jammed else "warn",
+                    f"CH {self.zone.channel}: {jammed} node(s) in primary drop zone, {degraded} degraded "
+                    f"({len(self.interference_reports)} interference reports{est_txt})",
+                )
+            self._last_rf_counts = counts
+        elif self.zone is None or counts == (0, 0):
+            self._last_rf_counts = counts
+
+    def deploy_zone(self, msg: dict) -> None:
+        lat, lng = float(msg["lat"]), float(msg["lng"])
+        kill = float(msg.get("kill_radius_m", ZONE_DEFAULT_KILL_M))
+        kill = max(10.0, min(ZONE_MAX_RADIUS_M, kill))
+        bleed = float(msg.get("bleed_radius_m", ZONE_DEFAULT_BLEED_M))
+        if bleed <= kill:
+            bleed = kill * (ZONE_DEFAULT_BLEED_M / ZONE_DEFAULT_KILL_M)
+        bleed = min(ZONE_MAX_RADIUS_M * 2.5, bleed)
+        if "channel" in msg and msg["channel"] is not None:
+            channel = int(msg["channel"])
+        elif "freq_mhz" in msg and msg["freq_mhz"] is not None:
+            channel = int(round((float(msg["freq_mhz"]) - 2407) / 5))
+        else:
+            channel = self.active_channel
+        if channel not in WIFI_CHANNELS:
+            raise ValueError(f"channel {channel} outside 1-11")
+        self.zone = InterferenceZone(
+            lat=lat, lng=lng, kill_radius_m=kill, bleed_radius_m=bleed,
+            channel=channel, freq_mhz=channel_freq_mhz(channel), deployed_at=time.monotonic(),
+        )
+        self._last_rf_counts = (0, 0)
+        self.log_event(
+            "RF-ALERT", "critical",
+            f"Interference zone placed at {lat:.5f}, {lng:.5f} on CH {channel} ({channel_freq_mhz(channel)} MHz): "
+            f"primary drop {kill:.0f} m / fringe {bleed:.0f} m",
+        )
+        self.notify_phones(f"[RF-ALERT] Interference detected on CH {channel}")
+
+    def clear_zone(self) -> None:
+        if self.zone is None:
+            return
+        self.zone = None
+        self.estimated_epicenter = None
+        self._last_rf_counts = (0, 0)
+        if self.acs_state == ACS_CONFIRMING:
+            self._cancel_confirmation("interference zone cleared")
+        self.log_event("RF-ALERT", "ok", "Interference zone cleared; spectrum nominal")
+        self.notify_phones("[RF-CLEAR] Interference cleared")
+
+    def choose_clean_channel(self) -> int:
+        """Cleanest non-overlapping channel away from the interference."""
+        avoid = self.zone.channel if self.zone is not None else self.active_channel
+        candidates = [
+            ch for ch in ACS_NON_OVERLAPPING
+            if ch != self.active_channel and abs(ch - avoid) >= ACS_MIN_SEPARATION
+        ] or [ch for ch in ACS_NON_OVERLAPPING if ch != self.active_channel]
+        # Prefer CH 11 on ties; noise jitter is +/- 1 dB so only real interference changes the order.
+        return min(candidates, key=lambda ch: (round(self.spectrum_noise.get(str(ch), BASE_NOISE_FLOOR_DBM) / 3.0), -ch))
+
+    def fhss_countdown_s(self) -> float | None:
+        if self.acs_state != ACS_CONFIRMING or self.acs_confirm_started is None:
+            return None
+        return max(0.0, ACS_CONFIRM_S - (time.monotonic() - self.acs_confirm_started))
+
+    def _cancel_confirmation(self, reason: str) -> None:
+        self.acs_state = ACS_IDLE
+        self.acs_confirm_started = None
+        self.acs_target_channel = None
+        self.acs_confirm_token += 1
+        self.log_event("CH-SWITCH", "info", f"ACS confirmation cancelled: {reason}")
+
+    def evaluate_acs(self) -> None:
+        jammed, degraded = self.rf_counts()
+        affected = jammed + degraded
+        zone_on_channel = self.zone is not None and self.zone.channel == self.active_channel
+        if self.acs_state == ACS_IDLE:
+            if self.acs_auto and zone_on_channel and affected >= ACS_TRIGGER_COUNT:
+                self.acs_state = ACS_CONFIRMING
+                self.acs_confirm_started = time.monotonic()
+                self.acs_target_channel = self.choose_clean_channel()
+                self.acs_confirm_token += 1
+                self.log_event(
+                    "CH-SWITCH", "warn",
+                    f"ACS: {affected} node(s) disconnected/degraded on CH {self.active_channel}; "
+                    f"confirming for {ACS_CONFIRM_S:.1f}s before switching to CH {self.acs_target_channel}",
+                )
+                self._spawn(self._confirm_then_switch(self.acs_confirm_token))
+        elif self.acs_state == ACS_CONFIRMING:
+            if not self.acs_auto:
+                self._cancel_confirmation("switched to MANUAL mode")
+            elif not zone_on_channel or affected < ACS_TRIGGER_COUNT:
+                self._cancel_confirmation("signal degradation subsided")
+
+    async def _confirm_then_switch(self, token: int) -> None:
+        await asyncio.sleep(ACS_CONFIRM_S)
+        if self.acs_state != ACS_CONFIRMING or token != self.acs_confirm_token:
+            return
+        target = self.choose_clean_channel()
+        await self.execute_channel_switch(target, "AUTO_CLEAN")
+
+    async def execute_channel_switch(self, target: int, reason: str) -> None:
+        if target not in WIFI_CHANNELS:
+            self.log_event("CH-SWITCH", "warn", f"Rejected channel switch to invalid CH {target}")
+            return
+        if self.acs_state in (ACS_SWITCHING, ACS_SCANNING):
+            self.log_event("CH-SWITCH", "warn", f"Channel switch to CH {target} ignored: switch already in progress")
+            return
+        if target == self.active_channel:
+            if self.acs_state == ACS_CONFIRMING:
+                self._cancel_confirmation(f"already on CH {target}")
+            self.log_event("CH-SWITCH", "info", f"Mesh already operating on CH {target}")
+            return
+
+        old = self.active_channel
+        self.acs_state = ACS_SWITCHING
+        self.acs_confirm_token += 1
+        self.acs_confirm_started = None
+        self.acs_target_channel = target
+        t0 = time.perf_counter()
+        self.log_event(
+            "CH-SWITCH", "warn",
+            f"Executing channel switch CH {old} ({channel_freq_mhz(old)} MHz) -> CH {target} "
+            f"({channel_freq_mhz(target)} MHz) [{reason}]",
+        )
+
+        # 1. Tell the physical ESP32 mesh (and their phones) about the new channel.
+        self.serial_send(f"CH_SWITCH:{target}|{reason}")
+
+        # 2. Move every active node to the new channel.
+        self.active_channel = target
+        moved = 0
+        for n in self.all_nodes():
+            if n.channel == old and n.status != STATUS_JAMMED and not (n.type == "hardware" and n.reported_status == STATUS_OFFLINE):
+                n.channel = target
+                moved += 1
+        self.recompute_topology()
+        await self.broadcast_snapshot()
+        self.log_event("CH-SWITCH", "info", f"{moved} active node(s) retuned to CH {target}; scanning for stragglers")
+
+        # 3. After the scan delay, pull the disconnected nodes onto the clean channel.
+        self.acs_state = ACS_SCANNING
+        await asyncio.sleep(ACS_SCAN_DELAY_S)
+        recovered = 0
+        for n in self.all_nodes():
+            if n.channel == old and not (n.type == "hardware" and n.reported_status == STATUS_OFFLINE):
+                n.channel = target
+                recovered += 1
+        self.recompute_topology()
+
+        # 4. Record self-healing convergence.
+        self.self_heal_convergence_ms = (time.perf_counter() - t0) * 1000.0
+        members = [n for n in self.all_nodes() if not n.is_gateway]
+        reachable = sum(1 for n in members if n.reachable)
+        self.acs_state = ACS_IDLE
+        self.acs_target_channel = None
+        self.log_event(
+            "CH-SWITCH", "ok",
+            f"Self-healing converged in {self.self_heal_convergence_ms / 1000.0:.2f} s on CH {target}: "
+            f"{recovered} node(s) recovered, {reachable}/{len(members)} reachable via Dijkstra",
+        )
+        await self.broadcast_snapshot()
+
+    def threat_dict(self) -> dict:
+        jammed, degraded = self.rf_counts()
+        z = self.zone
+        est = self.estimated_epicenter
+        countdown = self.fhss_countdown_s()
+        return {
+            "active": z is not None,
+            "epicenter": [z.lat, z.lng] if z else None,
+            "estimated_epicenter": [round(est[0], 7), round(est[1], 7)] if est else None,
+            "estimation_error_m": round(haversine_m(z.lat, z.lng, est[0], est[1]), 1) if (z and est) else None,
+            "kill_radius_m": z.kill_radius_m if z else ZONE_DEFAULT_KILL_M,
+            "bleed_radius_m": z.bleed_radius_m if z else ZONE_DEFAULT_BLEED_M,
+            "channel": z.channel if z else None,
+            "freq_mhz": z.freq_mhz if z else None,
+            "jammed_count": jammed,
+            "degraded_count": degraded,
+            "report_count": len(self.interference_reports),
+            "eccm_auto": self.acs_auto,
+            "acs_state": self.acs_state,
+            "acs_target_channel": self.acs_target_channel,
+            "fhss_countdown_s": round(countdown, 2) if countdown is not None else None,
+            "fhss_confirm_s": ACS_CONFIRM_S,
+        }
 
     async def sim_loop(self):
         loop = asyncio.get_running_loop()
@@ -801,7 +1101,7 @@ class Bridge:
             "health_score": round(self.metrics["health_score"], 1),
             "pdr_percent": round(self.metrics["pdr_percent"], 2),
             "avg_latency_ms": round(self.metrics["avg_latency_ms"], 2),
-            "self_heal_convergence_ms": None,
+            "self_heal_convergence_ms": _round(self.self_heal_convergence_ms, 1),
             "graph_diameter": self.metrics["graph_diameter"],
             "spectrum_noise": {k: round(v, 1) for k, v in self.spectrum_noise.items()},
             "node_count": len(nodes),
@@ -849,6 +1149,7 @@ class Bridge:
             "network": self.network_dict(),
             "nodes": [self.node_to_dict(n) for n in self.all_nodes()],
             "links": self.links_list(),
+            "threat": self.threat_dict(),
         }
 
     async def broadcast_snapshot(self):
@@ -937,7 +1238,26 @@ class Bridge:
             await self.broadcast_snapshot()
 
     def handle_extended_command(self, mtype, msg: dict) -> bool:
-        """Hook for commands added by later subsystems. Returns True if a refresh is needed."""
+        """RF / ACS commands. Returns True if a topology refresh is needed."""
+        if mtype == "DEPLOY_JAMMER":
+            self.deploy_zone(msg)
+            return True
+        if mtype == "CLEAR_JAMMER":
+            self.clear_zone()
+            return True
+        if mtype == "SET_ECCM_MODE":
+            self.acs_auto = bool(msg["auto"])
+            self.log_event("CH-SWITCH", "info", f"Adaptive Channel Switching: {'AUTO' if self.acs_auto else 'MANUAL'}")
+            if not self.acs_auto and self.acs_state == ACS_CONFIRMING:
+                self._cancel_confirmation("switched to MANUAL mode")
+            return True
+        if mtype == "EXECUTE_FHSS":
+            target = int(msg["target_channel"])
+            if self.acs_state == ACS_CONFIRMING:
+                self.acs_state = ACS_IDLE
+                self.acs_confirm_token += 1
+            self._spawn(self.execute_channel_switch(target, "AUTO_CLEAN" if msg.get("auto") else "MANUAL"))
+            return False
         return False
 
     def uplink(self, target: str, text: str) -> None:
