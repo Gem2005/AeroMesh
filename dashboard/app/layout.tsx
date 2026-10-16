@@ -13,9 +13,9 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "AeroMesh Command",
+  title: "AeroMesh HIL Mesh Digital Twin",
   description:
-    "Command & control visualization for a self-healing ESP32 painlessMesh network with UAV bridge",
+    "Hardware-in-the-loop wireless mesh digital twin: ESP32 painlessMesh nodes, virtual swarm, RF attenuation simulator and MAVLink relay telemetry",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
@@ -24,7 +24,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       lang="en"
       className={`${inter.variable} ${jetbrainsMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="h-full overflow-hidden">{children}</body>
     </html>
   );
 }

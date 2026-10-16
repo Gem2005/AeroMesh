@@ -159,6 +159,7 @@ ACS_CONFIRM_S = 3.0
 ACS_SCAN_DELAY_S = 1.5
 ACS_NON_OVERLAPPING = (1, 6, 11)
 ACS_MIN_SEPARATION = 5  # channels closer than this overlap on 2.4 GHz (20 MHz width)
+ACS_CLEAN_MARGIN_DB = 6.0  # noise within this margin of the base floor counts as clean
 
 RF_ALERT_MIN_INTERVAL_S = 5.0
 
@@ -169,8 +170,8 @@ RELAY_ID = "UAV-RELAY-01"
 RELAY_ALT_M = 60.0
 RELAY_SPEED_MPS = 18.0
 RELAY_ARRIVAL_RADIUS_M = 10.0
-RELAY_HOME_OFFSET_M = 25.0
-RELAY_HOME_BEARING = 270.0          # loiter just west of the gateway marker
+RELAY_HOME_OFFSET_M = 45.0
+RELAY_HOME_BEARING = 225.0          # loiter south-west of the gateway marker
 RELAY_RTB_HOLD_S = 10.0             # partition must stay healed this long before returning
 RELAY_WAYPOINT_DEADBAND_M = 40.0    # ignore centroid drift smaller than this
 RELAY_DISPATCH_CONFIRM_TICKS = 2    # isolation must persist this many ticks before dispatch
@@ -331,7 +332,8 @@ def hop_success(rssi: float) -> float:
 
 
 def link_quality(rssi: float) -> float:
-    return max(0.0, min(1.0, (rssi - LINK_RSSI_MIN) / (-50.0 - LINK_RSSI_MIN)))
+    """0 at the -88 dBm link threshold, 1 at -70 dBm and above."""
+    return max(0.0, min(1.0, (rssi - LINK_RSSI_MIN) / (-70.0 - LINK_RSSI_MIN)))
 
 
 def _round(v, nd=2):
@@ -1258,8 +1260,13 @@ class Bridge:
             ch for ch in ACS_NON_OVERLAPPING
             if ch != self.active_channel and abs(ch - avoid) >= ACS_MIN_SEPARATION
         ] or [ch for ch in ACS_NON_OVERLAPPING if ch != self.active_channel]
-        # Prefer CH 11 on ties; noise jitter is +/- 1 dB so only real interference changes the order.
-        return min(candidates, key=lambda ch: (round(self.spectrum_noise.get(str(ch), BASE_NOISE_FLOOR_DBM) / 3.0), -ch))
+
+        def interference_rank(ch: int) -> float:
+            noise = self.spectrum_noise.get(str(ch), BASE_NOISE_FLOOR_DBM)
+            return 0.0 if noise <= BASE_NOISE_FLOOR_DBM + ACS_CLEAN_MARGIN_DB else noise
+
+        # Clean channels tie, and ties prefer CH 11 (2462 MHz) over CH 1 (2412 MHz).
+        return min(candidates, key=lambda ch: (interference_rank(ch), -ch))
 
     def fhss_countdown_s(self) -> float | None:
         if self.acs_state != ACS_CONFIRMING or self.acs_confirm_started is None:
@@ -1357,11 +1364,19 @@ class Bridge:
         reachable = sum(1 for n in members if n.reachable)
         self.acs_state = ACS_IDLE
         self.acs_target_channel = None
-        self.log_event(
-            "CH-SWITCH", "ok",
-            f"Self-healing converged in {self.self_heal_convergence_ms / 1000.0:.2f} s on CH {target}: "
-            f"{recovered} node(s) recovered, {reachable}/{len(members)} reachable via Dijkstra",
-        )
+        elapsed_s = self.self_heal_convergence_ms / 1000.0
+        if reachable == len(members):
+            self.log_event(
+                "CH-SWITCH", "ok",
+                f"Self-healing converged in {elapsed_s:.2f} s on CH {target}: "
+                f"{recovered} node(s) recovered, {reachable}/{len(members)} reachable via Dijkstra",
+            )
+        else:
+            self.log_event(
+                "CH-SWITCH", "warn",
+                f"Channel switch settled in {elapsed_s:.2f} s on CH {target}, but only "
+                f"{reachable}/{len(members)} node(s) reachable; CH {target} is still impaired",
+            )
         await self.broadcast_snapshot()
 
     def threat_dict(self) -> dict:

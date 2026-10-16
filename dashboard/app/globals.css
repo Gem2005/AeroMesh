@@ -5,1004 +5,249 @@
   --font-mono: var(--font-jetbrains-mono);
 }
 
+html,
 body {
-  background-color: #020617;
-  color: #cbd5e1;
-  font-family: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
-}
-
-/* ------------------------------------------------------------------ */
-/* Ultra-Premium Tactical Glassmorphism System                         */
-/* ------------------------------------------------------------------ */
-
-.glass {
-  background: linear-gradient(135deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0.015) 100%), rgba(2, 6, 23, 0.52) !important;
-  backdrop-filter: blur(16px) saturate(190%);
-  -webkit-backdrop-filter: blur(16px) saturate(190%);
-  border: 1px solid rgba(255, 255, 255, 0.12) !important;
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.18),
-    0 8px 32px 0 rgba(0, 0, 0, 0.4);
-}
-
-.glass-sidebar {
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.01) 100%), rgba(2, 6, 23, 0.54);
-  backdrop-filter: blur(18px) saturate(190%);
-  -webkit-backdrop-filter: blur(18px) saturate(190%);
-  border-right: 1px solid rgba(255, 255, 255, 0.12);
-  box-shadow:
-    inset -1px 0 0 0 rgba(255, 255, 255, 0.06),
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.12),
-    4px 0 32px 0 rgba(0, 0, 0, 0.45);
-}
-
-.glass-subtle {
-  background: linear-gradient(135deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.01) 100%), rgba(15, 23, 42, 0.35);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-}
-
-.glass-card {
-  background: linear-gradient(135deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0.015) 100%), rgba(10, 16, 32, 0.35);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.12),
-    0 4px 16px 0 rgba(0, 0, 0, 0.25);
-  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.glass-card:hover {
-  background: linear-gradient(135deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.025) 100%), rgba(30, 41, 59, 0.5);
-  border-color: rgba(56, 189, 248, 0.4);
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.2),
-    0 6px 24px 0 rgba(0, 0, 0, 0.35);
-}
-
-.glass-card-operator {
-  background: linear-gradient(135deg, rgba(245, 158, 11, 0.15) 0%, rgba(245, 158, 11, 0.03) 100%), rgba(2, 6, 23, 0.48);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(245, 158, 11, 0.4);
-  box-shadow:
-    inset 0 1px 0 0 rgba(245, 158, 11, 0.3),
-    0 4px 20px 0 rgba(245, 158, 11, 0.12);
-  transition: all 0.2s ease;
-}
-.glass-card-operator:hover {
-  border-color: rgba(245, 158, 11, 0.65);
-  box-shadow:
-    inset 0 1px 0 0 rgba(245, 158, 11, 0.4),
-    0 6px 24px 0 rgba(245, 158, 11, 0.22);
-}
-
-.glass-card-gateway {
-  background: linear-gradient(135deg, rgba(34, 211, 238, 0.15) 0%, rgba(34, 211, 238, 0.03) 100%), rgba(2, 6, 23, 0.48);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(34, 211, 238, 0.4);
-  box-shadow:
-    inset 0 1px 0 0 rgba(34, 211, 238, 0.3),
-    0 4px 20px 0 rgba(34, 211, 238, 0.12);
-  transition: all 0.2s ease;
-}
-.glass-card-gateway:hover {
-  border-color: rgba(34, 211, 238, 0.65);
-  box-shadow:
-    inset 0 1px 0 0 rgba(34, 211, 238, 0.45),
-    0 6px 24px 0 rgba(34, 211, 238, 0.22);
-}
-
-.glass-card-jammed {
-  background: linear-gradient(135deg, rgba(244, 63, 94, 0.18) 0%, rgba(244, 63, 94, 0.04) 100%), rgba(2, 6, 23, 0.5);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(244, 63, 94, 0.5);
-  box-shadow:
-    inset 0 1px 0 0 rgba(244, 63, 94, 0.3),
-    0 4px 20px 0 rgba(244, 63, 94, 0.2);
-}
-
-.glass-card-relay {
-  background: linear-gradient(135deg, rgba(56, 189, 248, 0.18) 0%, rgba(56, 189, 248, 0.04) 100%), rgba(2, 6, 23, 0.48);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(56, 189, 248, 0.5);
-  box-shadow:
-    inset 0 1px 0 0 rgba(56, 189, 248, 0.3),
-    0 4px 24px 0 rgba(56, 189, 248, 0.25);
-}
-
-.glass-pill {
-  background: linear-gradient(135deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.02) 100%), rgba(15, 23, 42, 0.35);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
-  transition: all 0.2s ease;
-}
-.glass-pill:hover {
-  background: linear-gradient(135deg, rgba(255, 255, 255, 0.12) 0%, rgba(255, 255, 255, 0.03) 100%), rgba(30, 41, 59, 0.5);
-  border-color: rgba(255, 255, 255, 0.22);
-}
-
-.glass-terminal {
-  height: 150px;
-  background: linear-gradient(180deg, rgba(2, 6, 23, 0.52) 0%, rgba(2, 6, 23, 0.72) 100%) !important;
-  backdrop-filter: blur(18px) saturate(190%) !important;
-  -webkit-backdrop-filter: blur(18px) saturate(190%) !important;
-  border: 1px solid rgba(255, 255, 255, 0.14) !important;
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.18),
-    0 12px 40px 0 rgba(0, 0, 0, 0.55) !important;
-}
-
-/* ================================================================== */
-/* FEATURE 1: NODE INSPECTOR PANEL                                     */
-/* ================================================================== */
-
-.inspector-panel {
-  background: linear-gradient(135deg, rgba(15, 23, 42, 1) 0%, rgba(2, 6, 23, 1) 100%);
-  backdrop-filter: blur(24px) saturate(200%);
-  -webkit-backdrop-filter: blur(24px) saturate(200%);
-  border-right: 1px solid rgba(255, 255, 255, 0.12);
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.12),
-    8px 0 36px rgba(0, 0, 0, 0.6);
-}
-
-/* Force Signal Loss button glow on hover */
-.force-loss-btn:hover {
-  animation: force-loss-glow 1.5s ease-in-out infinite;
-}
-
-@keyframes force-loss-glow {
-  0%, 100% {
-    box-shadow: 0 0 15px rgba(244, 63, 94, 0.15);
-  }
-  50% {
-    box-shadow: 0 0 25px rgba(244, 63, 94, 0.35);
-  }
-}
-
-/* Make map markers clickable */
-.tactical-marker {
-  cursor: pointer;
-}
-
-/* ================================================================== */
-/* FEATURE 2: AUTHORIZE DEPLOYMENT BUTTON                              */
-/* ================================================================== */
-
-.authorize-btn {
-  animation: authorize-pulse 2s ease-in-out infinite;
-  position: relative;
-  overflow: hidden;
-}
-
-@keyframes authorize-pulse {
-  0%, 100% {
-    border-color: rgba(34, 211, 238, 0.4);
-    box-shadow:
-      0 0 10px rgba(34, 211, 238, 0.1),
-      inset 0 0 10px rgba(34, 211, 238, 0.05);
-  }
-  50% {
-    border-color: rgba(34, 211, 238, 0.8);
-    box-shadow:
-      0 0 25px rgba(34, 211, 238, 0.25),
-      inset 0 0 15px rgba(34, 211, 238, 0.1);
-  }
-}
-
-.authorize-btn::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: -100%;
-  width: 100%;
   height: 100%;
-  background: linear-gradient(
-    90deg,
-    transparent,
-    rgba(34, 211, 238, 0.08),
-    transparent
-  );
-  animation: authorize-sweep 3s ease-in-out infinite;
+  background-color: #0a0e17;
+  color: #e2e8f0;
 }
 
-@keyframes authorize-sweep {
-  0% { left: -100%; }
-  50% { left: 100%; }
-  100% { left: 100%; }
+body {
+  font-family: var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, monospace;
 }
 
-/* ================================================================== */
-/* FEATURE 3: EVENT TERMINAL                                           */
-/* ================================================================== */
+/* ------------------------------------------------------------------ */
+/* HUD panels & controls                                               */
+/* ------------------------------------------------------------------ */
 
-.event-terminal {
-  height: 150px;
-  background: rgba(2, 6, 23, 0.88);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(51, 65, 85, 0.4);
-  border-bottom-color: rgba(51, 65, 85, 0.5);
-  box-shadow:
-    0 -4px 30px rgba(0, 0, 0, 0.3),
-    inset 0 1px 0 rgba(51, 65, 85, 0.2);
+.hud-panel {
+  background: #0b101c;
 }
 
-/* ================================================================== */
-/* TACTICAL MAP MARKER SYSTEM                                          */
-/* ================================================================== */
-
-/* Base marker container */
-.tactical-marker {
-  position: relative;
-  width: 40px;
-  height: 40px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
+.hud-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #1e293b transparent;
+}
+.hud-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.hud-scroll::-webkit-scrollbar-thumb {
+  background: #1e293b;
+  border-radius: 3px;
 }
 
-/* Core dot */
-.marker-core {
+.hud-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: #1e293b;
+  outline: none;
+  --thumb: #22d3ee;
+}
+.hud-range-red {
+  --thumb: #fb7185;
+}
+.hud-range:disabled {
+  opacity: 0.4;
+}
+.hud-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
   width: 14px;
   height: 14px;
   border-radius: 50%;
+  background: var(--thumb);
+  border: 2px solid #0a0e17;
+  box-shadow: 0 0 8px var(--thumb);
+  cursor: pointer;
+}
+.hud-range::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--thumb);
+  border: 2px solid #0a0e17;
+  cursor: pointer;
+}
+
+.spectrum-bar {
+  transition: y 0.6s ease, height 0.6s ease, fill 0.4s ease;
+}
+
+/* ------------------------------------------------------------------ */
+/* Leaflet theming                                                     */
+/* ------------------------------------------------------------------ */
+
+.leaflet-container {
+  font-family: var(--font-jetbrains-mono), ui-monospace, monospace;
+  background: #0a0e17;
+}
+.map-crosshair .leaflet-container,
+.map-crosshair .leaflet-interactive {
+  cursor: crosshair !important;
+}
+.leaflet-bar a,
+.leaflet-bar a:hover {
+  background: #0d1424;
+  color: #cbd5e1;
+  border-bottom-color: #1e293b;
+}
+.leaflet-bar {
+  border: 1px solid #1e293b !important;
+}
+.leaflet-control-attribution {
+  background: rgba(10, 14, 23, 0.75) !important;
+  color: #475569 !important;
+  font-size: 9px;
+}
+.leaflet-control-attribution a {
+  color: #64748b !important;
+}
+
+.hud-tooltip {
+  background: rgba(10, 14, 23, 0.92);
+  border: 1px solid #334155;
+  border-radius: 3px;
+  color: #e2e8f0;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  padding: 2px 6px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+}
+.hud-tooltip::before {
+  display: none;
+}
+.hud-tooltip-red {
+  border-color: rgba(244, 63, 94, 0.6);
+  color: #fecdd3;
+}
+.hud-tooltip-amber {
+  border-color: rgba(245, 158, 11, 0.6);
+  color: #fde68a;
+}
+.hud-tooltip-sky {
+  border-color: rgba(56, 189, 248, 0.6);
+  color: #bae6fd;
+}
+.hud-tooltip-violet {
+  border-color: rgba(167, 139, 250, 0.6);
+  color: #ddd6fe;
+}
+
+/* ------------------------------------------------------------------ */
+/* Map markers                                                         */
+/* ------------------------------------------------------------------ */
+
+.mk {
+  position: relative;
+  width: 100%;
+  height: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-family: var(--font-jetbrains-mono), ui-monospace, monospace;
-  font-size: 6px;
-  font-weight: 700;
-  letter-spacing: 0.05em;
+  cursor: pointer;
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--mk, #22d3ee) 60%, transparent));
+}
+.mk svg {
   position: relative;
-  z-index: 3;
-}
-
-/* Precision ring */
-.marker-ring {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 26px;
-  height: 26px;
-  border-radius: 50%;
-  border: 1px solid;
-  transform: translate(-50%, -50%);
-  z-index: 2;
-}
-
-/* Animated pulse ring */
-.marker-pulse {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  border: 1px solid;
-  transform: translate(-50%, -50%);
   z-index: 1;
-  opacity: 0;
 }
-
-/* ---- GATEWAY: Glowing Cyan ---- */
-.marker-gateway .marker-core {
-  background: #22d3ee;
-  color: #0a0f1a;
-  box-shadow:
-    0 0 10px rgba(34, 211, 238, 0.6),
-    0 0 25px rgba(34, 211, 238, 0.3),
-    0 0 50px rgba(34, 211, 238, 0.15);
-}
-.marker-gateway .marker-ring {
-  border-color: rgba(34, 211, 238, 0.45);
-  box-shadow: 0 0 8px rgba(34, 211, 238, 0.2);
-}
-.marker-gateway .marker-pulse {
-  border-color: rgba(34, 211, 238, 0.3);
-  animation: gateway-pulse 3s ease-out infinite;
-}
-
-@keyframes gateway-pulse {
-  0% {
-    width: 26px;
-    height: 26px;
-    opacity: 0.6;
-    border-color: rgba(34, 211, 238, 0.5);
-  }
-  100% {
-    width: 50px;
-    height: 50px;
-    opacity: 0;
-    border-color: rgba(34, 211, 238, 0);
-  }
-}
-
-/* ---- ONLINE: Glowing Emerald ---- */
-.marker-online .marker-core {
-  background: #34d399;
-  color: #0a0f1a;
-  box-shadow:
-    0 0 8px rgba(52, 211, 153, 0.5),
-    0 0 20px rgba(52, 211, 153, 0.2);
-}
-.marker-online .marker-ring {
-  border-color: rgba(52, 211, 153, 0.35);
-}
-.marker-online .marker-pulse {
-  border-color: rgba(52, 211, 153, 0.2);
-  animation: online-pulse 4s ease-out infinite;
-}
-
-@keyframes online-pulse {
-  0% {
-    width: 22px;
-    height: 22px;
-    opacity: 0.4;
-  }
-  100% {
-    width: 42px;
-    height: 42px;
-    opacity: 0;
-  }
-}
-
-/* ---- JAMMED: Pulsing Crimson ---- */
-.marker-jammed .marker-core {
-  background: #f43f5e;
-  color: #fff;
-  animation: jammed-core-pulse 0.8s ease-in-out infinite alternate;
-  box-shadow:
-    0 0 12px rgba(244, 63, 94, 0.7),
-    0 0 30px rgba(244, 63, 94, 0.4),
-    0 0 60px rgba(244, 63, 94, 0.2);
-}
-.marker-jammed .marker-ring {
-  border-color: rgba(244, 63, 94, 0.6);
-  animation: jammed-ring-pulse 0.8s ease-in-out infinite alternate;
-}
-.marker-jammed .marker-pulse {
-  border-color: rgba(244, 63, 94, 0.5);
-  animation: jammed-expand 1.2s ease-out infinite;
-}
-
-@keyframes jammed-core-pulse {
-  0% {
-    box-shadow:
-      0 0 12px rgba(244, 63, 94, 0.7),
-      0 0 30px rgba(244, 63, 94, 0.4);
-    transform: scale(1);
-  }
-  100% {
-    box-shadow:
-      0 0 20px rgba(244, 63, 94, 1),
-      0 0 50px rgba(244, 63, 94, 0.6),
-      0 0 80px rgba(244, 63, 94, 0.3);
-    transform: scale(1.15);
-  }
-}
-
-@keyframes jammed-ring-pulse {
-  0% {
-    border-color: rgba(244, 63, 94, 0.4);
-    box-shadow: none;
-  }
-  100% {
-    border-color: rgba(244, 63, 94, 0.9);
-    box-shadow: 0 0 12px rgba(244, 63, 94, 0.4);
-  }
-}
-
-@keyframes jammed-expand {
-  0% {
-    width: 28px;
-    height: 28px;
-    opacity: 0.7;
-    border-color: rgba(244, 63, 94, 0.6);
-  }
-  100% {
-    width: 56px;
-    height: 56px;
-    opacity: 0;
-    border-color: rgba(244, 63, 94, 0);
-  }
-}
-
-/* ---- OFFLINE: Dim Slate (telemetry lost) ---- */
-.marker-offline .marker-core {
-  background: #475569;
-  color: #cbd5e1;
-  font-size: 8px;
-  box-shadow: 0 0 6px rgba(71, 85, 105, 0.5);
-  opacity: 0.9;
-}
-.marker-offline .marker-ring {
-  border-color: rgba(100, 116, 139, 0.4);
+.mk-selected::after {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border: 1.5px solid #34d399;
+  border-radius: 50%;
+  box-shadow: 0 0 10px rgba(52, 211, 153, 0.6);
+  animation: mk-selected-spin 2.4s linear infinite;
   border-style: dashed;
 }
-.marker-offline .marker-pulse {
-  display: none;
+@keyframes mk-selected-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
-/* ---- AERIAL RELAY: Pulsing Cyan Triangle ---- */
-.marker-relay .marker-core {
-  width: 18px;
-  height: 18px;
-  border-radius: 3px;
-  background: #22d3ee;
-  color: #0a0f1a;
-  font-size: 10px;
-  transform: rotate(0deg);
-  animation: relay-rotate 6s linear infinite;
-  box-shadow:
-    0 0 14px rgba(34, 211, 238, 0.7),
-    0 0 35px rgba(34, 211, 238, 0.4),
-    0 0 70px rgba(34, 211, 238, 0.2);
+.mk-gateway .mk-pulse {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid var(--mk, #facc15);
+  animation: mk-pulse 2s ease-out infinite;
 }
-.marker-relay .marker-ring {
-  border-color: rgba(34, 211, 238, 0.5);
-  border-style: dashed;
-  animation: relay-ring-spin 8s linear infinite reverse;
-}
-.marker-relay .marker-pulse {
-  border-color: rgba(34, 211, 238, 0.4);
-  animation: relay-pulse 2s ease-out infinite;
-}
-
-@keyframes relay-rotate {
-  0% { transform: rotate(0deg); }
-  100% { transform: rotate(360deg); }
-}
-
-@keyframes relay-ring-spin {
-  0% { transform: translate(-50%, -50%) rotate(0deg); }
-  100% { transform: translate(-50%, -50%) rotate(360deg); }
-}
-
-@keyframes relay-pulse {
+@keyframes mk-pulse {
   0% {
-    width: 30px;
-    height: 30px;
-    opacity: 0.6;
-    border-color: rgba(34, 211, 238, 0.5);
+    transform: scale(0.7);
+    opacity: 0.9;
   }
   100% {
-    width: 60px;
-    height: 60px;
+    transform: scale(1.9);
     opacity: 0;
-    border-color: rgba(34, 211, 238, 0);
   }
 }
 
-/* ---- MESH RELAY: Dual Cyan/Emerald Tactical Marker ---- */
-.marker-mesh-relay .marker-core {
-  background: #06b6d4;
-  color: #042f2e;
-  font-size: 6px;
-  font-weight: 800;
-  box-shadow:
-    0 0 10px rgba(6, 182, 212, 0.7),
-    0 0 25px rgba(6, 182, 212, 0.35);
+.mk-jammed {
+  animation: mk-blink 0.9s steps(2, start) infinite;
 }
-.marker-mesh-relay .marker-ring {
-  border-color: rgba(6, 182, 212, 0.55);
-  border-style: dashed;
-  animation: relay-ring-spin 10s linear infinite;
+@keyframes mk-blink {
+  50% {
+    opacity: 0.35;
+  }
 }
-.marker-mesh-relay .marker-pulse {
-  border-color: rgba(6, 182, 212, 0.45);
-  animation: mesh-relay-pulse 2.5s ease-out infinite;
+.mk-offline {
+  opacity: 0.55;
 }
 
-@keyframes mesh-relay-pulse {
-  0% {
-    width: 24px;
-    height: 24px;
-    opacity: 0.7;
-    border-color: rgba(6, 182, 212, 0.6);
+.mk-relay-active svg {
+  animation: mk-hover 1.6s ease-in-out infinite;
+}
+@keyframes mk-hover {
+  50% {
+    transform: translateY(-2px) scale(1.06);
   }
-  100% {
-    width: 48px;
-    height: 48px;
-    opacity: 0;
-    border-color: rgba(6, 182, 212, 0);
+}
+.mk-crosshair {
+  cursor: default;
+  animation: mk-crosshair-spin 6s linear infinite;
+}
+@keyframes mk-crosshair-spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 
-/* Active Mesh Relay Polyline animation (flowing dashed packets) */
-.relay-active-polyline {
-  stroke-dasharray: 6 6 !important;
-  animation: relay-packet-flow 1.2s linear infinite !important;
-  filter: drop-shadow(0 0 4px rgba(34, 211, 238, 0.7));
+/* ------------------------------------------------------------------ */
+/* Overlays & packet animations                                        */
+/* ------------------------------------------------------------------ */
+
+.zone-kill {
+  animation: zone-pulse 2.2s ease-in-out infinite;
+}
+@keyframes zone-pulse {
+  50% {
+    fill-opacity: 0.28;
+    stroke-opacity: 0.6;
+  }
 }
 
-@keyframes relay-packet-flow {
+.packet-flow {
+  stroke-dasharray: 14 22;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 4px currentColor);
+}
+.packet-outbound {
+  animation: packet-flow-forward 0.7s linear infinite;
+}
+.packet-inbound {
+  animation: packet-flow-forward 0.7s linear infinite;
+}
+@keyframes packet-flow-forward {
   from {
-    stroke-dashoffset: 24;
+    stroke-dashoffset: 36;
   }
   to {
     stroke-dashoffset: 0;
   }
 }
-
-/* ---- OPERATOR: Warm Amber/Gold Diamond ---- */
-.marker-operator .marker-core {
-  width: 16px;
-  height: 16px;
-  border-radius: 3px;
-  background: #f59e0b;
-  color: #0a0f1a;
-  font-size: 7px;
-  font-weight: 800;
-  transform: rotate(45deg);
-  box-shadow:
-    0 0 12px rgba(245, 158, 11, 0.6),
-    0 0 30px rgba(245, 158, 11, 0.3),
-    0 0 60px rgba(245, 158, 11, 0.1);
-}
-.marker-operator .marker-core::after {
-  content: "OP";
-  display: block;
-  transform: rotate(-45deg);
-}
-.marker-operator .marker-ring {
-  border-color: rgba(245, 158, 11, 0.45);
-  border-style: dashed;
-  animation: operator-ring-spin 12s linear infinite;
-}
-.marker-operator .marker-pulse {
-  border-color: rgba(245, 158, 11, 0.3);
-  animation: operator-pulse 3s ease-out infinite;
-}
-
-@keyframes operator-ring-spin {
-  0% { transform: translate(-50%, -50%) rotate(0deg); }
-  100% { transform: translate(-50%, -50%) rotate(360deg); }
-}
-
-@keyframes operator-pulse {
-  0% {
-    width: 26px;
-    height: 26px;
-    opacity: 0.5;
-    border-color: rgba(245, 158, 11, 0.4);
-  }
-  100% {
-    width: 54px;
-    height: 54px;
-    opacity: 0;
-    border-color: rgba(245, 158, 11, 0);
-  }
-}
-
-/* ================================================================== */
-/* RECENTER BUTTON                                                     */
-/* ================================================================== */
-
-.recenter-control {
-  margin: 60px 10px 0 0 !important;
-}
-
-.recenter-btn {
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 34px;
-  height: 34px;
-  background: linear-gradient(135deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.02) 100%), rgba(2, 6, 23, 0.65);
-  backdrop-filter: blur(14px) saturate(180%);
-  -webkit-backdrop-filter: blur(14px) saturate(180%);
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 6px;
-  color: #94a3b8;
-  cursor: pointer;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.18),
-    0 6px 20px rgba(0, 0, 0, 0.4);
-  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.recenter-btn:hover {
-  background: linear-gradient(135deg, rgba(255, 255, 255, 0.14) 0%, rgba(255, 255, 255, 0.03) 100%), rgba(30, 41, 59, 0.75);
-  color: #f59e0b;
-  border-color: rgba(245, 158, 11, 0.5);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.25),
-    0 0 18px rgba(245, 158, 11, 0.3);
-}
-
-.recenter-btn.is-panned {
-  border-color: rgba(245, 158, 11, 0.65);
-  color: #f59e0b;
-  background: linear-gradient(135deg, rgba(245, 158, 11, 0.15) 0%, rgba(245, 158, 11, 0.03) 100%), rgba(15, 23, 42, 0.75);
-  box-shadow:
-    inset 0 1px 0 rgba(245, 158, 11, 0.3),
-    0 0 16px rgba(245, 158, 11, 0.25);
-}
-
-.recenter-indicator {
-  position: absolute;
-  top: 3px;
-  right: 3px;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #f59e0b;
-  box-shadow: 0 0 6px rgba(245, 158, 11, 0.9);
-  animation: pulse 1.8s infinite;
-}
-
-.recenter-btn:active {
-  transform: scale(0.92);
-}
-
-/* ================================================================== */
-/* MAP TOOLTIP STYLING                                                 */
-/* ================================================================== */
-
-.tactical-tooltip {
-  background: linear-gradient(135deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0.015) 100%), rgba(2, 6, 23, 0.8) !important;
-  backdrop-filter: blur(14px) saturate(180%) !important;
-  -webkit-backdrop-filter: blur(14px) saturate(180%) !important;
-  border: 1px solid rgba(255, 255, 255, 0.14) !important;
-  border-radius: 6px !important;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.18),
-    0 8px 30px rgba(0, 0, 0, 0.6) !important;
-  padding: 0 !important;
-  color: #e2e8f0 !important;
-}
-
-.tactical-tooltip::before {
-  border-bottom-color: rgba(51, 65, 85, 0.6) !important;
-}
-
-.relay-tooltip {
-  border-color: rgba(34, 211, 238, 0.4) !important;
-}
-
-.gateway-tooltip {
-  border-color: rgba(34, 211, 238, 0.5) !important;
-  box-shadow:
-    inset 0 1px 0 rgba(34, 211, 238, 0.2),
-    0 8px 30px rgba(0, 0, 0, 0.7),
-    0 0 15px rgba(34, 211, 238, 0.25) !important;
-}
-
-.relay-node-tooltip {
-  border-color: rgba(6, 182, 212, 0.5) !important;
-  box-shadow:
-    inset 0 1px 0 rgba(6, 182, 212, 0.2),
-    0 8px 30px rgba(0, 0, 0, 0.7),
-    0 0 15px rgba(6, 182, 212, 0.2) !important;
-}
-
-.operator-tooltip {
-  border-color: rgba(245, 158, 11, 0.4) !important;
-}
-
-.tooltip-content {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  padding: 6px 10px;
-  font-family: var(--font-jetbrains-mono), ui-monospace, monospace;
-}
-
-.tooltip-id {
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: 0.15em;
-  color: #94a3b8;
-}
-
-.tooltip-hex {
-  font-size: 10px;
-  color: #e2e8f0;
-}
-
-.tooltip-coords {
-  font-size: 9px;
-  color: #64748b;
-}
-
-.relay-label {
-  color: #22d3ee !important;
-}
-
-.operator-label {
-  color: #f59e0b !important;
-}
-
-/* ================================================================== */
-/* DISPATCH PANEL                                                      */
-/* ================================================================== */
-
-.dispatch-panel {
-  background: rgba(15, 23, 42, 0.82);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  animation: dispatch-panel-enter 0.3s ease-out;
-  box-shadow:
-    0 0 30px rgba(244, 63, 94, 0.2),
-    0 0 60px rgba(244, 63, 94, 0.1),
-    inset 0 1px 0 rgba(244, 63, 94, 0.1);
-}
-
-@keyframes dispatch-panel-enter {
-  0% {
-    opacity: 0;
-    transform: translateX(20px);
-  }
-  100% {
-    opacity: 1;
-    transform: translateX(0);
-  }
-}
-
-.dispatch-flash {
-  animation: dispatch-text-flash 1s ease-in-out infinite;
-}
-
-@keyframes dispatch-text-flash {
-  0%, 100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.5;
-  }
-}
-
-/* ================================================================== */
-/* SHARED ANIMATIONS                                                   */
-/* ================================================================== */
-
-@keyframes pulse-glow {
-  0%, 100% {
-    opacity: 0.55;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-.animate-pulse-glow {
-  animation: pulse-glow 2s ease-in-out infinite;
-}
-
-@keyframes flash-critical {
-  0%, 100% {
-    background-color: rgba(159, 18, 57, 0.22);
-    border-color: rgba(244, 63, 94, 0.65);
-    box-shadow: 0 0 18px rgba(244, 63, 94, 0.3);
-  }
-  50% {
-    background-color: rgba(159, 18, 57, 0.5);
-    border-color: rgba(244, 63, 94, 1);
-    box-shadow: 0 0 34px rgba(244, 63, 94, 0.55);
-  }
-}
-.animate-flash-critical {
-  animation: flash-critical 0.9s ease-in-out infinite;
-}
-
-/* ================================================================== */
-/* LEAFLET OVERRIDES — dark-mode compatibility                         */
-/* ================================================================== */
-
-.leaflet-container {
-  background: #0a0f1a !important;
-  font-family: var(--font-jetbrains-mono), ui-monospace, monospace !important;
-}
-
-.leaflet-control-zoom {
-  border: 1px solid rgba(51, 65, 85, 0.5) !important;
-  border-radius: 4px !important;
-  overflow: hidden;
-}
-
-.leaflet-control-zoom a {
-  background: rgba(15, 23, 42, 0.8) !important;
-  color: #94a3b8 !important;
-  border-color: rgba(51, 65, 85, 0.3) !important;
-  backdrop-filter: blur(8px);
-}
-
-.leaflet-control-zoom a:hover {
-  background: rgba(30, 41, 59, 0.9) !important;
-  color: #e2e8f0 !important;
-}
-
-/* Hide default Leaflet attribution */
-.leaflet-control-attribution {
-  display: none !important;
-}
-
-/* Make sure Leaflet tooltip arrows work with dark theme */
-.leaflet-tooltip-top::before {
-  border-top-color: rgba(15, 23, 42, 0.85) !important;
-}
-.leaflet-tooltip-bottom::before {
-  border-bottom-color: rgba(15, 23, 42, 0.85) !important;
-}
-
-/* ------------------------------------------------------------------ */
-/* Terminal-style scrollbars (event log, node roster, inspector)       */
-/* ------------------------------------------------------------------ */
-.terminal-scroll {
-  scrollbar-width: thin;
-  scrollbar-color: rgba(71, 85, 105, 0.6) transparent;
-}
-.terminal-scroll::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-.terminal-scroll::-webkit-scrollbar-track {
-  background: transparent;
-}
-.terminal-scroll::-webkit-scrollbar-thumb {
-  background: rgba(71, 85, 105, 0.6);
-  border-radius: 3px;
-}
-
-/* Tactical sidebar subtle shadow and depth */
-.tactical-sidebar {
-  box-shadow:
-    0 10px 30px -10px rgba(0, 0, 0, 0.7),
-    0 0 0 1px rgba(51, 65, 85, 0.3);
-}
-
-/* ================================================================== */
-/* TACTICAL C2 UPLINK — Transmit Button Flash                          */
-/* ================================================================== */
-
-.uplink-input:focus {
-  box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.4), 0 0 12px rgba(34, 211, 238, 0.1);
-}
-
-.transmit-btn {
-  position: relative;
-  overflow: hidden;
-}
-
-.transmit-btn::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: -100%;
-  width: 100%;
-  height: 100%;
-  background: linear-gradient(
-    90deg,
-    transparent,
-    rgba(34, 211, 238, 0.08),
-    transparent
-  );
-  transition: left 0.4s ease;
-}
-
-.transmit-btn:hover::before {
-  left: 100%;
-}
-
-.transmit-btn-sent {
-  animation: sent-flash 0.4s ease-out;
-}
-
-@keyframes sent-flash {
-  0% {
-    box-shadow: 0 0 0 rgba(52, 211, 153, 0);
-  }
-  30% {
-    box-shadow: 0 0 24px rgba(52, 211, 153, 0.5), inset 0 0 12px rgba(52, 211, 153, 0.15);
-  }
-  100% {
-    box-shadow: 0 0 8px rgba(52, 211, 153, 0.15);
-  }
-}
-
-/* ================================================================== */
-/* COMMS TERMINAL — Incoming Field Transmissions                       */
-/* ================================================================== */
-
-.comms-terminal {
-  background: linear-gradient(180deg, rgba(2, 6, 23, 0.92) 0%, rgba(2, 6, 23, 0.96) 100%);
-  backdrop-filter: blur(16px) saturate(190%);
-  -webkit-backdrop-filter: blur(16px) saturate(190%);
-  border: 1px solid rgba(52, 211, 153, 0.18);
-  border-bottom-color: rgba(52, 211, 153, 0.25);
-  box-shadow:
-    0 -4px 30px rgba(0, 0, 0, 0.35),
-    inset 0 1px 0 rgba(52, 211, 153, 0.08),
-    0 0 20px rgba(52, 211, 153, 0.04);
-  resize: vertical;
-  overflow: hidden;
-  min-height: 80px;
-  max-height: 400px;
-}
-
-.comms-terminal::-webkit-resizer {
-  display: none;
-}
-
-/* Custom resize handle */
-.comms-resize-handle {
-  position: absolute;
-  bottom: 0;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 40px;
-  height: 4px;
-  border-radius: 2px;
-  background: rgba(52, 211, 153, 0.25);
-  cursor: ns-resize;
-  transition: background 0.2s ease;
-}
-.comms-resize-handle:hover {
-  background: rgba(52, 211, 153, 0.55);
-}
-
-/* New message flash */
-.comms-msg-enter {
-  animation: comms-msg-slide 0.3s ease-out;
-}
-
-@keyframes comms-msg-slide {
-  0% {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  100% {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-/* ================================================================== */
-/* PACKET FLOW ANIMATION — SVG Laser / Data Stream Effect              */
-/* ================================================================== */
-
-/* Outbound C2 command: Cyan → Amber laser flow (Gateway → Node) */
-.packet-flow-outbound {
-  stroke-dasharray: 1000 !important;
-  stroke-dashoffset: 1000 !important;
-  animation: packet-laser-flow 1.4s linear forwards !important;
-  filter: drop-shadow(0 0 6px rgba(6, 182, 212, 0.8))
-          drop-shadow(0 0 14px rgba(6, 182, 212, 0.4)) !important;
-}
-
-/* Inbound field reply: Emerald laser flow (Node → Gateway) */
-.packet-flow-inbound {
-  stroke-dasharray: 1000 !important;
-  stroke-dashoffset: 1000 !important;
-  animation: packet-laser-flow 1.4s linear forwards !important;
-  filter: drop-shadow(0 0 6px rgba(16, 185, 129, 0.8))
-          drop-shadow(0 0 14px rgba(16, 185, 129, 0.4)) !important;
-}
-
-@keyframes packet-laser-flow {
-  0% {
-    stroke-dashoffset: 1000;
-    opacity: 0.3;
-  }
-  10% {
-    opacity: 1;
-  }
-  85% {
-    opacity: 1;
-  }
-  100% {
-    stroke-dashoffset: 0;
-    opacity: 0;
-  }
-}
-
