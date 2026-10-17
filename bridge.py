@@ -7,23 +7,24 @@ directed graph, and streams a unified 1 Hz telemetry snapshot to every
 connected dashboard over WebSocket.
 
 Subsystems:
-    * SwarmSimulator     -- configurable concentric-orbit kinematics with lost-link position hold
+    * SwarmSimulator     -- configurable orbit rings / polygon infill with lost-link position hold
     * RF attenuation     -- primary drop zone + fringe penalty, weighted centroid estimate
     * Adaptive Channel Switching (ACS) -- confirmation timer, CH_SWITCH over serial
-    * RelayAutopilot     -- midpoint positioning of UAV-RELAY-01 over partitions
-    * MavlinkUdpSender   -- MAVLink v2 HEARTBEAT / position / waypoints to udp:127.0.0.1:14550
+    * FleetManager       -- any number of relay UAVs: cluster allocator, relay chains,
+                            relief on station, battery / lost-link / geofence failsafes
+    * MavlinkUdpSender   -- MAVLink v2 telemetry per UAV system id to udp:127.0.0.1:14550
 
 All node movement and signal behaviour of the virtual nodes is a purely
 mathematical simulation for educational wireless sensor network research.
 
 Setup:
     pip install pyserial websockets networkx
-    pip install pymavlink   # optional; a standard-library MAVLink framer is used otherwise
 
 Run:
     python bridge.py                       # defaults: COM9 @ 115200, ws://localhost:8765
     python bridge.py --port COM5           # custom serial port
     python bridge.py --port COM9 --baud 115200 --ws-port 8765 --swarm 40
+    python bridge.py --uavs 6 --uav-endurance-min 15   # bigger relay fleet, shorter endurance
 """
 
 from __future__ import annotations
@@ -128,14 +129,18 @@ ORBIT_SPEED_MAX_MPS = 10.0
 ORBIT_RADIAL_AMPLITUDE_M = 15.0
 ORBIT_RADIAL_FREQ = 0.05
 NODE_TRANSIT_SPEED_MPS = 12.0
+POLYGON_GRID_SHRINK = 0.9
+POLYGON_GRID_MAX_ITER = 60
 VIRTUAL_BATTERY_DRAIN_MV_PER_S = 0.08
 VIRTUAL_BATTERY_FLOOR_MV = 3300.0
+
+PLACEMENT_ORBIT = "ORBIT_PATROL"
+PLACEMENT_POLYGON = "POLYGON_INFILL"
 
 # Lost-link position hold: a disconnected node freezes where it lost the link
 # and only resumes its orbit after this many consecutive reachable ticks.
 HOLD_RELEASE_TICKS = 3
 HOLD_LOST_LINK = "LOST_LINK"
-HOLD_UAV_BRIDGED = "UAV_BRIDGED"
 HOLD_RECONNECTING = "RECONNECTING"
 
 # ------------------------------------------------------------------ #
@@ -172,31 +177,78 @@ ACS_CLEAN_MARGIN_DB = 6.0  # noise within this margin of the base floor counts a
 RF_ALERT_MIN_INTERVAL_S = 5.0
 
 # ------------------------------------------------------------------ #
-# Mobile relay (UAV-RELAY-01) & MAVLink telemetry
+# Relay UAV fleet
 # ------------------------------------------------------------------ #
 UAV_ID_PREFIX = "UAV-"
-RELAY_ID = "UAV-RELAY-01"
-RELAY_ALT_M = 60.0
-RELAY_SPEED_MPS = 18.0
-RELAY_ARRIVAL_RADIUS_M = 10.0
-RELAY_HOME_OFFSET_M = 45.0
-RELAY_HOME_BEARING = 225.0          # loiter south-west of the gateway marker
+UAV_DEFAULT_COUNT = 2
+UAV_SOFT_LIMIT = 60                 # pairwise link search is O(n^2); warn, don't cap
+UAV_MAX_SYSID = 255                 # MAVLink system ids are one byte; sysid 1 is the bridge
+UAV_CRUISE_SPEED_MPS = 18.0
+UAV_SPEED_MIN_MPS = 3.0
+UAV_SPEED_MAX_MPS = 25.0
+UAV_CLIMB_MPS = 3.0
+UAV_DESCENT_MPS = 2.0
+UAV_BASE_ALT_M = 50.0
+UAV_ALT_LAYER_STEP_M = 10.0
+UAV_ALT_LAYERS = 5                  # 50/60/70/80/90 m keeps neighbours vertically separated
+UAV_ALT_MIN_M = 20.0
+UAV_MESH_MIN_ALT_M = 10.0           # below this the relay radio is not part of the mesh
+UAV_ARRIVAL_RADIUS_M = 10.0
+UAV_PAD_BASE_RADIUS_M = 40.0
+UAV_PAD_RING_STEP_M = 15.0
+UAV_PADS_PER_RING = 12
+UAV_PAD_START_BEARING = 225.0
+UAV_ENDURANCE_MIN_DEFAULT = 20.0
+UAV_SPEED_DRAIN_FACTOR = 0.35       # extra drain at cruise speed relative to hover
+UAV_RECHARGE_PCT_PER_S = 1.0        # accelerated pad recharge so demos don't stall
+UAV_RELIEF_BATTERY_PCT = 40.0       # on-station UAV requests a relief at this level
+UAV_LOW_BATTERY_PCT = 30.0          # failsafe: RTL
+UAV_CRITICAL_BATTERY_PCT = 15.0     # failsafe: land in place
+UAV_DISPATCH_MIN_BATTERY_PCT = 50.0
+UAV_LOST_LINK_S = 8.0               # airborne without a route to the gateway -> RTL
+UAV_A2A_MAX_M = 800.0               # air-to-air line-of-sight relay range
+GEOFENCE_RADIUS_M = 1500.0
+GEOFENCE_CEILING_M = 120.0          # common regulatory ceiling (400 ft AGL)
+
 RELAY_RTB_HOLD_S = 10.0             # partition must stay healed this long before returning
 RELAY_WAYPOINT_DEADBAND_M = 40.0    # ignore centroid drift smaller than this
 RELAY_DISPATCH_CONFIRM_TICKS = 2    # isolation must persist this many ticks before dispatch
 RELAY_ANTENNA_GAIN_DB = 10.0        # elevated high-gain relay antenna (air-to-ground LOS)
 RELAY_LINK_MAX_M = 450.0
+RELAY_CHAIN_SPACING_FACTOR = 0.8    # chain hops at 80% of slant range for fade margin
+ALLOCATOR_REPORT_MIN_INTERVAL_S = 5.0
 
-RELAY_LOITERING = "LOITERING"
-RELAY_DISPATCHED = "DISPATCHED"
-RELAY_BRIDGING = "BRIDGING_ACTIVE"
+MODE_AUTO = "AUTO"
+MODE_GUIDED = "GUIDED"
+MODE_LOITER = "LOITER"
+MODE_RTL = "RTL"
+MODE_LAND = "LAND"
+UAV_MODES = (MODE_AUTO, MODE_GUIDED, MODE_LOITER, MODE_RTL, MODE_LAND)
+COPTER_CUSTOM_MODE = {MODE_AUTO: 3, MODE_GUIDED: 4, MODE_LOITER: 5, MODE_RTL: 6, MODE_LAND: 9}
+CUSTOM_MODE_TO_MODE = {v: k for k, v in COPTER_CUSTOM_MODE.items()}
+
+FS_LANDED = "LANDED"
+FS_TAKING_OFF = "TAKING_OFF"
+FS_TRANSIT = "TRANSIT"
+FS_ON_STATION = "ON_STATION"
+FS_HOLDING = "HOLDING"
+FS_RETURNING = "RETURNING"
+FS_LANDING = "LANDING"
+
+TASK_RELAY = "RELAY"
+TASK_RELIEF = "RELIEF"
+TASK_GOTO = "GOTO"
+
+FAILSAFE_LOW_BATTERY = "LOW_BATTERY"
+FAILSAFE_CRITICAL_BATTERY = "CRITICAL_BATTERY"
+FAILSAFE_LOST_LINK = "LOST_LINK"
+FAILSAFE_GEOFENCE = "GEOFENCE"
 
 MAVLINK_HOST = "127.0.0.1"
 MAVLINK_PORT = 14550
-MAVLINK_SYSID = 1
 MAVLINK_COMPID = 1
 MAV_TYPE_QUADROTOR = 2
-MAV_AUTOPILOT_GENERIC = 0
+MAV_AUTOPILOT_ARDUPILOTMEGA = 3
 MAV_MODE_FLAG_CUSTOM_MODE_ENABLED = 1
 MAV_MODE_FLAG_GUIDED_ENABLED = 8
 MAV_MODE_FLAG_SAFETY_ARMED = 128
@@ -273,6 +325,30 @@ def move_toward(lat: float, lng: float, tlat: float, tlng: float, step_m: float)
         return tlat, tlng, 0.0
     f = step_m / d
     return lat + (tlat - lat) * f, lng + (tlng - lng) * f, d - step_m
+
+
+def point_in_polygon(x: float, y: float, poly: list[tuple[float, float]]) -> bool:
+    """Ray casting (Jordan curve theorem) point-in-polygon test."""
+    inside = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if (yi > y) != (yj > y):
+            x_cross = (xj - xi) * (y - yi) / (yj - yi) + xi
+            if x < x_cross:
+                inside = not inside
+        j = i
+    return inside
+
+
+def polygon_area(poly: list[tuple[float, float]]) -> float:
+    s = 0.0
+    for i in range(len(poly)):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % len(poly)]
+        s += x1 * y2 - x2 * y1
+    return abs(s) / 2.0
 
 
 def channel_freq_mhz(channel: int) -> int:
@@ -357,6 +433,8 @@ class MeshNode:
     ring: int = 0
     theta0: float = 0.0
     psi: float = 0.0
+    target: tuple[float, float] | None = None  # polygon infill slot
+    alt_m: float = 0.0  # AGL; non-zero only for airborne relay UAVs
     # Lost-link position hold
     hold_pos: tuple[float, float] | None = None
     hold_reason: str | None = None
@@ -370,6 +448,8 @@ class MeshNode:
     def role(self) -> str:
         if self.is_gateway:
             return "gateway"
+        if self.type == "uav":
+            return "uav"
         return "edge" if self.type == "hardware" else "virtual"
 
 
@@ -393,10 +473,12 @@ def virtual_id(index: int) -> str:
 # Virtual swarm simulator
 # ------------------------------------------------------------------ #
 class SwarmSimulator:
-    """Concentric-orbit kinematics for N synthetic mesh nodes anchored on the gateway."""
+    """Concentric-orbit or polygon-infill kinematics for N synthetic mesh nodes anchored on the gateway."""
 
     def __init__(self, count: int, rng: random.Random):
         self.rng = rng
+        self.mode = PLACEMENT_ORBIT
+        self.polygon: list[tuple[float, float]] | None = None
         self.radii: list[float] = list(ORBIT_RADII_DEFAULT_M)
         self.speed_mps = ORBIT_TANGENTIAL_SPEED_MPS
         self.ring_phase: list[float] = [0.0] * len(self.radii)
@@ -436,7 +518,24 @@ class SwarmSimulator:
             del self.nodes[nid]
         self.nodes = dict(sorted(self.nodes.items(), key=lambda kv: kv[1].index))
         self._layout_orbit()
+        if self.mode == PLACEMENT_POLYGON and self.polygon:
+            self._assign_polygon_targets()
         return count
+
+    def set_orbit(self) -> None:
+        self.mode = PLACEMENT_ORBIT
+        self.release_commandable_holds()
+        for n in self.nodes.values():
+            n.target = None
+
+    def set_polygon(self, vertices: list[tuple[float, float]]) -> int:
+        """Returns the number of target points generated (0 on invalid polygon)."""
+        if len(vertices) < 3:
+            return 0
+        self.polygon = vertices
+        self.mode = PLACEMENT_POLYGON
+        self.release_commandable_holds()
+        return self._assign_polygon_targets()
 
     @staticmethod
     def validate_orbit_config(radii, speed_mps) -> tuple[list[float], float]:
@@ -460,6 +559,8 @@ class SwarmSimulator:
         self.radii, self.speed_mps = self.validate_orbit_config(radii, speed_mps)
         self.ring_phase = [0.0] * len(self.radii)
         self._layout_orbit()
+        if self.mode == PLACEMENT_ORBIT:
+            self.release_commandable_holds()
 
     def max_ring_gap_m(self) -> float:
         """Largest radial gap a packet must cross, including gateway -> innermost ring."""
@@ -492,6 +593,13 @@ class SwarmSimulator:
         theta = node.theta0 + self.ring_phase[node.ring]
         return offset_m(anchor[0], anchor[1], r * math.sin(theta), r * math.cos(theta))
 
+    def release_commandable_holds(self) -> None:
+        """A new placement order reaches every node that still has a route (direct or via a relay UAV)."""
+        for n in self.nodes.values():
+            if n.hold_reason == HOLD_RECONNECTING:
+                n.hold_pos = n.hold_reason = n.lost_link_since = None
+                n.reconnect_streak = 0
+
     def holding_count(self) -> int:
         return sum(1 for n in self.nodes.values() if n.hold_pos is not None)
 
@@ -507,11 +615,8 @@ class SwarmSimulator:
             return True
         if node.hold_pos is None:
             return False
-        # A node served only by an airborne relay stays where the relay is covering it.
-        if any(hop.startswith(UAV_ID_PREFIX) for hop in node.hop_path):
-            node.reconnect_streak = 0
-            node.hold_reason = HOLD_UAV_BRIDGED
-            return True
+        # Any route counts, including one through a relay UAV: the node has C2 again and
+        # resumes its placement order; the allocator re-positions relays if it drifts out.
         node.reconnect_streak += 1
         if node.reconnect_streak < HOLD_RELEASE_TICKS:
             node.hold_reason = HOLD_RECONNECTING
@@ -521,6 +626,60 @@ class SwarmSimulator:
         node.lost_link_since = None
         node.reconnect_streak = 0
         return False
+
+    def _polygon_points(self, n: int) -> list[tuple[float, float]]:
+        verts = self.polygon or []
+        lat0, lng0 = verts[0]
+        local = [to_local_m(lat0, lng0, la, ln) for la, ln in verts]
+        area = polygon_area(local)
+        if area < 1.0:
+            return []
+        xs = [p[0] for p in local]
+        ys = [p[1] for p in local]
+        min_x, max_x, min_y, max_y = min(xs), max(xs), min(ys), max(ys)
+        spacing = math.sqrt(area / n)
+        inside: list[tuple[float, float]] = []
+        for _ in range(POLYGON_GRID_MAX_ITER):
+            inside = []
+            y = min_y + spacing / 2
+            while y < max_y:
+                x = min_x + spacing / 2
+                while x < max_x:
+                    if point_in_polygon(x, y, local):
+                        inside.append((x, y))
+                    x += spacing
+                y += spacing
+            if len(inside) >= n:
+                break
+            spacing *= POLYGON_GRID_SHRINK
+        if not inside:
+            return []
+        picked = [inside[int(i * len(inside) / n)] for i in range(n)] if len(inside) >= n else inside
+        return [offset_m(lat0, lng0, x, y) for x, y in picked]
+
+    def _assign_polygon_targets(self) -> int:
+        nodes = list(self.nodes.values())
+        points = self._polygon_points(len(nodes))
+        if not points:
+            return 0
+        pairs = []
+        for ni, node in enumerate(nodes):
+            for pi, (plat, plng) in enumerate(points):
+                pairs.append((haversine_m(node.lat, node.lng, plat, plng), ni, pi))
+        pairs.sort()
+        node_done: set[int] = set()
+        point_done: set[int] = set()
+        for _, ni, pi in pairs:
+            if ni in node_done or pi in point_done:
+                continue
+            nodes[ni].target = points[pi]
+            node_done.add(ni)
+            point_done.add(pi)
+        # More nodes than points (degenerate polygon): stack leftovers on points round-robin.
+        for ni, node in enumerate(nodes):
+            if ni not in node_done:
+                node.target = points[ni % len(points)]
+        return len(points)
 
     def step(self, dt: float, anchor: tuple[float, float]) -> None:
         """Advances one tick using the link state from the previous topology pass."""
@@ -532,7 +691,10 @@ class SwarmSimulator:
             if self._update_hold(node):
                 node.lat, node.lng = node.hold_pos
             else:
-                tlat, tlng = self._orbit_position(node, anchor)
+                if self.mode == PLACEMENT_POLYGON and node.target is not None:
+                    tlat, tlng = node.target
+                else:
+                    tlat, tlng = self._orbit_position(node, anchor)
                 node.lat, node.lng, _ = move_toward(node.lat, node.lng, tlat, tlng, step_m)
             if node.battery_mv is not None:
                 node.battery_mv = max(VIRTUAL_BATTERY_FLOOR_MV, node.battery_mv - VIRTUAL_BATTERY_DRAIN_MV_PER_S * dt)
@@ -552,158 +714,846 @@ def x25_crc(data: bytes, crc: int = 0xFFFF) -> int:
 
 class MavlinkUdpSender:
     """
-    Streams MAVLink v2 to a ground station on UDP (QGroundControl / Mission
-    Planner listen on 127.0.0.1:14550). Uses pymavlink when installed and a
-    hand-framed standard-library socket otherwise, so it never hard-fails.
+    Streams MAVLink v2 for every relay UAV to a ground station on UDP
+    (QGroundControl / Mission Planner listen on 127.0.0.1:14550). Each UAV
+    uses its own system id and sequence counter, so the GCS sees N vehicles.
     """
 
     def __init__(self, host: str = MAVLINK_HOST, port: int = MAVLINK_PORT):
         self.addr = (host, port)
-        self.seq = 0
+        self.seq: dict[int, int] = {}
         self.packet_count = 0
         self.boot = time.monotonic()
-        self.conn = None
-        self.sock = None
-        try:
-            from pymavlink import mavutil  # type: ignore
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setblocking(False)
+        self.backend = "stdlib"
+        log.info("MAVLink v2 telemetry -> udp:%s:%d (%s framing)", host, port, self.backend)
 
-            self.conn = mavutil.mavlink_connection(
-                f"udpout:{host}:{port}", source_system=MAVLINK_SYSID, source_component=MAVLINK_COMPID
-            )
-            self.backend = "pymavlink"
-        except Exception:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock.setblocking(False)
-            self.backend = "stdlib"
-        log.info("MAVLink v2 telemetry -> udp:%s:%d (%s backend)", host, port, self.backend)
-
-    def frame(self, msg: tuple[int, int], payload: bytes) -> bytes:
+    def frame(self, msg: tuple[int, int], payload: bytes, sysid: int, compid: int = MAVLINK_COMPID) -> bytes:
         msgid, crc_extra = msg
         body = payload.rstrip(b"\x00") or b"\x00"  # MAVLink v2 trailing-zero truncation
-        header = struct.pack(
-            "<BBBBBBB", 0xFD, len(body), 0, 0, self.seq, MAVLINK_SYSID, MAVLINK_COMPID
-        ) + msgid.to_bytes(3, "little")
+        seq = self.seq.get(sysid, 0)
+        header = struct.pack("<BBBBBBB", 0xFD, len(body), 0, 0, seq, sysid, compid) + msgid.to_bytes(3, "little")
         crc = x25_crc(header[1:] + body)
         crc = x25_crc(bytes([crc_extra]), crc)
-        self.seq = (self.seq + 1) & 0xFF
+        self.seq[sysid] = (seq + 1) & 0xFF
         return header + body + struct.pack("<H", crc)
 
-    def _send_raw(self, msg: tuple[int, int], payload: bytes) -> None:
+    def _send_raw(self, msg: tuple[int, int], payload: bytes, sysid: int) -> None:
         try:
-            self.sock.sendto(self.frame(msg, payload), self.addr)
+            self.sock.sendto(self.frame(msg, payload, sysid), self.addr)
             self.packet_count += 1
         except OSError as exc:
             log.debug("MAVLink UDP send failed: %s", exc)
 
-    def _send_pymavlink(self, fn, *args) -> None:
-        try:
-            fn(*args)
-            self.packet_count += 1
-        except Exception as exc:
-            log.debug("pymavlink send failed: %s", exc)
+    def time_boot_ms(self) -> int:
+        return int((time.monotonic() - self.boot) * 1000) & 0xFFFFFFFF
 
-    def send_heartbeat(self, active: bool) -> None:
-        base_mode = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED | MAV_MODE_FLAG_GUIDED_ENABLED
-        if active:
+    def send_heartbeat(self, u: "UavAgent") -> None:
+        base_mode = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+        if u.mode in (MODE_GUIDED, MODE_AUTO):
+            base_mode |= MAV_MODE_FLAG_GUIDED_ENABLED
+        if u.armed:
             base_mode |= MAV_MODE_FLAG_SAFETY_ARMED
-        state = MAV_STATE_ACTIVE if active else MAV_STATE_STANDBY
-        if self.conn is not None:
-            self._send_pymavlink(self.conn.mav.heartbeat_send, MAV_TYPE_QUADROTOR, MAV_AUTOPILOT_GENERIC, base_mode, 0, state)
-            return
-        payload = struct.pack("<IBBBBB", 0, MAV_TYPE_QUADROTOR, MAV_AUTOPILOT_GENERIC, base_mode, state, 3)
-        self._send_raw(MAVLINK_MSG_HEARTBEAT, payload)
+        state = MAV_STATE_ACTIVE if u.airborne else MAV_STATE_STANDBY
+        payload = struct.pack(
+            "<IBBBBB", COPTER_CUSTOM_MODE[u.mode], MAV_TYPE_QUADROTOR, MAV_AUTOPILOT_ARDUPILOTMEGA, base_mode, state, 3
+        )
+        self._send_raw(MAVLINK_MSG_HEARTBEAT, payload, u.sysid)
 
-    def send_global_position(self, lat: float, lng: float, alt_m: float, speed_mps: float, bearing_deg: float) -> None:
-        time_boot_ms = int((time.monotonic() - self.boot) * 1000) & 0xFFFFFFFF
-        b = math.radians(bearing_deg)
-        vx = int(max(-32768, min(32767, round(speed_mps * math.cos(b) * 100))))
-        vy = int(max(-32768, min(32767, round(speed_mps * math.sin(b) * 100))))
-        hdg = int(round(bearing_deg * 100)) % 36000
-        lat_e7, lng_e7 = int(round(lat * 1e7)), int(round(lng * 1e7))
-        alt_mm = int(round(alt_m * 1000))
-        if self.conn is not None:
-            self._send_pymavlink(self.conn.mav.global_position_int_send, time_boot_ms, lat_e7, lng_e7, alt_mm, alt_mm, vx, vy, 0, hdg)
-            return
-        payload = struct.pack("<IiiiihhhH", time_boot_ms, lat_e7, lng_e7, alt_mm, alt_mm, vx, vy, 0, hdg)
-        self._send_raw(MAVLINK_MSG_GLOBAL_POSITION_INT, payload)
+    def send_global_position(self, u: "UavAgent") -> None:
+        b = math.radians(u.bearing_deg)
+        vx = int(max(-32768, min(32767, round(u.ground_speed_mps * math.cos(b) * 100))))
+        vy = int(max(-32768, min(32767, round(u.ground_speed_mps * math.sin(b) * 100))))
+        vz = int(max(-32768, min(32767, round(-u.climb_mps * 100))))
+        hdg = int(round(u.bearing_deg * 100)) % 36000
+        lat_e7, lng_e7 = int(round(u.node.lat * 1e7)), int(round(u.node.lng * 1e7))
+        alt_mm = int(round(u.node.alt_m * 1000))
+        payload = struct.pack("<IiiiihhhH", self.time_boot_ms(), lat_e7, lng_e7, alt_mm, alt_mm, vx, vy, vz, hdg)
+        self._send_raw(MAVLINK_MSG_GLOBAL_POSITION_INT, payload, u.sysid)
 
-    def send_waypoint(self, lat: float, lng: float, alt_m: float, seq: int = 0) -> None:
+    def send_waypoint(self, u: "UavAgent", lat: float, lng: float, alt_m: float) -> None:
         """MISSION_ITEM_INT carrying MAV_CMD_NAV_WAYPOINT (current=2: guided 'fly-to')."""
         lat_e7, lng_e7 = int(round(lat * 1e7)), int(round(lng * 1e7))
-        hold_s, accept_m, pass_m, yaw = 0.0, RELAY_ARRIVAL_RADIUS_M, 0.0, float("nan")
-        seq &= 0xFFFF
-        if self.conn is not None:
-            self._send_pymavlink(
-                self.conn.mav.mission_item_int_send,
-                1, 1, seq, MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, MAV_CMD_NAV_WAYPOINT, 2, 1,
-                hold_s, accept_m, pass_m, yaw, lat_e7, lng_e7, alt_m,
-            )
-            return
+        hold_s, accept_m, pass_m, yaw = 0.0, UAV_ARRIVAL_RADIUS_M, 0.0, float("nan")
         payload = struct.pack(
             "<ffffiifHHBBBBBB",
             hold_s, accept_m, pass_m, yaw, lat_e7, lng_e7, alt_m,
-            seq, MAV_CMD_NAV_WAYPOINT, 1, 1, MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, 2, 1, 0,
+            u.waypoint_seq & 0xFFFF, MAV_CMD_NAV_WAYPOINT, u.sysid, 1, MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, 2, 1, 0,
         )
-        self._send_raw(MAVLINK_MSG_MISSION_ITEM_INT, payload)
+        self._send_raw(MAVLINK_MSG_MISSION_ITEM_INT, payload, u.sysid)
 
 
 # ------------------------------------------------------------------ #
-# Mobile relay autopilot
+# Relay UAV fleet
 # ------------------------------------------------------------------ #
-class RelayAutopilot:
-    """Midpoint-positioning mobile relay that bridges partitioned mesh islands."""
+def uav_id(index: int) -> str:
+    return f"{UAV_ID_PREFIX}{index:02d}"
 
-    def __init__(self, home: tuple[float, float]):
+
+def _coord(p: tuple[float, float] | None) -> list[float] | None:
+    return [round(p[0], 7), round(p[1], 7)] if p else None
+
+
+class UavAgent:
+    """One relay multirotor: 3D point-mass kinematics, battery model and flight modes."""
+
+    def __init__(self, index: int, home: tuple[float, float], battery_pct: float):
+        self.index = index
+        self.id = uav_id(index)
+        self.sysid: int | None = index + 1 if index + 1 <= UAV_MAX_SYSID else None
         self.home = home
-        self.node = MeshNode(id=RELAY_ID, type="virtual", lat=home[0], lng=home[1])
-        self.mission_state = RELAY_LOITERING
-        self.target_waypoint: tuple[float, float] | None = None
-        self.isolated_centroid: tuple[float, float] | None = None
+        self.node = MeshNode(id=self.id, type="uav", lat=home[0], lng=home[1])
+        self.cruise_alt_m = UAV_BASE_ALT_M + UAV_ALT_LAYER_STEP_M * ((index - 1) % UAV_ALT_LAYERS)
+        self.cruise_speed_mps = UAV_CRUISE_SPEED_MPS
+        self.mode = MODE_AUTO
+        self.flight_state = FS_LANDED
+        self.armed = False
+        self.battery_pct = battery_pct
+        self.target: tuple[float, float] | None = None
+        self.hold_pos: tuple[float, float] | None = None
+        self.task: str | None = None
+        self.relieving: str | None = None   # id of the low-battery UAV this one is replacing
+        self.relief_by: str | None = None   # id of the UAV inbound to replace this one
+        self.slot_label: str | None = None
+        self.unmatched_since: float | None = None
+        self.auto_after_land = True
+        self.remove_on_land = False
+        self.failsafe: str | None = None
         self.ground_speed_mps = 0.0
+        self.climb_mps = 0.0
         self.bearing_deg = 0.0
         self.eta_s: float | None = None
-        self.isolated_count = 0
+        self.mission_time_s = 0.0
+        self.unreachable_since: float | None = None
+        self.waypoint_seq = 0
         self.bridged_count = 0
+        self.last_command: str | None = None
+
+    @property
+    def airborne(self) -> bool:
+        return self.flight_state != FS_LANDED
+
+    @property
+    def in_mesh(self) -> bool:
+        return self.airborne and self.node.alt_m >= UAV_MESH_MIN_ALT_M
+
+    def distance_to(self, p: tuple[float, float]) -> float:
+        return haversine_m(self.node.lat, self.node.lng, p[0], p[1])
+
+    # -- flight primitives (mode bookkeeping lives in FleetManager) --
+    def set_target(self, target: tuple[float, float]) -> None:
+        self.target = target
+        self.hold_pos = None
+        if self.flight_state == FS_LANDED:
+            self.armed = True
+            self.flight_state = FS_TAKING_OFF
+        elif self.flight_state != FS_TAKING_OFF:
+            self.flight_state = FS_ON_STATION if self.distance_to(target) <= UAV_ARRIVAL_RADIUS_M else FS_TRANSIT
+
+    def takeoff(self) -> None:
+        self.target = None
+        self.armed = True
+        self.flight_state = FS_TAKING_OFF
+
+    def hold(self) -> None:
+        self.target = None
+        self.hold_pos = (self.node.lat, self.node.lng)
+        if self.flight_state != FS_TAKING_OFF:
+            self.flight_state = FS_HOLDING
+
+    def rtl(self) -> None:
+        self.target = None
+        self.hold_pos = None
+        self.flight_state = FS_RETURNING
+
+    def land(self) -> None:
+        self.target = None
+        self.hold_pos = None
+        self.flight_state = FS_LANDING
+
+    def step(self, dt: float, endurance_s: float) -> list[str]:
+        """Advances one tick and returns flight events (TAKEOFF_COMPLETE, ARRIVED, OVER_HOME, LANDED)."""
+        n = self.node
+        if self.flight_state == FS_LANDED:
+            n.alt_m = 0.0
+            self.ground_speed_mps = self.climb_mps = 0.0
+            self.eta_s = None
+            if not self.armed:
+                self.battery_pct = min(100.0, self.battery_pct + UAV_RECHARGE_PCT_PER_S * dt)
+            return []
+
+        fs = self.flight_state
+        target_alt = 0.0 if fs == FS_LANDING else self.cruise_alt_m
+        dz = target_alt - n.alt_m
+        rate = UAV_CLIMB_MPS if dz > 0 else UAV_DESCENT_MPS
+        step_z = max(-rate * dt, min(rate * dt, dz))
+        n.alt_m = max(0.0, n.alt_m + step_z)
+        self.climb_mps = step_z / dt
+
+        goal = None
+        if fs in (FS_TRANSIT, FS_ON_STATION) and self.target is not None:
+            goal = self.target
+        elif fs == FS_HOLDING and self.hold_pos is not None:
+            goal = self.hold_pos
+        elif fs == FS_RETURNING:
+            goal = self.home
+
+        remaining = 0.0
+        if goal is not None:
+            d = self.distance_to(goal)
+            if d > 0.5:
+                self.bearing_deg = calculate_bearing(n.lat, n.lng, goal[0], goal[1])
+            n.lat, n.lng, remaining = move_toward(n.lat, n.lng, goal[0], goal[1], self.cruise_speed_mps * dt)
+            self.ground_speed_mps = (d - remaining) / dt
+            self.eta_s = remaining / self.cruise_speed_mps
+        else:
+            self.ground_speed_mps = 0.0
+            self.eta_s = None
+
+        events = []
+        if fs == FS_TAKING_OFF and abs(self.cruise_alt_m - n.alt_m) < 0.5:
+            if self.target is not None:
+                self.flight_state = FS_TRANSIT
+            else:
+                self.hold_pos = (n.lat, n.lng)
+                self.flight_state = FS_HOLDING
+            events.append("TAKEOFF_COMPLETE")
+        elif fs == FS_TRANSIT and remaining <= UAV_ARRIVAL_RADIUS_M:
+            self.flight_state = FS_ON_STATION
+            events.append("ARRIVED")
+        elif fs == FS_RETURNING and remaining <= 1.0:
+            self.flight_state = FS_LANDING
+            events.append("OVER_HOME")
+        elif fs == FS_LANDING and n.alt_m <= 0.01:
+            n.alt_m = 0.0
+            self.flight_state = FS_LANDED
+            self.armed = False
+            self.ground_speed_mps = self.climb_mps = 0.0
+            self.eta_s = None
+            events.append("LANDED")
+
+        if self.flight_state != FS_LANDED:
+            self.mission_time_s += dt
+            load = 1.0 + UAV_SPEED_DRAIN_FACTOR * min(1.5, self.ground_speed_mps / UAV_CRUISE_SPEED_MPS)
+            self.battery_pct = max(0.0, self.battery_pct - (100.0 / endurance_s) * load * dt)
+        return events
+
+    def endurance_remaining_s(self, endurance_s: float) -> float:
+        return endurance_s * self.battery_pct / 100.0
+
+
+class FleetManager:
+    """Relay UAV fleet: add/remove, operator commands, failsafes and the relay allocator."""
+
+    def __init__(self, bridge: "Bridge", count: int, endurance_min: float):
+        self.bridge = bridge
+        self.endurance_s = max(1.0, float(endurance_min)) * 60.0
+        self.uavs: dict[str, UavAgent] = {}
         self.isolation_streak = 0
-        self.last_isolated_at = 0.0
-        self.waypoint_count = 0
+        self.clusters: list[dict] = []
+        self.slots: list[dict] = []
+        self.shortfall = 0
+        self.assigned = 0
+        self._last_report: tuple | None = None
+        self._last_report_at = -1e9
+        self.gateway_jammed = False
+        self.add(count, announce=False)
 
-    def airborne_bridge(self) -> bool:
-        return self.mission_state in (RELAY_DISPATCHED, RELAY_BRIDGING)
+    # -- bookkeeping --
+    def now(self) -> float:
+        return self.bridge.tick_count * SIM_TICK_S
 
-    def dispatch(self, waypoint: tuple[float, float]) -> None:
-        self.target_waypoint = waypoint
-        self.waypoint_count += 1
-        on_station = haversine_m(self.node.lat, self.node.lng, *waypoint) <= RELAY_ARRIVAL_RADIUS_M
-        if not (self.mission_state == RELAY_BRIDGING and on_station):
-            self.mission_state = RELAY_DISPATCHED
+    def pad_position(self, index: int) -> tuple[float, float]:
+        ring, slot = divmod(index - 1, UAV_PADS_PER_RING)
+        radius = UAV_PAD_BASE_RADIUS_M + UAV_PAD_RING_STEP_M * ring
+        bearing = UAV_PAD_START_BEARING + slot * (360.0 / UAV_PADS_PER_RING) + ring * 15.0
+        gw_lat, gw_lng = self.bridge.gateway_pos
+        return destination(gw_lat, gw_lng, radius, bearing)
 
-    def return_home(self) -> None:
-        self.mission_state = RELAY_LOITERING
-        self.target_waypoint = None
-        self.isolated_centroid = None
+    def update_homes(self) -> None:
+        for u in self.uavs.values():
+            u.home = self.pad_position(u.index)
+            if u.flight_state == FS_LANDED:
+                u.node.lat, u.node.lng = u.home
 
-    def step(self, dt: float) -> bool:
-        """Advances the relay. Returns True on the DISPATCHED -> BRIDGING_ACTIVE transition."""
-        goal = self.target_waypoint if (self.airborne_bridge() and self.target_waypoint) else self.home
-        d = haversine_m(self.node.lat, self.node.lng, *goal)
-        if d > 0.5:
-            self.bearing_deg = calculate_bearing(self.node.lat, self.node.lng, *goal)
-        lat, lng, remaining = move_toward(self.node.lat, self.node.lng, goal[0], goal[1], RELAY_SPEED_MPS * dt)
-        self.node.lat, self.node.lng = lat, lng
-        self.ground_speed_mps = (d - remaining) / dt
-        self.eta_s = remaining / RELAY_SPEED_MPS
-        if self.mission_state == RELAY_DISPATCHED and remaining <= RELAY_ARRIVAL_RADIUS_M:
-            self.mission_state = RELAY_BRIDGING
-            return True
-        return False
+    def mesh_nodes(self) -> list[MeshNode]:
+        return [u.node for u in self.uavs.values() if u.in_mesh]
+
+    def _free_index(self) -> int:
+        used = {u.index for u in self.uavs.values()}
+        idx = 1
+        while idx in used:
+            idx += 1
+        return idx
+
+    def add(self, count: int, announce: bool = True) -> list[str]:
+        count = max(0, int(count))
+        before = len(self.uavs)
+        ids = []
+        for _ in range(count):
+            idx = self._free_index()
+            u = UavAgent(idx, self.pad_position(idx), self.bridge.rng.uniform(92.0, 100.0))
+            self.uavs[u.id] = u
+            ids.append(u.id)
+        self.uavs = dict(sorted(self.uavs.items(), key=lambda kv: kv[1].index))
+        if announce and ids:
+            span = ids[0] if len(ids) == 1 else f"{ids[0]}..{ids[-1]}"
+            self.bridge.log_event("FLEET", "ok", f"Added {len(ids)} relay UAV(s) ({span}) on home pads; fleet size {len(self.uavs)}")
+        if before <= UAV_SOFT_LIMIT < len(self.uavs):
+            self.bridge.log_event(
+                "FLEET", "warn",
+                f"Fleet above {UAV_SOFT_LIMIT} UAVs: link computation grows with the square of node count; expect slower ticks",
+            )
+        return ids
+
+    def remove(self, uav_id: str) -> tuple[bool, str]:
+        u = self.uavs.get(uav_id)
+        if u is None:
+            return False, f"unknown UAV {uav_id}"
+        if u.airborne:
+            self.release(u)
+            u.mode = MODE_RTL
+            u.auto_after_land = False
+            u.remove_on_land = True
+            u.rtl()
+            return True, f"{u.id} returning to pad; it will be removed after landing"
+        self.release(u)
+        del self.uavs[uav_id]
+        return True, f"{uav_id} removed from fleet ({len(self.uavs)} remaining)"
+
+    def release(self, u: UavAgent) -> None:
+        """Drops any relay/relief assignment held by this UAV."""
+        if u.relieving:
+            other = self.uavs.get(u.relieving)
+            if other is not None:
+                other.relief_by = None
+            u.relieving = None
+        if u.relief_by:
+            reliever = self.uavs.get(u.relief_by)
+            if reliever is not None:
+                reliever.relieving = None
+                reliever.task = TASK_RELAY
+                reliever.slot_label = u.slot_label
+            u.relief_by = None
+        u.task = None
+        u.slot_label = None
+        u.unmatched_since = None
+
+    def event(self, u: UavAgent, severity: str, text: str) -> None:
+        self.bridge.uav_event(u, severity, text)
+
+    # -- operator / GCS commands --
+    def command(self, uav_id: str, action: str, source: str = "DASHBOARD", **args) -> tuple[bool, str]:
+        u = self.uavs.get(uav_id)
+        if u is None:
+            return False, f"unknown UAV {uav_id}"
+        action = str(action).upper()
+        if action == "LOITER":
+            action = "HOLD"
+        try:
+            ok, text = self._apply_command(u, action, args)
+        except (KeyError, TypeError, ValueError) as exc:
+            ok, text = False, f"bad parameters ({exc})"
+        if ok:
+            u.last_command = f"{action} via {source}"
+            self.bridge.log_event("FLEET", "info", f"{u.id} {action} accepted from {source}: {text}")
+        else:
+            self.bridge.log_event("FLEET", "warn", f"{u.id} {action} rejected from {source}: {text}")
+        return ok, text
+
+    def _validate_alt(self, alt) -> float:
+        alt = float(alt)
+        if not UAV_ALT_MIN_M <= alt <= GEOFENCE_CEILING_M:
+            raise ValueError(f"altitude {alt:.0f} m outside {UAV_ALT_MIN_M:.0f}-{GEOFENCE_CEILING_M:.0f} m AGL")
+        return alt
+
+    def _validate_speed(self, speed) -> float:
+        speed = float(speed)
+        if not UAV_SPEED_MIN_MPS <= speed <= UAV_SPEED_MAX_MPS:
+            raise ValueError(f"speed {speed:.1f} m/s outside {UAV_SPEED_MIN_MPS:.0f}-{UAV_SPEED_MAX_MPS:.0f} m/s")
+        return speed
+
+    def inside_geofence(self, lat: float, lng: float) -> bool:
+        gw_lat, gw_lng = self.bridge.gateway_pos
+        return haversine_m(gw_lat, gw_lng, lat, lng) <= GEOFENCE_RADIUS_M
+
+    def _apply_command(self, u: UavAgent, action: str, args: dict) -> tuple[bool, str]:
+        alt = args.get("alt_m")
+        speed = args.get("speed_mps")
+        if action == "TAKEOFF":
+            if u.airborne:
+                return False, "already airborne"
+            if u.battery_pct <= UAV_LOW_BATTERY_PCT:
+                return False, f"battery {u.battery_pct:.0f}% too low for takeoff"
+            if alt is not None:
+                u.cruise_alt_m = self._validate_alt(alt)
+            self.release(u)
+            u.mode = MODE_GUIDED
+            u.failsafe = None
+            u.auto_after_land = False
+            u.takeoff()
+            return True, f"climbing to {u.cruise_alt_m:.0f} m, then holding over pad"
+        if action == "HOLD":
+            if not u.airborne:
+                return False, "on the ground"
+            if u.battery_pct <= UAV_CRITICAL_BATTERY_PCT:
+                return False, "battery critical; landing cannot be overridden"
+            self.release(u)
+            u.mode = MODE_LOITER
+            u.failsafe = None
+            u.hold()
+            return True, f"holding at {u.node.lat:.5f}, {u.node.lng:.5f}"
+        if action == "RTL":
+            if not u.airborne:
+                return False, "on the ground"
+            self.release(u)
+            u.mode = MODE_RTL
+            u.auto_after_land = False
+            u.rtl()
+            return True, "returning to home pad"
+        if action == "LAND":
+            if not u.airborne:
+                return False, "already landed"
+            self.release(u)
+            u.mode = MODE_LAND
+            u.auto_after_land = False
+            u.land()
+            return True, "landing in place"
+        if action == "AUTO":
+            if u.task in (TASK_GOTO, None):
+                self.release(u)
+            u.mode = MODE_AUTO
+            u.auto_after_land = True
+            u.unmatched_since = None
+            if u.airborne and u.flight_state not in (FS_RETURNING, FS_LANDING):
+                u.hold()
+            return True, "relay allocator in control"
+        if action == "GOTO":
+            lat, lng = float(args["lat"]), float(args["lng"])
+            if not self.inside_geofence(lat, lng):
+                return False, f"target outside {GEOFENCE_RADIUS_M:.0f} m geofence"
+            if u.battery_pct <= UAV_LOW_BATTERY_PCT:
+                return False, f"battery {u.battery_pct:.0f}% too low"
+            if alt is not None:
+                u.cruise_alt_m = self._validate_alt(alt)
+            if speed is not None:
+                u.cruise_speed_mps = self._validate_speed(speed)
+            self.release(u)
+            u.mode = MODE_GUIDED
+            u.failsafe = None
+            u.auto_after_land = False
+            u.task = TASK_GOTO
+            self._send_to(u, (lat, lng))
+            return True, f"flying to {lat:.5f}, {lng:.5f} at {u.cruise_alt_m:.0f} m"
+        if action == "SET_ALT":
+            u.cruise_alt_m = self._validate_alt(alt)
+            return True, f"cruise altitude {u.cruise_alt_m:.0f} m"
+        if action == "SET_SPEED":
+            u.cruise_speed_mps = self._validate_speed(speed)
+            return True, f"cruise speed {u.cruise_speed_mps:.1f} m/s"
+        if action == "ARM":
+            if u.airborne:
+                return True, "already armed"
+            u.armed = True
+            return True, "armed on pad"
+        if action == "DISARM":
+            if u.airborne:
+                return False, "cannot disarm in flight"
+            u.armed = False
+            return True, "disarmed"
+        return False, f"unsupported action {action}"
+
+    def fleet_command(self, action: str) -> tuple[int, int]:
+        """Applies one action to every eligible UAV. Returns (accepted, eligible)."""
+        action = str(action).upper()
+        per_uav = {"LAUNCH_ALL": "TAKEOFF", "AUTO_ALL": "AUTO", "RTL_ALL": "RTL", "LAND_ALL": "LAND"}.get(action)
+        if per_uav is None:
+            raise ValueError(f"unsupported fleet action {action}")
+        if per_uav == "TAKEOFF":
+            eligible = [u for u in self.uavs.values() if not u.airborne]
+        elif per_uav == "AUTO":
+            eligible = list(self.uavs.values())
+        else:
+            eligible = [u for u in self.uavs.values() if u.airborne]
+        accepted = 0
+        for u in eligible:
+            ok, _ = self._apply_command(u, per_uav, {})
+            if ok:
+                u.last_command = f"{action} via DASHBOARD"
+                accepted += 1
+        self.bridge.log_event("FLEET", "info" if accepted else "warn", f"{action}: {accepted}/{len(eligible)} UAV(s) accepted")
+        return accepted, len(eligible)
+
+    def _send_to(self, u: UavAgent, point: tuple[float, float]) -> None:
+        u.set_target(point)
+        u.waypoint_seq += 1
+        u.last_command = "MAV_CMD_NAV_WAYPOINT"
+        if u.sysid is not None:
+            self.bridge.mavlink.send_waypoint(u, point[0], point[1], u.cruise_alt_m)
+
+    # -- per-tick --
+    def step(self, dt: float) -> None:
+        for u in list(self.uavs.values()):
+            for ev in u.step(dt, self.endurance_s):
+                self._on_flight_event(u, ev)
+
+    def _on_flight_event(self, u: UavAgent, ev: str) -> None:
+        if ev == "ARRIVED":
+            if u.task in (TASK_RELAY, TASK_RELIEF):
+                self.event(u, "ok", f"{u.id} on station at {u.slot_label or 'relay slot'} ({u.node.lat:.5f}, {u.node.lng:.5f}, {u.cruise_alt_m:.0f} m); BRIDGING_ACTIVE")
+            elif u.task == TASK_GOTO:
+                self.event(u, "ok", f"{u.id} reached Go-To target; holding position")
+        elif ev == "LANDED":
+            self.event(u, "info", f"{u.id} landed on pad ({u.battery_pct:.0f}% battery); disarmed and charging")
+            if u.remove_on_land:
+                self.release(u)
+                del self.uavs[u.id]
+                self.bridge.log_event("FLEET", "info", f"{u.id} removed from fleet ({len(self.uavs)} remaining)")
+                return
+            if u.auto_after_land:
+                u.mode = MODE_AUTO
+            u.failsafe = None
+
+    def evaluate(self) -> None:
+        """Runs after the topology pass: bridged counts, failsafes, then the allocator."""
+        b = self.bridge
+        now = self.now()
+        for u in self.uavs.values():
+            u.bridged_count = sum(1 for n in b.all_nodes() if u.id in n.hop_path)
+            if u.in_mesh and not u.node.reachable:
+                u.unreachable_since = u.unreachable_since if u.unreachable_since is not None else now
+            else:
+                u.unreachable_since = None
+        for u in list(self.uavs.values()):
+            self._check_failsafes(u, now)
+        self.allocate(now)
+
+    def _trigger_failsafe(self, u: UavAgent, kind: str, land: bool, text: str) -> None:
+        u.failsafe = kind
+        u.auto_after_land = u.mode == MODE_AUTO
+        self.release(u)
+        if land:
+            u.mode = MODE_LAND
+            u.land()
+        else:
+            u.mode = MODE_RTL
+            u.rtl()
+        self.event(u, "critical" if land else "warn", f"{u.id} FAILSAFE {kind}: {text}")
+
+    def _check_failsafes(self, u: UavAgent, now: float) -> None:
+        if not u.airborne or u.flight_state == FS_LANDING:
+            return
+        if u.battery_pct <= UAV_CRITICAL_BATTERY_PCT:
+            self._trigger_failsafe(u, FAILSAFE_CRITICAL_BATTERY, True, f"battery {u.battery_pct:.0f}%; landing in place")
+            return
+        if u.flight_state == FS_RETURNING:
+            return
+        if u.battery_pct <= UAV_LOW_BATTERY_PCT:
+            self._trigger_failsafe(u, FAILSAFE_LOW_BATTERY, False, f"battery {u.battery_pct:.0f}%; returning to pad")
+        elif not self.inside_geofence(u.node.lat, u.node.lng):
+            self._trigger_failsafe(u, FAILSAFE_GEOFENCE, False, f"left the {GEOFENCE_RADIUS_M:.0f} m geofence; returning to pad")
+        elif u.unreachable_since is not None and now - u.unreachable_since >= UAV_LOST_LINK_S:
+            self._trigger_failsafe(u, FAILSAFE_LOST_LINK, False, f"no C2 route to gateway for {UAV_LOST_LINK_S:.0f} s; returning to pad")
+
+    # -- relay allocator --
+    def _available(self, u: UavAgent) -> bool:
+        return (
+            u.mode == MODE_AUTO
+            and u.failsafe is None
+            and u.task is None
+            and not u.remove_on_land
+            and u.flight_state != FS_LANDING
+            and u.battery_pct >= UAV_DISPATCH_MIN_BATTERY_PCT
+        )
+
+    def _plan_slots(self) -> list[dict]:
+        """Relay points for every isolated cluster: one midpoint, or an evenly spaced chain."""
+        b = self.bridge
+        by_id = {n.id: n for n in b.all_nodes()}
+        isolated = [nid for nid in b.isolated_ground if nid in by_id]
+        components = nx.connected_components(b.mesh_graph.subgraph(isolated).to_undirected())
+        clusters = sorted((list(c) for c in components), key=len, reverse=True)
+        anchors = [n for n in b.all_nodes() if n.id in b.ground_paths and n.status != STATUS_JAMMED]
+        hop_m = RELAY_CHAIN_SPACING_FACTOR * RELAY_LINK_MAX_M
+        a2a_hop_m = RELAY_CHAIN_SPACING_FACTOR * UAV_A2A_MAX_M
+        slots: list[dict] = []
+        self.clusters = []
+        for ci, members in enumerate(clusters, start=1):
+            c_lat = sum(by_id[m].lat for m in members) / len(members)
+            c_lng = sum(by_id[m].lng for m in members) / len(members)
+            # Bridge the shortest gap between the connected mesh and the cluster; the
+            # cluster is internally connected, so one bridged member reconnects all of it.
+            dist, anchor, entry = min(
+                (haversine_m(a.lat, a.lng, by_id[m].lat, by_id[m].lng), a, by_id[m])
+                for a in (anchors or [b.gateway]) for m in members
+            )
+            # End relays sit one air-to-ground hop from each side; any middle
+            # relays only need the longer air-to-air hop between UAVs.
+            if dist <= 2 * hop_m:
+                fractions = [0.5]
+            else:
+                middle = max(0, math.ceil((dist - 2 * hop_m) / a2a_hop_m) - 1)
+                k = 2 + middle
+                start, end = hop_m / dist, 1.0 - hop_m / dist
+                fractions = [start + (end - start) * j / (k - 1) for j in range(k)]
+            k = len(fractions)
+            self.clusters.append({
+                "id": ci, "size": len(members), "centroid": _coord((c_lat, c_lng)),
+                "anchor_id": anchor.id, "anchor": _coord((anchor.lat, anchor.lng)),
+                "entry_id": entry.id, "entry": _coord((entry.lat, entry.lng)),
+                "distance_m": round(dist, 1), "relays_needed": k,
+            })
+            for i, f in enumerate(fractions, start=1):
+                lat = anchor.lat + (entry.lat - anchor.lat) * f
+                lng = anchor.lng + (entry.lng - anchor.lng) * f
+                if not self.inside_geofence(lat, lng):
+                    gw_lat, gw_lng = b.gateway_pos
+                    lat, lng = destination(gw_lat, gw_lng, GEOFENCE_RADIUS_M * 0.95, calculate_bearing(gw_lat, gw_lng, lat, lng))
+                label = f"C{ci}-R{i}" if k > 1 else f"C{ci}"
+                slots.append({"lat": lat, "lng": lng, "cluster": ci, "index": i, "of": k, "size": len(members), "label": label})
+        return slots
+
+    def allocate(self, now: float) -> None:
+        b = self.bridge
+        isolated = bool(b.isolated_ground)
+        self.isolation_streak = self.isolation_streak + 1 if isolated else 0
+        if isolated and self.isolation_streak < RELAY_DISPATCH_CONFIRM_TICKS:
+            return  # wait for the partition to persist before committing aircraft
+        gateway_jammed = b.gateway.status == STATUS_JAMMED
+        if gateway_jammed != self.gateway_jammed:
+            self.gateway_jammed = gateway_jammed
+            if gateway_jammed:
+                b.log_event("FLEET", "critical", "Allocator suspended: gateway is jammed, relays cannot restore C2; change channel or clear the zone")
+            else:
+                b.log_event("FLEET", "ok", "Allocator resumed: gateway link restored")
+        if isolated and not gateway_jammed:
+            self.slots = self._plan_slots()
+        else:
+            self.slots, self.clusters = [], []
+
+        holders = [u for u in self.uavs.values() if u.task == TASK_RELAY and u.mode == MODE_AUTO and u.failsafe is None]
+        claimed: dict[int, UavAgent] = {}
+        matched: set[str] = set()
+        pairs = sorted(
+            (haversine_m(u.target[0], u.target[1], s["lat"], s["lng"]), u.id, si)
+            for u in holders if u.target is not None
+            for si, s in enumerate(self.slots)
+        )
+        for d, uid, si in pairs:
+            if uid in matched or si in claimed or d > 3 * RELAY_WAYPOINT_DEADBAND_M:
+                continue
+            claimed[si] = self.uavs[uid]
+            matched.add(uid)
+
+        newly_dispatched = 0
+        for si, s in enumerate(self.slots):
+            if si in claimed:
+                continue
+            candidates = [u for u in self.uavs.values() if self._available(u) and u.id not in matched]
+            if not candidates:
+                continue
+            # Prefer airborne aircraft; a grounded one pays a takeoff penalty.
+            best = min(candidates, key=lambda u: u.distance_to((s["lat"], s["lng"])) + (0.0 if u.airborne else 150.0))
+            claimed[si] = best
+            matched.add(best.id)
+            newly_dispatched += 1
+
+        for si, u in claimed.items():
+            s = self.slots[si]
+            point = (s["lat"], s["lng"])
+            first = u.task != TASK_RELAY
+            u.task = TASK_RELAY
+            u.slot_label = s["label"]
+            u.unmatched_since = None
+            if first or u.target is None or haversine_m(u.target[0], u.target[1], *point) > RELAY_WAYPOINT_DEADBAND_M:
+                self._send_to(u, point)
+                if first:
+                    self.event(
+                        u, "warn",
+                        f"{u.id} -> {s['label']} ({point[0]:.5f}, {point[1]:.5f}, {u.cruise_alt_m:.0f} m) "
+                        f"bridging cluster of {s['size']} isolated node(s)"
+                        + (f"; relay chain hop {s['index']}/{s['of']}" if s["of"] > 1 else ""),
+                    )
+                else:
+                    self.bridge.log_event("FLEET", "info", f"{u.id} retargeted {s['label']} -> {point[0]:.5f}, {point[1]:.5f}")
+        if newly_dispatched and len(holders) == 0:
+            b.notify_phones(f"[RELAY] {newly_dispatched} relay UAV(s) dispatched to bridge isolated nodes")
+
+        self._run_reliefs()
+
+        # Assignments no longer needed (partition healed or cluster merged): release after a hold.
+        for u in self.uavs.values():
+            idle_auto = u.mode == MODE_AUTO and u.task is None and u.relieving is None and u.airborne \
+                and u.flight_state not in (FS_RETURNING, FS_LANDING, FS_TAKING_OFF)
+            stale_holder = u.task == TASK_RELAY and u.id not in matched and u.relieving is None
+            if not (idle_auto or stale_holder):
+                if u.task is not None:
+                    u.unmatched_since = None
+                continue
+            u.unmatched_since = u.unmatched_since if u.unmatched_since is not None else now
+            if now - u.unmatched_since > RELAY_RTB_HOLD_S:
+                was_relay = u.task == TASK_RELAY
+                self.release(u)
+                u.auto_after_land = True
+                u.rtl()
+                self.event(u, "info", f"{u.id} {'relay slot no longer needed' if was_relay else 'idle'}; returning to pad")
+
+        self.assigned = len(claimed)
+        self.shortfall = len(self.slots) - len(claimed)
+        report = (len(self.clusters), len(self.slots), self.shortfall)
+        last = self._last_report or (0, 0, 0)
+        state_flip = (bool(report[1]) != bool(last[1])) or (bool(report[2]) != bool(last[2]))
+        due = now - self._last_report_at >= ALLOCATOR_REPORT_MIN_INTERVAL_S
+        if report != self._last_report and (state_flip or due):
+            self._last_report_at = now
+            if self.slots:
+                text = (
+                    f"Allocator: {len(self.clusters)} isolated cluster(s) need {len(self.slots)} relay slot(s); "
+                    f"{len(claimed)} assigned"
+                )
+                if self.shortfall:
+                    text += f"; need {self.shortfall} more relay UAV(s) (add UAVs or recharge the fleet)"
+                b.log_event("FLEET", "warn" if self.shortfall else "info", text)
+            elif self._last_report and self._last_report[1]:
+                b.log_event("FLEET", "ok", "Allocator: no isolated clusters; relay slots cleared")
+            self._last_report = report
+
+    def _run_reliefs(self) -> None:
+        for u in list(self.uavs.values()):
+            if u.task == TASK_RELAY and u.relief_by is None and u.battery_pct <= UAV_RELIEF_BATTERY_PCT and u.target:
+                candidates = [c for c in self.uavs.values() if self._available(c)]
+                if not candidates:
+                    continue
+                c = min(candidates, key=lambda c: c.distance_to(u.target) + (0.0 if c.airborne else 150.0))
+                c.task = TASK_RELIEF
+                c.relieving = u.id
+                c.slot_label = u.slot_label
+                u.relief_by = c.id
+                self._send_to(c, u.target)
+                self.event(c, "warn", f"{c.id} launched to relieve {u.id} at {u.slot_label} ({u.battery_pct:.0f}% battery)")
+        for c in list(self.uavs.values()):
+            if c.task != TASK_RELIEF:
+                continue
+            u = self.uavs.get(c.relieving) if c.relieving else None
+            if u is None or u.task != TASK_RELAY:
+                c.task, c.relieving = TASK_RELAY, None
+                continue
+            if u.target and (c.target is None or haversine_m(c.target[0], c.target[1], *u.target) > RELAY_WAYPOINT_DEADBAND_M):
+                self._send_to(c, u.target)
+            if c.flight_state == FS_ON_STATION:
+                label = u.slot_label
+                u.relief_by = None
+                c.relieving = None
+                c.task = TASK_RELAY
+                c.slot_label = label
+                self.release(u)
+                u.auto_after_land = True
+                u.rtl()
+                self.event(c, "ok", f"{c.id} took over {label}; {u.id} returning to pad to recharge")
+
+    # -- snapshot --
+    def uav_dict(self, u: UavAgent) -> dict:
+        n = u.node
+        return {
+            "id": u.id,
+            "sysid": u.sysid,
+            "mode": u.mode,
+            "flight_state": u.flight_state,
+            "armed": u.armed,
+            "coords": _coord((n.lat, n.lng)),
+            "alt_m": round(n.alt_m, 1),
+            "cruise_alt_m": round(u.cruise_alt_m, 1),
+            "speed_mps": round(u.ground_speed_mps, 1),
+            "cruise_speed_mps": round(u.cruise_speed_mps, 1),
+            "climb_mps": round(u.climb_mps, 1),
+            "bearing_deg": round(u.bearing_deg, 1),
+            "eta_s": round(u.eta_s, 1) if u.eta_s is not None else None,
+            "target": _coord(u.target),
+            "home": _coord(u.home),
+            "task": u.task,
+            "slot_label": u.slot_label,
+            "relieving": u.relieving,
+            "relief_by": u.relief_by,
+            "battery_pct": round(u.battery_pct, 1),
+            "endurance_remaining_s": round(u.endurance_remaining_s(self.endurance_s)),
+            "failsafe": u.failsafe,
+            "in_mesh": u.in_mesh,
+            "reachable": n.reachable,
+            "status": n.status if u.in_mesh else ("STANDBY" if not u.airborne else "OFFLINE"),
+            "parent_id": n.parent_id,
+            "link_rssi": _round(n.rssi, 1),
+            "hop_count": max(0, len(n.hop_path) - 1),
+            "bridged_count": u.bridged_count,
+            "dist_home_m": round(u.distance_to(u.home), 1),
+            "mission_time_s": round(u.mission_time_s),
+            "c2_lost_s": round(self.now() - u.unreachable_since, 1) if u.unreachable_since is not None else None,
+            "waypoint_seq": u.waypoint_seq,
+            "last_command": u.last_command,
+            "remove_on_land": u.remove_on_land,
+        }
+
+    def to_dict(self) -> dict:
+        uavs = list(self.uavs.values())
+        gw_lat, gw_lng = self.bridge.gateway_pos
+        return {
+            "uavs": [self.uav_dict(u) for u in uavs],
+            "counts": {
+                "total": len(uavs),
+                "airborne": sum(1 for u in uavs if u.airborne),
+                "bridging": sum(1 for u in uavs if u.task in (TASK_RELAY, TASK_RELIEF) and u.flight_state == FS_ON_STATION),
+                "landed": sum(1 for u in uavs if not u.airborne),
+                "low_battery": sum(1 for u in uavs if u.battery_pct <= UAV_RELIEF_BATTERY_PCT),
+                "failsafe": sum(1 for u in uavs if u.failsafe),
+            },
+            "allocator": {
+                "clusters": self.clusters,
+                "isolated": len(self.bridge.isolated_ground),
+                "needed": len(self.slots),
+                "assigned": self.assigned,
+                "shortfall": self.shortfall,
+                "suspended": self.gateway_jammed,
+                "slots": [{"coords": _coord((s["lat"], s["lng"])), "label": s["label"], "cluster": s["cluster"]} for s in self.slots],
+            },
+            "geofence": {"center": [gw_lat, gw_lng], "radius_m": GEOFENCE_RADIUS_M, "ceiling_m": GEOFENCE_CEILING_M},
+            "config": {
+                "endurance_min": round(self.endurance_s / 60.0, 1),
+                "soft_limit": UAV_SOFT_LIMIT,
+                "speed_min_mps": UAV_SPEED_MIN_MPS,
+                "speed_max_mps": UAV_SPEED_MAX_MPS,
+                "alt_min_m": UAV_ALT_MIN_M,
+                "alt_max_m": GEOFENCE_CEILING_M,
+                "low_battery_pct": UAV_LOW_BATTERY_PCT,
+                "critical_battery_pct": UAV_CRITICAL_BATTERY_PCT,
+                "relief_battery_pct": UAV_RELIEF_BATTERY_PCT,
+                "lost_link_s": UAV_LOST_LINK_S,
+                "relay_range_m": RELAY_LINK_MAX_M,
+                "a2a_range_m": UAV_A2A_MAX_M,
+            },
+            "mavlink": {
+                "host": self.bridge.mavlink.addr[0],
+                "port": self.bridge.mavlink.addr[1],
+                "backend": self.bridge.mavlink.backend,
+                "packet_count": self.bridge.mavlink.packet_count,
+            },
+        }
 
 
 # ------------------------------------------------------------------ #
 # Bridge / Digital Twin engine
 # ------------------------------------------------------------------ #
 class Bridge:
-    def __init__(self, serial_port: str, baud: int, ws_host: str, ws_port: int, swarm_size: int = SWARM_DEFAULT):
+    def __init__(
+        self,
+        serial_port: str,
+        baud: int,
+        ws_host: str,
+        ws_port: int,
+        swarm_size: int = SWARM_DEFAULT,
+        uav_count: int = UAV_DEFAULT_COUNT,
+        uav_endurance_min: float = UAV_ENDURANCE_MIN_DEFAULT,
+        mavlink_port: int = MAVLINK_PORT,
+    ):
         self.serial_port = serial_port
         self.baud = baud
         self.ws_host = ws_host
@@ -738,6 +1588,7 @@ class Bridge:
 
         self.mesh_graph = nx.DiGraph()
         self.paths: dict[str, list[str]] = {GATEWAY_KEY: [GATEWAY_KEY]}
+        self.ground_paths: dict[str, list[str]] = {GATEWAY_KEY: [GATEWAY_KEY]}
         self.spectrum_noise: dict[str, float] = {}
         self.metrics = {
             "health_score": 0.0,
@@ -761,10 +1612,10 @@ class Bridge:
         self._last_rf_counts = (0, 0)
         self._last_rf_alert_at = 0.0
 
-        # Mobile relay + MAVLink
+        # Relay UAV fleet + MAVLink
         self.isolated_ground: set[str] = set()
-        self.mavlink = MavlinkUdpSender(MAVLINK_HOST, MAVLINK_PORT)
-        self.relay = RelayAutopilot(self.relay_home())
+        self.mavlink = MavlinkUdpSender(MAVLINK_HOST, mavlink_port)
+        self.fleet = FleetManager(self, uav_count, uav_endurance_min)
 
         self.recompute_topology()
 
@@ -934,11 +1785,10 @@ class Bridge:
                 hw.lat, hw.lng = destination(gw_lat, gw_lng, hw.proj_distance_m, bearing)
 
         nodes = self.all_nodes()
-        relay = self.relay.node
-        relay_in_graph = self.relay.airborne_bridge()
-        if relay_in_graph:
-            relay.channel = self.active_channel
-        graph_nodes = [*nodes, relay] if relay_in_graph else nodes
+        uav_nodes = self.fleet.mesh_nodes()
+        for un in uav_nodes:
+            un.channel = self.active_channel
+        graph_nodes = [*nodes, *uav_nodes]
         self.spectrum_noise = self.compute_spectrum()
         self.apply_rf_environment(graph_nodes)
 
@@ -952,23 +1802,31 @@ class Bridge:
             for j in range(i + 1, len(linkable)):
                 self._try_link(g, a, linkable[j], best_neighbor)
 
-        # Ground-only Dijkstra decides which nodes the mobile relay must bridge.
+        # Ground-only Dijkstra decides which nodes the relay fleet must bridge.
         _, ground_paths = nx.single_source_dijkstra(g, GATEWAY_KEY, weight="weight")
+        self.ground_paths = ground_paths
         self.isolated_ground = {
             n.id for n in nodes
             if n.id not in ground_paths and self.node_can_link(n) and not n.is_gateway
         }
 
         paths = ground_paths
-        if not relay_in_graph:
-            relay.status, relay.rssi, relay.snr, relay.reachable = STATUS_ONLINE, None, None, False
-            relay.parent_id, relay.hop_path = None, []
-        else:
-            g.add_node(relay.id, type="relay")
-            if self.node_can_link(relay):
+        if uav_nodes:
+            for un in uav_nodes:
+                g.add_node(un.id, type="uav")
+            linkable_uavs = [un for un in uav_nodes if self.node_can_link(un)]
+            for i, a in enumerate(linkable_uavs):
                 for n in linkable:
-                    self._try_link(g, relay, n, best_neighbor)
+                    self._try_link(g, a, n, best_neighbor)
+                for other in linkable_uavs[i + 1:]:
+                    self._try_link(g, a, other, best_neighbor)
             _, paths = nx.single_source_dijkstra(g, GATEWAY_KEY, weight="weight")
+        for u in self.fleet.uavs.values():
+            if not u.in_mesh:
+                n = u.node
+                n.status, n.rssi, n.snr, n.reachable = STATUS_ONLINE, None, None, False
+                n.parent_id, n.hop_path = None, []
+                n.rf_state, n.rf_penalty_db = "CLEAR", 0.0
 
         self.mesh_graph = g
         self.paths = paths
@@ -979,11 +1837,16 @@ class Bridge:
         if a.channel != b.channel:
             return
         d = haversine_m(a.lat, a.lng, b.lat, b.lng)
-        if a.id == RELAY_ID or b.id == RELAY_ID:
-            d = math.hypot(d, RELAY_ALT_M)  # slant range to the airborne relay
-            if d > RELAY_LINK_MAX_M:
+        a_air, b_air = a.type == "uav", b.type == "uav"
+        if a_air or b_air:
+            d = math.hypot(d, a.alt_m - b.alt_m)  # slant range to the airborne relay
+            if a_air and b_air:
+                max_m, gain = UAV_A2A_MAX_M, 2 * RELAY_ANTENNA_GAIN_DB
+            else:
+                max_m, gain = RELAY_LINK_MAX_M, RELAY_ANTENNA_GAIN_DB
+            if d > max_m:
                 return
-            nominal = SIM_TX_POWER + RELAY_ANTENNA_GAIN_DB - 10 * SIM_PATH_LOSS_EXPONENT * math.log10(max(d, 1.0)) + self.rng.gauss(0, RSSI_SIGMA)
+            nominal = SIM_TX_POWER + gain - 10 * SIM_PATH_LOSS_EXPONENT * math.log10(max(d, 1.0)) + self.rng.gauss(0, RSSI_SIGMA)
         else:
             nominal = self.link_rssi(a, b, d)
             if nominal is None:
@@ -1079,94 +1942,27 @@ class Bridge:
     def tick(self) -> None:
         self.tick_count += 1
         self.swarm.step(SIM_TICK_S, self.gateway_pos)
-        self.update_relay_kinematics()
+        self.fleet.update_homes()
+        self.fleet.step(SIM_TICK_S)
         self.recompute_topology()
         self.evaluate_rf_alerts()
         self.evaluate_acs()
-        self.evaluate_relay()
+        self.fleet.evaluate()
         self.stream_mavlink()
 
     # ------------------------------------------------------------------ #
-    # Mobile relay (UAV-RELAY-01) + MAVLink
+    # Relay UAV fleet + MAVLink
     # ------------------------------------------------------------------ #
-    def relay_home(self) -> tuple[float, float]:
-        return destination(self.gateway_pos[0], self.gateway_pos[1], RELAY_HOME_OFFSET_M, RELAY_HOME_BEARING)
-
-    def update_relay_kinematics(self) -> None:
-        self.relay.home = self.relay_home()
-        arrived = self.relay.step(SIM_TICK_S)
-        if arrived:
-            wp = self.relay.target_waypoint
-            self.log_event(
-                "MAVLINK", "ok",
-                f"Relay Node on station at WP-ALPHA ({wp[0]:.5f}, {wp[1]:.5f}, {RELAY_ALT_M:.0f}m); BRIDGING_ACTIVE",
-            )
-
-    def evaluate_relay(self) -> None:
-        r = self.relay
-        isolated = [n for n in self.all_nodes() if n.id in self.isolated_ground]
-        r.isolated_count = len(isolated)
-        r.bridged_count = sum(1 for n in self.all_nodes() if RELAY_ID in n.hop_path)
-        now = self.tick_count * SIM_TICK_S
-        r.isolation_streak = r.isolation_streak + 1 if isolated else 0
-
-        if isolated and r.isolation_streak >= RELAY_DISPATCH_CONFIRM_TICKS:
-            r.last_isolated_at = now
-            iso_lat = sum(n.lat for n in isolated) / len(isolated)
-            iso_lng = sum(n.lng for n in isolated) / len(isolated)
-            gw_lat, gw_lng = self.gateway_pos
-            relay_lat = (gw_lat + iso_lat) / 2.0
-            relay_lng = (gw_lng + iso_lng) / 2.0
-            r.isolated_centroid = (iso_lat, iso_lng)
-            needs_new_wp = (
-                r.mission_state == RELAY_LOITERING
-                or r.target_waypoint is None
-                or haversine_m(relay_lat, relay_lng, *r.target_waypoint) > RELAY_WAYPOINT_DEADBAND_M
-            )
-            if needs_new_wp:
-                first_dispatch = r.mission_state == RELAY_LOITERING
-                r.dispatch((relay_lat, relay_lng))
-                self.mavlink.send_waypoint(relay_lat, relay_lng, RELAY_ALT_M, r.waypoint_count)
-                self.log_event(
-                    "MAVLINK", "warn",
-                    f"Relay Node -> WP-ALPHA ({relay_lat:.5f}, {relay_lng:.5f}, {RELAY_ALT_M:.0f}m) "
-                    f"bridging {len(isolated)} isolated node(s)",
-                )
-                if first_dispatch:
-                    self.notify_phones(f"[RELAY] {RELAY_ID} dispatched to bridge {len(isolated)} node(s)")
-        elif r.mission_state != RELAY_LOITERING and not isolated and now - r.last_isolated_at > RELAY_RTB_HOLD_S:
-            r.return_home()
-            self.log_event("MAVLINK", "info", f"Partition healed; {RELAY_ID} returning to LOITER over gateway")
+    def uav_event(self, u: UavAgent, severity: str, text: str) -> None:
+        """Fleet event: dashboard log line plus a MAVLink STATUSTEXT for that vehicle."""
+        self.log_event("FLEET", severity, text)
 
     def stream_mavlink(self) -> None:
-        r = self.relay
-        self.mavlink.send_heartbeat(active=r.mission_state != RELAY_LOITERING)
-        self.mavlink.send_global_position(r.node.lat, r.node.lng, RELAY_ALT_M, r.ground_speed_mps, r.bearing_deg)
-
-    def autopilot_dict(self) -> dict:
-        r = self.relay
-        return {
-            "id": RELAY_ID,
-            "coords": [round(r.node.lat, 7), round(r.node.lng, 7)],
-            "target_waypoint": [round(r.target_waypoint[0], 7), round(r.target_waypoint[1], 7)] if r.target_waypoint else None,
-            "home": [round(r.home[0], 7), round(r.home[1], 7)],
-            "isolated_centroid": [round(r.isolated_centroid[0], 7), round(r.isolated_centroid[1], 7)] if r.isolated_centroid else None,
-            "alt_m": RELAY_ALT_M,
-            "speed_mps": round(r.ground_speed_mps, 1),
-            "cruise_speed_mps": RELAY_SPEED_MPS,
-            "bearing_deg": round(r.bearing_deg, 1),
-            "eta_s": round(r.eta_s, 1) if r.eta_s is not None else None,
-            "mission_state": r.mission_state,
-            "status": r.node.status,
-            "isolated_count": r.isolated_count,
-            "bridged_count": r.bridged_count,
-            "waypoint_count": r.waypoint_count,
-            "mavlink_host": MAVLINK_HOST,
-            "mavlink_port": MAVLINK_PORT,
-            "mavlink_backend": self.mavlink.backend,
-            "last_command": "MAV_CMD_NAV_WAYPOINT" if r.waypoint_count else None,
-            "packet_count": self.mavlink.packet_count,
-        }
+        for u in self.fleet.uavs.values():
+            if u.sysid is None:
+                continue
+            self.mavlink.send_heartbeat(u)
+            self.mavlink.send_global_position(u)
 
     # ------------------------------------------------------------------ #
     # RF attenuation zone & Adaptive Channel Switching
@@ -1409,6 +2205,7 @@ class Bridge:
             "status": n.status,
             "channel": n.channel,
             "coords": [round(n.lat, 7), round(n.lng, 7)],
+            "alt_m": round(n.alt_m, 1),
             "rssi": _round(n.rssi, 1),
             "snr": _round(n.snr, 1),
             "battery_mv": None if n.battery_mv is None else int(n.battery_mv),
@@ -1435,6 +2232,8 @@ class Bridge:
             "node_count": len(nodes),
             "hardware_count": 1 + len(self.hw_nodes),
             "virtual_count": self.swarm.count,
+            "uav_count": len(self.fleet.uavs),
+            "airborne_uav_count": sum(1 for u in self.fleet.uavs.values() if u.airborne),
             "reachable_count": self.metrics["reachable_count"],
             "link_count": self.mesh_graph.number_of_edges() // 2,
         }
@@ -1468,6 +2267,8 @@ class Bridge:
             },
             "gateway": {"id": GATEWAY_KEY, "coords": [self.gateway_pos[0], self.gateway_pos[1]]},
             "swarm": {
+                "mode": self.swarm.mode,
+                "polygon": [list(v) for v in self.swarm.polygon] if self.swarm.polygon else None,
                 "count": self.swarm.count,
                 "min": SWARM_MIN,
                 "max": SWARM_MAX,
@@ -1486,10 +2287,10 @@ class Bridge:
                 },
             },
             "network": self.network_dict(),
-            "nodes": [self.node_to_dict(n) for n in self.all_nodes()],
+            "nodes": [self.node_to_dict(n) for n in [*self.all_nodes(), *self.fleet.mesh_nodes()]],
             "links": self.links_list(),
             "threat": self.threat_dict(),
-            "autopilot": self.autopilot_dict(),
+            "fleet": self.fleet.to_dict(),
         }
 
     async def broadcast_snapshot(self):
@@ -1540,6 +2341,27 @@ class Bridge:
             count = self.swarm.set_size(int(msg["count"]), self.gateway_pos, self.active_channel)
             self.log_event("SERIAL", "info", f"Virtual swarm resized to {count} nodes")
 
+        elif mtype == "SET_PLACEMENT_MODE":
+            mode = msg.get("mode")
+            if mode == PLACEMENT_ORBIT:
+                self.swarm.set_orbit()
+                rings = "/".join(f"{r:.0f}" for r in self.swarm.radii)
+                self.log_event("SERIAL", "info", f"Placement mode: ORBIT_PATROL (concentric rings {rings} m)")
+            elif mode == PLACEMENT_POLYGON and self.swarm.polygon:
+                points = self.swarm.set_polygon(self.swarm.polygon)
+                self.log_event("SERIAL", "info", f"Placement mode: POLYGON_INFILL ({points} target points)")
+            else:
+                refresh = False
+
+        elif mtype == "SET_DEPLOYMENT_POLYGON":
+            vertices = [(float(v[0]), float(v[1])) for v in msg["vertices"]]
+            points = self.swarm.set_polygon(vertices)
+            if points:
+                self.log_event("SERIAL", "ok", f"Coverage polygon set ({len(vertices)} vertices); {points} nodes transiting at {NODE_TRANSIT_SPEED_MPS:.0f} m/s")
+            else:
+                self.log_event("SERIAL", "warn", "Coverage polygon rejected (needs >= 3 vertices and non-zero area)")
+                refresh = False
+
         elif mtype == "SET_ORBIT_CONFIG":
             try:
                 self.swarm.set_orbit_config(msg["radii"], msg.get("speed_mps", self.swarm.speed_mps))
@@ -1549,9 +2371,10 @@ class Bridge:
             else:
                 rings = "/".join(f"{r:.0f}" for r in self.swarm.radii)
                 gap = self.swarm.max_ring_gap_m()
+                applies = "nodes transiting to new slots" if self.swarm.mode == PLACEMENT_ORBIT else "applies when Orbit Patrol is selected"
                 self.log_event(
                     "SERIAL", "ok",
-                    f"Orbit configuration: rings {rings} m at {self.swarm.speed_mps:.1f} m/s; nodes transiting to new slots",
+                    f"Orbit configuration: rings {rings} m at {self.swarm.speed_mps:.1f} m/s; {applies}",
                 )
                 if gap > LINK_MAX_M:
                     self.log_event(
@@ -1577,7 +2400,25 @@ class Bridge:
             await self.broadcast_snapshot()
 
     def handle_extended_command(self, mtype, msg: dict) -> bool:
-        """RF / ACS commands. Returns True if a topology refresh is needed."""
+        """RF / ACS / fleet commands. Returns True if a topology refresh is needed."""
+        if mtype == "FLEET_ADD":
+            self.fleet.add(int(msg.get("count", 1)))
+            return True
+        if mtype == "FLEET_REMOVE":
+            ok, text = self.fleet.remove(str(msg["uav_id"]))
+            self.log_event("FLEET", "info" if ok else "warn", text)
+            return True
+        if mtype == "UAV_COMMAND":
+            args = {k: msg[k] for k in ("lat", "lng", "alt_m", "speed_mps") if msg.get(k) is not None}
+            self.fleet.command(str(msg["uav_id"]), str(msg["action"]), "DASHBOARD", **args)
+            return True
+        if mtype == "FLEET_COMMAND":
+            try:
+                self.fleet.fleet_command(str(msg["action"]))
+            except ValueError as exc:
+                self.log_event("FLEET", "warn", str(exc))
+                return False
+            return True
         if mtype == "DEPLOY_JAMMER":
             self.deploy_zone(msg)
             return True
@@ -1893,9 +2734,15 @@ def main():
     parser.add_argument("--ws-host", default="localhost", help="WebSocket bind host (default: localhost)")
     parser.add_argument("--ws-port", type=int, default=8765, help="WebSocket port (default: 8765)")
     parser.add_argument("--swarm", type=int, default=SWARM_DEFAULT, help=f"Virtual node count {SWARM_MIN}-{SWARM_MAX} (default: {SWARM_DEFAULT})")
+    parser.add_argument("--uavs", type=int, default=UAV_DEFAULT_COUNT, help=f"Initial relay UAV fleet size (default: {UAV_DEFAULT_COUNT}; add more at runtime)")
+    parser.add_argument("--uav-endurance-min", type=float, default=UAV_ENDURANCE_MIN_DEFAULT, help=f"Relay UAV flight endurance in minutes (default: {UAV_ENDURANCE_MIN_DEFAULT:.0f})")
+    parser.add_argument("--mavlink-port", type=int, default=MAVLINK_PORT, help=f"Ground station UDP port on {MAVLINK_HOST} (default: {MAVLINK_PORT})")
     args = parser.parse_args()
 
-    bridge = Bridge(args.port, args.baud, args.ws_host, args.ws_port, args.swarm)
+    bridge = Bridge(
+        args.port, args.baud, args.ws_host, args.ws_port, args.swarm,
+        uav_count=max(0, args.uavs), uav_endurance_min=args.uav_endurance_min, mavlink_port=args.mavlink_port,
+    )
     try:
         asyncio.run(bridge.run())
     except KeyboardInterrupt:
