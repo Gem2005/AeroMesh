@@ -10,8 +10,10 @@ Subsystems:
     * SwarmSimulator     -- configurable orbit rings / polygon infill with lost-link position hold
     * RF attenuation     -- primary drop zone + fringe penalty, weighted centroid estimate
     * Adaptive Channel Switching (ACS) -- confirmation timer, CH_SWITCH over serial
-    * FleetManager       -- any number of relay UAVs: cluster allocator, relay chains,
-                            relief on station, battery / lost-link / geofence failsafes
+    * FleetManager       -- any number of mixed-airframe relay UAVs (same radio payload):
+                            relay chains for isolated clusters, coverage for weak next-hop
+                            links, config-aware dispatch, relief on station, battery /
+                            lost-link / geofence failsafes
     * MavlinkGcsLink     -- two-way MAVLink v2 on udp:127.0.0.1:14550: one vehicle per UAV
                             system id; QGroundControl / Mission Planner can arm, take off,
                             change mode, fly-to, RTL and land any relay UAV
@@ -26,13 +28,15 @@ Run:
     python bridge.py                       # defaults: COM9 @ 115200, ws://localhost:8765
     python bridge.py --port COM5           # custom serial port
     python bridge.py --port COM9 --baud 115200 --ws-port 8765 --swarm 40
-    python bridge.py --uavs 6 --uav-endurance-min 15   # bigger relay fleet, shorter endurance
+    python bridge.py --uav-mix QUAD-S:3,VTOL-FW:2      # custom mixed relay fleet
+    python bridge.py --uavs 6                          # 6 UAVs cycling through every type
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import json
 import logging
 import math
@@ -97,11 +101,29 @@ HW_DISTANCE_SMOOTHING = 0.35   # EMA factor so markers don't jump on every RSSI 
 # ------------------------------------------------------------------ #
 # Simulated link model (outdoor line-of-sight virtual swarm)
 # ------------------------------------------------------------------ #
-SIM_TX_POWER = -40
-SIM_PATH_LOSS_EXPONENT = 2.0   # puts the -88 dBm threshold at ~220 m
+# Every node and every UAV type carries the same ESP32-class radio (20 dBm, 2 dBi):
+# -16 dBm at 1 m, so link quality differs only by geometry.
+RSSI_1M_DBM = -16.0
+# Ground-to-ground: two-ray dual slope. Free space up to the breakpoint 4*h1*h2/lambda
+# (~25 m for 0.9 m handheld antennas at 2.4 GHz), then 40 dB/decade ground reflection loss.
+GROUND_BREAKPOINT_M = 25.0
+GROUND_FAR_EXPONENT = 4.0
+# Air-to-ground: free space plus elevation-angle excess loss (LOS probability falls at
+# grazing angles): 0 dB straight down, A2G_GRAZING_LOSS_DB at the horizon.
+A2G_GRAZING_LOSS_DB = 15.0
 RSSI_SIGMA = 1.5
 LINK_RSSI_MIN = -88.0
-LINK_MAX_M = 220.0
+_GROUND_BREAKPOINT_RSSI = RSSI_1M_DBM - 20 * math.log10(GROUND_BREAKPOINT_M)
+LINK_MAX_M = GROUND_BREAKPOINT_M * 10 ** ((_GROUND_BREAKPOINT_RSSI - LINK_RSSI_MIN) / (10 * GROUND_FAR_EXPONENT))  # ~315 m
+# Signal bands shared with the dashboard legend / histogram.
+RSSI_EXCELLENT_DBM = -55.0
+RSSI_GOOD_DBM = -75.0
+# Routing cost per hop = LINK_COST_HOP + exp((LINK_COST_REF - rssi) / LINK_COST_SCALE):
+# one -84 dBm hop costs more than two -75 dBm hops, so parents are strong next hops,
+# while the flat per-hop term stops routes from chaining through many short links.
+LINK_COST_HOP = 10.0
+LINK_COST_REF_DBM = -60.0
+LINK_COST_SCALE_DB = 4.0
 DEFAULT_CHANNEL = 6
 WIFI_CHANNELS = tuple(range(1, 12))
 BASE_NOISE_FLOOR_DBM = -92.0
@@ -182,14 +204,8 @@ RF_ALERT_MIN_INTERVAL_S = 5.0
 # Relay UAV fleet
 # ------------------------------------------------------------------ #
 UAV_ID_PREFIX = "UAV-"
-UAV_DEFAULT_COUNT = 2
 UAV_SOFT_LIMIT = 60                 # pairwise link search is O(n^2); warn, don't cap
 UAV_MAX_SYSID = 255                 # MAVLink system ids are one byte; sysid 1 is the bridge
-UAV_CRUISE_SPEED_MPS = 18.0
-UAV_SPEED_MIN_MPS = 3.0
-UAV_SPEED_MAX_MPS = 25.0
-UAV_CLIMB_MPS = 3.0
-UAV_DESCENT_MPS = 2.0
 UAV_BASE_ALT_M = 50.0
 UAV_ALT_LAYER_STEP_M = 10.0
 UAV_ALT_LAYERS = 5                  # 50/60/70/80/90 m keeps neighbours vertically separated
@@ -200,8 +216,6 @@ UAV_PAD_BASE_RADIUS_M = 40.0
 UAV_PAD_RING_STEP_M = 15.0
 UAV_PADS_PER_RING = 12
 UAV_PAD_START_BEARING = 225.0
-UAV_ENDURANCE_MIN_DEFAULT = 20.0
-UAV_SPEED_DRAIN_FACTOR = 0.35       # extra drain at cruise speed relative to hover
 UAV_RECHARGE_PCT_PER_S = 1.0        # accelerated pad recharge so demos don't stall
 UAV_RELIEF_BATTERY_PCT = 40.0       # on-station UAV requests a relief at this level
 UAV_LOW_BATTERY_PCT = 30.0          # failsafe: RTL
@@ -215,10 +229,25 @@ GEOFENCE_CEILING_M = 120.0          # common regulatory ceiling (400 ft AGL)
 RELAY_RTB_HOLD_S = 10.0             # partition must stay healed this long before returning
 RELAY_WAYPOINT_DEADBAND_M = 40.0    # ignore centroid drift smaller than this
 RELAY_DISPATCH_CONFIRM_TICKS = 2    # isolation must persist this many ticks before dispatch
-RELAY_ANTENNA_GAIN_DB = 10.0        # elevated high-gain relay antenna (air-to-ground LOS)
 RELAY_LINK_MAX_M = 450.0
 RELAY_CHAIN_SPACING_FACTOR = 0.8    # chain hops at 80% of slant range for fade margin
+RELAY_MIN_STATION_S = 120.0         # dispatch only if the airframe can hold a relay slot this long
 ALLOCATOR_REPORT_MIN_INTERVAL_S = 5.0
+
+# Coverage duty: ground nodes whose own next hop (ground-only tree) is below the good
+# band get a UAV overhead. Demand comes from the ground tree, so a UAV's own coverage
+# never cancels the demand that placed it.
+COVER_CONFIRM_TICKS = 4             # weak next hop must persist this long to count
+COVER_HYSTERESIS_DB = 2.0           # a weak node clears only once its next hop is this far into the good band
+COVER_PLAN_ALT_M = UAV_BASE_ALT_M
+COVER_RADIUS_MARGIN = 0.8           # plan groups inside 80% of the good-RSSI footprint
+COVER_MIN_GROUP = 1
+COVER_MATCH_FACTOR = 1.0            # holders keep a slot that moved less than one plan radius
+COVER_RELEASE_HOLD_S = 30.0
+COVER_MIN_STATION_S = 300.0
+COVER_ENDURANCE_WEIGHT = 0.1        # s of ETA traded per s of extra on-station time
+COVER_REPORT_MIN_INTERVAL_S = 20.0
+UAV_ARM_DELAY_S = 3.0
 
 MODE_AUTO = "AUTO"
 MODE_GUIDED = "GUIDED"
@@ -227,7 +256,71 @@ MODE_RTL = "RTL"
 MODE_LAND = "LAND"
 UAV_MODES = (MODE_AUTO, MODE_GUIDED, MODE_LOITER, MODE_RTL, MODE_LAND)
 COPTER_CUSTOM_MODE = {MODE_AUTO: 3, MODE_GUIDED: 4, MODE_LOITER: 5, MODE_RTL: 6, MODE_LAND: 9}
-CUSTOM_MODE_TO_MODE = {v: k for k, v in COPTER_CUSTOM_MODE.items()}
+PLANE_CUSTOM_MODE = {MODE_AUTO: 10, MODE_GUIDED: 15, MODE_LOITER: 12, MODE_RTL: 11, MODE_LAND: 20}  # LAND = QLAND
+
+AIRFRAME_MULTIROTOR = "MULTIROTOR"
+AIRFRAME_VTOL = "VTOL_FIXED_WING"
+
+
+@dataclass(frozen=True)
+class UavType:
+    """Airframe profile. Every type carries the identical relay radio payload."""
+    key: str
+    name: str
+    airframe: str
+    mav_type: int
+    cruise_speed_mps: float
+    min_speed_mps: float
+    max_speed_mps: float
+    climb_mps: float
+    descent_mps: float
+    endurance_min: float
+    speed_drain_factor: float       # extra drain at cruise relative to the base rate
+    hover_drain_factor: float       # drain multiplier while hovering (VTOL lift motors)
+    loiter_radius_m: float          # 0 = hovers in place on station
+
+    @property
+    def endurance_s(self) -> float:
+        return self.endurance_min * 60.0
+
+    @property
+    def custom_modes(self) -> dict[str, int]:
+        return PLANE_CUSTOM_MODE if self.airframe == AIRFRAME_VTOL else COPTER_CUSTOM_MODE
+
+    def to_dict(self) -> dict:
+        return {
+            "key": self.key, "name": self.name, "airframe": self.airframe,
+            "cruise_speed_mps": self.cruise_speed_mps, "min_speed_mps": self.min_speed_mps,
+            "max_speed_mps": self.max_speed_mps, "climb_mps": self.climb_mps,
+            "endurance_min": self.endurance_min, "loiter_radius_m": self.loiter_radius_m,
+        }
+
+
+UAV_TYPES: dict[str, UavType] = {t.key: t for t in (
+    UavType("QUAD-S", "Light quadcopter", AIRFRAME_MULTIROTOR, 2,
+            cruise_speed_mps=15.0, min_speed_mps=3.0, max_speed_mps=20.0, climb_mps=3.0, descent_mps=2.0,
+            endurance_min=25.0, speed_drain_factor=0.35, hover_drain_factor=1.0, loiter_radius_m=0.0),
+    UavType("HEXA-H", "Heavy-lift hexacopter", AIRFRAME_MULTIROTOR, 13,
+            cruise_speed_mps=12.0, min_speed_mps=3.0, max_speed_mps=16.0, climb_mps=2.5, descent_mps=2.0,
+            endurance_min=40.0, speed_drain_factor=0.3, hover_drain_factor=1.0, loiter_radius_m=0.0),
+    UavType("VTOL-FW", "VTOL fixed-wing", AIRFRAME_VTOL, 22,
+            cruise_speed_mps=22.0, min_speed_mps=16.0, max_speed_mps=28.0, climb_mps=3.5, descent_mps=2.5,
+            endurance_min=90.0, speed_drain_factor=0.2, hover_drain_factor=3.0, loiter_radius_m=60.0),
+)}
+UAV_DEFAULT_TYPE = "QUAD-S"
+UAV_DEFAULT_MIX = (("QUAD-S", 2), ("HEXA-H", 1), ("VTOL-FW", 1))
+
+
+def parse_uav_mix(text: str) -> list[str]:
+    """'QUAD-S:2,VTOL-FW:1' -> ['QUAD-S', 'QUAD-S', 'VTOL-FW']."""
+    out: list[str] = []
+    for part in filter(None, (p.strip() for p in text.split(","))):
+        key, _, count = part.partition(":")
+        key = key.strip().upper()
+        if key not in UAV_TYPES:
+            raise ValueError(f"unknown UAV type {key!r} (known: {', '.join(UAV_TYPES)})")
+        out.extend([key] * (int(count) if count.strip() else 1))
+    return out
 
 FS_LANDED = "LANDED"
 FS_TAKING_OFF = "TAKING_OFF"
@@ -239,7 +332,11 @@ FS_LANDING = "LANDING"
 
 TASK_RELAY = "RELAY"
 TASK_RELIEF = "RELIEF"
+TASK_COVER = "COVER"
 TASK_GOTO = "GOTO"
+
+SLOT_RELAY = "RELAY"
+SLOT_COVER = "COVER"
 
 FAILSAFE_LOW_BATTERY = "LOW_BATTERY"
 FAILSAFE_CRITICAL_BATTERY = "CRITICAL_BATTERY"
@@ -446,6 +543,38 @@ def hop_success(rssi: float) -> float:
     """Per-hop delivery probability including MAC retries."""
     p = 1.0 / (1.0 + math.exp(-(rssi - PDR_LOGISTIC_CENTER_DBM) / PDR_LOGISTIC_SCALE_DB))
     return 1.0 - (1.0 - p) ** (1 + MAC_RETRIES)
+
+
+def link_cost(rssi: float) -> float:
+    """Dijkstra edge weight: grows steeply as a link approaches the -88 dBm floor."""
+    return LINK_COST_HOP + math.exp((LINK_COST_REF_DBM - rssi) / LINK_COST_SCALE_DB)
+
+
+def ground_rssi_nominal(d: float) -> float:
+    if d <= GROUND_BREAKPOINT_M:
+        return RSSI_1M_DBM - 20 * math.log10(max(d, 1.0))
+    return _GROUND_BREAKPOINT_RSSI - 10 * GROUND_FAR_EXPONENT * math.log10(d / GROUND_BREAKPOINT_M)
+
+
+def air_rssi_nominal(slant_m: float, dz_m: float, air_to_air: bool) -> float:
+    rssi = RSSI_1M_DBM - 20 * math.log10(max(slant_m, 1.0))
+    if not air_to_air:
+        rssi -= A2G_GRAZING_LOSS_DB * (1.0 - min(1.0, dz_m / max(slant_m, 1.0)))
+    return rssi
+
+
+def a2g_cover_radius_m(alt_m: float, rssi_dbm: float = RSSI_GOOD_DBM) -> float:
+    """Horizontal radius under a relay at alt_m where the air-to-ground link stays above rssi_dbm."""
+    if air_rssi_nominal(alt_m, alt_m, False) < rssi_dbm:
+        return 0.0
+    lo, hi = 0.0, RELAY_LINK_MAX_M
+    for _ in range(30):
+        mid = (lo + hi) / 2
+        if air_rssi_nominal(math.hypot(mid, alt_m), alt_m, False) >= rssi_dbm:
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 def link_quality(rssi: float) -> float:
@@ -912,7 +1041,7 @@ class MavlinkGcsLink:
             base_mode |= MAV_MODE_FLAG_SAFETY_ARMED
         state = MAV_STATE_ACTIVE if u.airborne else MAV_STATE_STANDBY
         payload = struct.pack(
-            "<IBBBBB", COPTER_CUSTOM_MODE[u.mode], MAV_TYPE_QUADROTOR, MAV_AUTOPILOT_ARDUPILOTMEGA, base_mode, state, 3
+            "<IBBBBB", u.utype.custom_modes[u.mode], u.utype.mav_type, MAV_AUTOPILOT_ARDUPILOTMEGA, base_mode, state, 3
         )
         self._send_raw(MAVLINK_MSG_HEARTBEAT, payload, u.sysid)
 
@@ -1094,7 +1223,7 @@ class MavlinkGcsLink:
         return ok
 
     def _set_mode(self, fleet: "FleetManager", u: "UavAgent", custom_mode: int) -> int:
-        mode = CUSTOM_MODE_TO_MODE.get(int(custom_mode))
+        mode = next((m for m, v in u.utype.custom_modes.items() if v == int(custom_mode)), None)
         if mode is None:
             self._record(f"{u.id} SET_MODE {custom_mode} unsupported")
             return MAV_RESULT_UNSUPPORTED
@@ -1167,16 +1296,17 @@ def _coord(p: tuple[float, float] | None) -> list[float] | None:
 
 
 class UavAgent:
-    """One relay multirotor: 3D point-mass kinematics, battery model and flight modes."""
+    """One relay UAV: 3D point-mass kinematics, per-airframe battery model and flight modes."""
 
-    def __init__(self, index: int, home: tuple[float, float], battery_pct: float):
+    def __init__(self, index: int, home: tuple[float, float], battery_pct: float, utype: UavType):
         self.index = index
         self.id = uav_id(index)
+        self.utype = utype
         self.sysid: int | None = index + 1 if index + 1 <= UAV_MAX_SYSID else None
         self.home = home
         self.node = MeshNode(id=self.id, type="uav", lat=home[0], lng=home[1])
         self.cruise_alt_m = UAV_BASE_ALT_M + UAV_ALT_LAYER_STEP_M * ((index - 1) % UAV_ALT_LAYERS)
-        self.cruise_speed_mps = UAV_CRUISE_SPEED_MPS
+        self.cruise_speed_mps = utype.cruise_speed_mps
         self.mode = MODE_AUTO
         self.flight_state = FS_LANDED
         self.armed = False
@@ -1209,18 +1339,28 @@ class UavAgent:
     def in_mesh(self) -> bool:
         return self.airborne and self.node.alt_m >= UAV_MESH_MIN_ALT_M
 
+    @property
+    def loiters(self) -> bool:
+        return self.utype.loiter_radius_m > 0
+
+    @property
+    def arrival_radius_m(self) -> float:
+        return self.utype.loiter_radius_m + UAV_ARRIVAL_RADIUS_M if self.loiters else UAV_ARRIVAL_RADIUS_M
+
     def distance_to(self, p: tuple[float, float]) -> float:
         return haversine_m(self.node.lat, self.node.lng, p[0], p[1])
 
     # -- flight primitives (mode bookkeeping lives in FleetManager) --
-    def set_target(self, target: tuple[float, float]) -> None:
+    def set_target(self, target: tuple[float, float], keep_station: bool = False) -> None:
         self.target = target
         self.hold_pos = None
         if self.flight_state == FS_LANDED:
             self.armed = True
             self.flight_state = FS_TAKING_OFF
+        elif keep_station and self.flight_state == FS_ON_STATION:
+            pass  # station keeping: drift with the slot without leaving it
         elif self.flight_state != FS_TAKING_OFF:
-            self.flight_state = FS_ON_STATION if self.distance_to(target) <= UAV_ARRIVAL_RADIUS_M else FS_TRANSIT
+            self.flight_state = FS_ON_STATION if self.distance_to(target) <= self.arrival_radius_m else FS_TRANSIT
 
     def takeoff(self) -> None:
         self.target = None
@@ -1243,9 +1383,20 @@ class UavAgent:
         self.hold_pos = None
         self.flight_state = FS_LANDING
 
-    def step(self, dt: float, endurance_s: float) -> list[str]:
+    def _loiter_point(self, center: tuple[float, float], dt: float) -> tuple[float, float]:
+        """Next point on the loiter circle around center (a fixed-wing cannot hover)."""
+        r = self.utype.loiter_radius_m
+        n = self.node
+        d = haversine_m(center[0], center[1], n.lat, n.lng)
+        ang = calculate_bearing(center[0], center[1], n.lat, n.lng) if d >= 1.0 else self.bearing_deg
+        if d < 0.7 * r:
+            return destination(center[0], center[1], r, ang)
+        return destination(center[0], center[1], r, ang + math.degrees(self.utype.min_speed_mps * dt / r))
+
+    def step(self, dt: float) -> list[str]:
         """Advances one tick and returns flight events (TAKEOFF_COMPLETE, ARRIVED, OVER_HOME, LANDED)."""
         n = self.node
+        t = self.utype
         if self.flight_state == FS_LANDED:
             n.alt_m = 0.0
             self.ground_speed_mps = self.climb_mps = 0.0
@@ -1257,7 +1408,7 @@ class UavAgent:
         fs = self.flight_state
         target_alt = 0.0 if fs == FS_LANDING else self.cruise_alt_m
         dz = target_alt - n.alt_m
-        rate = UAV_CLIMB_MPS if dz > 0 else UAV_DESCENT_MPS
+        rate = t.climb_mps if dz > 0 else t.descent_mps
         step_z = max(-rate * dt, min(rate * dt, dz))
         n.alt_m = max(0.0, n.alt_m + step_z)
         self.climb_mps = step_z / dt
@@ -1271,7 +1422,17 @@ class UavAgent:
             goal = self.home
 
         remaining = 0.0
-        if goal is not None:
+        if goal is not None and self.loiters and fs in (FS_ON_STATION, FS_HOLDING):
+            off_circle = self.distance_to(goal) > self.arrival_radius_m + UAV_ARRIVAL_RADIUS_M
+            p = goal if off_circle else self._loiter_point(goal, dt)
+            d = self.distance_to(p)
+            if d > 0.5:
+                self.bearing_deg = calculate_bearing(n.lat, n.lng, p[0], p[1])
+            speed = self.cruise_speed_mps if off_circle else t.min_speed_mps
+            n.lat, n.lng, left = move_toward(n.lat, n.lng, p[0], p[1], speed * dt)
+            self.ground_speed_mps = (d - left) / dt
+            self.eta_s = None
+        elif goal is not None:
             d = self.distance_to(goal)
             if d > 0.5:
                 self.bearing_deg = calculate_bearing(n.lat, n.lng, goal[0], goal[1])
@@ -1290,7 +1451,7 @@ class UavAgent:
                 self.hold_pos = (n.lat, n.lng)
                 self.flight_state = FS_HOLDING
             events.append("TAKEOFF_COMPLETE")
-        elif fs == FS_TRANSIT and remaining <= UAV_ARRIVAL_RADIUS_M:
+        elif fs == FS_TRANSIT and remaining <= self.arrival_radius_m:
             self.flight_state = FS_ON_STATION
             events.append("ARRIVED")
         elif fs == FS_RETURNING and remaining <= 1.0:
@@ -1306,30 +1467,52 @@ class UavAgent:
 
         if self.flight_state != FS_LANDED:
             self.mission_time_s += dt
-            load = 1.0 + UAV_SPEED_DRAIN_FACTOR * min(1.5, self.ground_speed_mps / UAV_CRUISE_SPEED_MPS)
-            self.battery_pct = max(0.0, self.battery_pct - (100.0 / endurance_s) * load * dt)
+            self.battery_pct = max(0.0, self.battery_pct - (100.0 / t.endurance_s) * self._load(fs) * dt)
         return events
 
-    def endurance_remaining_s(self, endurance_s: float) -> float:
-        return endurance_s * self.battery_pct / 100.0
+    def _load(self, fs: str) -> float:
+        """Drain relative to the rated endurance (multirotor: hover, fixed-wing: cruise)."""
+        t = self.utype
+        speed_ratio = min(1.5, self.ground_speed_mps / t.cruise_speed_mps)
+        if t.airframe == AIRFRAME_VTOL:
+            if fs in (FS_TAKING_OFF, FS_LANDING) or self.ground_speed_mps < 0.5 * t.min_speed_mps:
+                return t.hover_drain_factor
+            return (1.0 - t.speed_drain_factor) + t.speed_drain_factor * speed_ratio
+        return t.hover_drain_factor + t.speed_drain_factor * speed_ratio
+
+    def endurance_remaining_s(self) -> float:
+        return self.utype.endurance_s * self.battery_pct / 100.0
+
+    def usable_endurance_s(self) -> float:
+        """Flight time left before the low-battery RTL failsafe fires."""
+        return self.utype.endurance_s * max(0.0, self.battery_pct - UAV_LOW_BATTERY_PCT) / 100.0
 
 
 class FleetManager:
     """Relay UAV fleet: add/remove, operator commands, failsafes and the relay allocator."""
 
-    def __init__(self, bridge: "Bridge", count: int, endurance_min: float):
+    def __init__(self, bridge: "Bridge", types: list[str]):
         self.bridge = bridge
-        self.endurance_s = max(1.0, float(endurance_min)) * 60.0
         self.uavs: dict[str, UavAgent] = {}
         self.isolation_streak = 0
         self.clusters: list[dict] = []
         self.slots: list[dict] = []
+        self.cover_groups: list[dict] = []
+        self.coverage_enabled = True
+        self._cover_labels: list[tuple[str, float, float]] = []
+        self.weak_streak: dict[str, int] = {}
+        self.weak_nodes: set[str] = set()
         self.shortfall = 0
         self.assigned = 0
+        self.cover_assigned = 0
         self._last_report: tuple | None = None
         self._last_report_at = -1e9
+        self._last_cover_report: tuple | None = None
+        self._last_cover_report_at = -1e9
         self.gateway_jammed = False
-        self.add(count, announce=False)
+        self.cover_plan_radius_m = COVER_RADIUS_MARGIN * a2g_cover_radius_m(COVER_PLAN_ALT_M)
+        for key in types:
+            self.add(1, key, announce=False)
 
     # -- bookkeeping --
     def now(self) -> float:
@@ -1358,19 +1541,26 @@ class FleetManager:
             idx += 1
         return idx
 
-    def add(self, count: int, announce: bool = True) -> list[str]:
+    def add(self, count: int, uav_type: str | None = None, announce: bool = True) -> list[str]:
         count = max(0, int(count))
+        key = (uav_type or UAV_DEFAULT_TYPE).upper()
+        utype = UAV_TYPES.get(key)
+        if utype is None:
+            raise ValueError(f"unknown UAV type {key} (known: {', '.join(UAV_TYPES)})")
         before = len(self.uavs)
         ids = []
         for _ in range(count):
             idx = self._free_index()
-            u = UavAgent(idx, self.pad_position(idx), self.bridge.rng.uniform(92.0, 100.0))
+            u = UavAgent(idx, self.pad_position(idx), self.bridge.rng.uniform(92.0, 100.0), utype)
             self.uavs[u.id] = u
             ids.append(u.id)
         self.uavs = dict(sorted(self.uavs.items(), key=lambda kv: kv[1].index))
         if announce and ids:
             span = ids[0] if len(ids) == 1 else f"{ids[0]}..{ids[-1]}"
-            self.bridge.log_event("FLEET", "ok", f"Added {len(ids)} relay UAV(s) ({span}) on home pads; fleet size {len(self.uavs)}")
+            self.bridge.log_event(
+                "FLEET", "ok",
+                f"Added {len(ids)} {utype.key} {utype.name} relay UAV(s) ({span}) on home pads; fleet size {len(self.uavs)}",
+            )
         if before <= UAV_SOFT_LIMIT < len(self.uavs):
             self.bridge.log_event(
                 "FLEET", "warn",
@@ -1445,10 +1635,11 @@ class FleetManager:
             raise ValueError(f"altitude {alt:.0f} m outside {UAV_ALT_MIN_M:.0f}-{GEOFENCE_CEILING_M:.0f} m AGL")
         return alt
 
-    def _validate_speed(self, speed) -> float:
+    def _validate_speed(self, u: UavAgent, speed) -> float:
         speed = float(speed)
-        if not UAV_SPEED_MIN_MPS <= speed <= UAV_SPEED_MAX_MPS:
-            raise ValueError(f"speed {speed:.1f} m/s outside {UAV_SPEED_MIN_MPS:.0f}-{UAV_SPEED_MAX_MPS:.0f} m/s")
+        t = u.utype
+        if not t.min_speed_mps <= speed <= t.max_speed_mps:
+            raise ValueError(f"speed {speed:.1f} m/s outside the {t.key} envelope {t.min_speed_mps:.0f}-{t.max_speed_mps:.0f} m/s")
         return speed
 
     def inside_geofence(self, lat: float, lng: float) -> bool:
@@ -1526,7 +1717,7 @@ class FleetManager:
             if alt is not None:
                 u.cruise_alt_m = self._validate_alt(alt)
             if speed is not None:
-                u.cruise_speed_mps = self._validate_speed(speed)
+                u.cruise_speed_mps = self._validate_speed(u, speed)
             self.release(u)
             u.mode = MODE_GUIDED
             u.failsafe = None
@@ -1538,7 +1729,7 @@ class FleetManager:
             u.cruise_alt_m = self._validate_alt(alt)
             return True, f"cruise altitude {u.cruise_alt_m:.0f} m"
         if action == "SET_SPEED":
-            u.cruise_speed_mps = self._validate_speed(speed)
+            u.cruise_speed_mps = self._validate_speed(u, speed)
             return True, f"cruise speed {u.cruise_speed_mps:.1f} m/s"
         if action == "ARM":
             if u.airborne:
@@ -1573,8 +1764,8 @@ class FleetManager:
         self.bridge.log_event("FLEET", "info" if accepted else "warn", f"{action}: {accepted}/{len(eligible)} UAV(s) accepted")
         return accepted, len(eligible)
 
-    def _send_to(self, u: UavAgent, point: tuple[float, float]) -> None:
-        u.set_target(point)
+    def _send_to(self, u: UavAgent, point: tuple[float, float], keep_station: bool = False) -> None:
+        u.set_target(point, keep_station)
         u.waypoint_seq += 1
         u.last_command = "MAV_CMD_NAV_WAYPOINT"
         if u.sysid is not None:
@@ -1583,13 +1774,16 @@ class FleetManager:
     # -- per-tick --
     def step(self, dt: float) -> None:
         for u in list(self.uavs.values()):
-            for ev in u.step(dt, self.endurance_s):
+            for ev in u.step(dt):
                 self._on_flight_event(u, ev)
 
     def _on_flight_event(self, u: UavAgent, ev: str) -> None:
         if ev == "ARRIVED":
             if u.task in (TASK_RELAY, TASK_RELIEF):
                 self.event(u, "ok", f"{u.id} on station at {u.slot_label or 'relay slot'} ({u.node.lat:.5f}, {u.node.lng:.5f}, {u.cruise_alt_m:.0f} m); BRIDGING_ACTIVE")
+            elif u.task == TASK_COVER:
+                how = f"loitering r={u.utype.loiter_radius_m:.0f} m" if u.loiters else "hovering"
+                self.event(u, "ok", f"{u.id} on station over coverage {u.slot_label} at {u.cruise_alt_m:.0f} m, {how}")
             elif u.task == TASK_GOTO:
                 self.event(u, "ok", f"{u.id} reached Go-To target; holding position")
         elif ev == "LANDED":
@@ -1699,13 +1893,135 @@ class FleetManager:
                     gw_lat, gw_lng = b.gateway_pos
                     lat, lng = destination(gw_lat, gw_lng, GEOFENCE_RADIUS_M * 0.95, calculate_bearing(gw_lat, gw_lng, lat, lng))
                 label = f"C{ci}-R{i}" if k > 1 else f"C{ci}"
-                slots.append({"lat": lat, "lng": lng, "cluster": ci, "index": i, "of": k, "size": len(members), "label": label})
+                slots.append({
+                    "kind": SLOT_RELAY, "lat": lat, "lng": lng, "cluster": ci, "index": i, "of": k,
+                    "size": len(members), "label": label,
+                })
         return slots
+
+    def _update_weak(self) -> None:
+        """Tracks virtual nodes whose ground-only next hop sits below the good band (with hysteresis)."""
+        b = self.bridge
+        score = {}
+        for n in b.all_nodes():
+            if n.is_gateway or n.type != "virtual" or n.rf_state == STATUS_JAMMED:
+                continue
+            r = b.ground_link_rssi.get(n.id)
+            if r is None:
+                continue
+            k = self.weak_streak.get(n.id, 0)
+            if r < RSSI_GOOD_DBM:
+                k = min(2 * COVER_CONFIRM_TICKS, k + 1)
+            elif r > RSSI_GOOD_DBM + COVER_HYSTERESIS_DB:
+                k -= 1
+            if k > 0:
+                score[n.id] = k
+        self.weak_streak = score
+        self.weak_nodes = {nid for nid, k in score.items() if k >= COVER_CONFIRM_TICKS}
+
+    def _plan_cover_slots(self) -> list[dict]:
+        """Sticky disc cover of the weak nodes; one UAV over each disc lifts them to the good band.
+
+        Areas from the previous tick (UAV-held ones first) re-claim the weak nodes still inside
+        their disc and keep their label, so slots drift with the orbit instead of re-forming.
+        Only the remaining weak nodes are grouped fresh, greedily by disc population.
+        """
+        b = self.bridge
+        by_id = {n.id: n for n in b.all_nodes()}
+        gw_lat, gw_lng = b.gateway_pos
+
+        def xy(lat: float, lng: float) -> tuple[float, float]:
+            return (
+                haversine_m(gw_lat, gw_lng, gw_lat, lng) * (1 if lng >= gw_lng else -1),
+                haversine_m(gw_lat, gw_lng, lat, gw_lng) * (1 if lat >= gw_lat else -1),
+            )
+
+        pts = {nid: xy(by_id[nid].lat, by_id[nid].lng) for nid in self.weak_nodes if nid in by_id}
+        r = self.cover_plan_radius_m
+        left = set(pts)
+        groups: list[tuple[str | None, list[str]]] = []
+        seen: set[str] = set()
+        previous = [
+            (u.slot_label, u.target[0], u.target[1]) for u in self.uavs.values()
+            if u.task == TASK_COVER and u.slot_label and u.target is not None
+        ] + self._cover_labels
+        for label, lat, lng in previous:
+            if label in seen:
+                continue
+            seen.add(label)
+            c = xy(lat, lng)
+            members = sorted(a for a in left if math.hypot(pts[a][0] - c[0], pts[a][1] - c[1]) <= r)
+            if members:
+                groups.append((label, members))
+                left -= set(members)
+        near = {a: {c for c in left if math.hypot(pts[a][0] - pts[c][0], pts[a][1] - pts[c][1]) <= r} for a in left}
+        while left:
+            seed = max(left, key=lambda a: (len(near[a] & left), math.hypot(*pts[a]), a))
+            members = sorted(near[seed] & left)
+            left -= set(members)
+            groups.append((None, members))
+        groups = [g for g in groups if len(g[1]) >= COVER_MIN_GROUP]
+        groups.sort(key=lambda g: len(g[1]), reverse=True)
+
+        slots = []
+        self.cover_groups = []
+        self._cover_labels = []
+        taken = {g[0] for g in groups if g[0]} | {
+            u.slot_label for u in self.uavs.values() if u.task == TASK_COVER and u.slot_label
+        }
+        free = (f"W{k}" for k in itertools.count(1) if f"W{k}" not in taken)
+        for gi, (label, members) in enumerate(groups, start=1):
+            lat = sum(by_id[m].lat for m in members) / len(members)
+            lng = sum(by_id[m].lng for m in members) / len(members)
+            if not self.inside_geofence(lat, lng):
+                lat, lng = destination(gw_lat, gw_lng, GEOFENCE_RADIUS_M * 0.95, calculate_bearing(gw_lat, gw_lng, lat, lng))
+            if label is None:
+                label = next(free)
+            worst = min(b.ground_link_rssi.get(m, LINK_RSSI_MIN) for m in members)
+            self._cover_labels.append((label, lat, lng))
+            self.cover_groups.append({
+                "id": gi, "label": label, "size": len(members), "centroid": _coord((lat, lng)),
+                "worst_rssi": round(worst, 1), "members": members,
+            })
+            slots.append({
+                "kind": SLOT_COVER, "lat": lat, "lng": lng, "cluster": gi, "index": 1, "of": 1,
+                "size": len(members), "label": label, "worst_rssi": worst,
+            })
+        return slots
+
+    def _dispatch_cost(self, u: UavAgent, point: tuple[float, float], kind: str) -> float | None:
+        """Lower is better; None when the airframe cannot fly out, hold the slot and return."""
+        t = u.utype
+        eta = u.distance_to(point) / u.cruise_speed_mps
+        if not u.airborne:
+            eta += UAV_ARM_DELAY_S + u.cruise_alt_m / t.climb_mps
+        back = haversine_m(point[0], point[1], u.home[0], u.home[1]) / u.cruise_speed_mps + u.cruise_alt_m / t.descent_mps
+        station = u.usable_endurance_s() - eta - back
+        if station < (RELAY_MIN_STATION_S if kind == SLOT_RELAY else COVER_MIN_STATION_S):
+            return None
+        if kind == SLOT_RELAY:
+            return eta  # partitions are urgent: fastest arrival wins
+        return eta - COVER_ENDURANCE_WEIGHT * station  # persistent duty favours long-endurance airframes
+
+    def _pick(self, pool: list[UavAgent], s: dict) -> UavAgent | None:
+        point = (s["lat"], s["lng"])
+        scored = [(c, u.index, u) for u in pool if (c := self._dispatch_cost(u, point, s["kind"])) is not None]
+        return min(scored)[2] if scored else None
+
+    def _handoff_low_cover(self) -> None:
+        for u in self.uavs.values():
+            if u.task == TASK_COVER and u.battery_pct <= UAV_RELIEF_BATTERY_PCT:
+                label = u.slot_label
+                self.release(u)
+                u.auto_after_land = True
+                u.rtl()
+                self.event(u, "info", f"{u.id} handing off coverage {label} at {u.battery_pct:.0f}% battery; returning to pad")
 
     def allocate(self, now: float) -> None:
         b = self.bridge
         isolated = bool(b.isolated_ground)
         self.isolation_streak = self.isolation_streak + 1 if isolated else 0
+        self._update_weak()
         if isolated and self.isolation_streak < RELAY_DISPATCH_CONFIRM_TICKS:
             return  # wait for the partition to persist before committing aircraft
         gateway_jammed = b.gateway.status == STATUS_JAMMED
@@ -1716,89 +2032,127 @@ class FleetManager:
             else:
                 b.log_event("FLEET", "ok", "Allocator resumed: gateway link restored")
         if isolated and not gateway_jammed:
-            self.slots = self._plan_slots()
+            relay_slots = self._plan_slots()
         else:
-            self.slots, self.clusters = [], []
+            relay_slots, self.clusters = [], []
+        if gateway_jammed or not self.coverage_enabled:
+            cover_slots, self.cover_groups = [], []
+        else:
+            cover_slots = self._plan_cover_slots()
+        self.slots = relay_slots + cover_slots
+        self._handoff_low_cover()
 
-        holders = [u for u in self.uavs.values() if u.task == TASK_RELAY and u.mode == MODE_AUTO and u.failsafe is None]
+        holders = [
+            u for u in self.uavs.values()
+            if u.task in (TASK_RELAY, TASK_COVER) and u.mode == MODE_AUTO and u.failsafe is None
+        ]
+        prior_relay_holders = sum(1 for u in holders if u.task == TASK_RELAY)
         claimed: dict[int, UavAgent] = {}
         matched: set[str] = set()
+        cover_by_label = {s["label"]: si for si, s in enumerate(self.slots) if s["kind"] == SLOT_COVER}
+        for u in holders:
+            si = cover_by_label.get(u.slot_label) if u.task == TASK_COVER else None
+            if si is not None and si not in claimed:
+                claimed[si] = u
+                matched.add(u.id)
+        task_of = {SLOT_RELAY: TASK_RELAY, SLOT_COVER: TASK_COVER}
+        match_m = {SLOT_RELAY: 3 * RELAY_WAYPOINT_DEADBAND_M, SLOT_COVER: COVER_MATCH_FACTOR * self.cover_plan_radius_m}
         pairs = sorted(
             (haversine_m(u.target[0], u.target[1], s["lat"], s["lng"]), u.id, si)
             for u in holders if u.target is not None
-            for si, s in enumerate(self.slots)
+            for si, s in enumerate(self.slots) if task_of[s["kind"]] == u.task
         )
         for d, uid, si in pairs:
-            if uid in matched or si in claimed or d > 3 * RELAY_WAYPOINT_DEADBAND_M:
+            if uid in matched or si in claimed or d > match_m[self.slots[si]["kind"]]:
                 continue
             claimed[si] = self.uavs[uid]
             matched.add(uid)
 
-        newly_dispatched = 0
+        newly_relay = 0
         for si, s in enumerate(self.slots):
             if si in claimed:
                 continue
-            candidates = [u for u in self.uavs.values() if self._available(u) and u.id not in matched]
-            if not candidates:
+            pool = [u for u in self.uavs.values() if u.id not in matched and self._available(u)]
+            pool += [u for u in holders if u.task == TASK_COVER and u.id not in matched]
+            if s["kind"] == SLOT_RELAY:
+                # Isolation outranks weak coverage: a covering UAV may be pulled onto a relay slot.
+                pool += [u for u in holders if u.task == TASK_COVER and u.id in matched]
+            best = self._pick(pool, s)
+            if best is None:
                 continue
-            # Prefer airborne aircraft; a grounded one pays a takeoff penalty.
-            best = min(candidates, key=lambda u: u.distance_to((s["lat"], s["lng"])) + (0.0 if u.airborne else 150.0))
+            if best.id in matched:
+                lost = next(sj for sj, v in claimed.items() if v is best)
+                del claimed[lost]
+                self.event(best, "warn", f"{best.id} pulled off coverage {self.slots[lost]['label']} for relay slot {s['label']}")
             claimed[si] = best
             matched.add(best.id)
-            newly_dispatched += 1
+            if s["kind"] == SLOT_RELAY:
+                newly_relay += 1
 
         for si, u in claimed.items():
             s = self.slots[si]
             point = (s["lat"], s["lng"])
-            first = u.task != TASK_RELAY
-            u.task = TASK_RELAY
+            task = task_of[s["kind"]]
+            first = u.task != task
+            u.task = task
             u.slot_label = s["label"]
             u.unmatched_since = None
             if first or u.target is None or haversine_m(u.target[0], u.target[1], *point) > RELAY_WAYPOINT_DEADBAND_M:
-                self._send_to(u, point)
-                if first:
+                self._send_to(u, point, keep_station=not first and task == TASK_COVER)
+                if not first:
+                    if task == TASK_RELAY:
+                        self.bridge.log_event("FLEET", "info", f"{u.id} retargeted {s['label']} -> {point[0]:.5f}, {point[1]:.5f}")
+                elif task == TASK_RELAY:
                     self.event(
                         u, "warn",
-                        f"{u.id} -> {s['label']} ({point[0]:.5f}, {point[1]:.5f}, {u.cruise_alt_m:.0f} m) "
+                        f"{u.id} ({u.utype.key}) -> {s['label']} ({point[0]:.5f}, {point[1]:.5f}, {u.cruise_alt_m:.0f} m) "
                         f"bridging cluster of {s['size']} isolated node(s)"
                         + (f"; relay chain hop {s['index']}/{s['of']}" if s["of"] > 1 else ""),
                     )
                 else:
-                    self.bridge.log_event("FLEET", "info", f"{u.id} retargeted {s['label']} -> {point[0]:.5f}, {point[1]:.5f}")
-        if newly_dispatched and len(holders) == 0:
-            b.notify_phones(f"[RELAY] {newly_dispatched} relay UAV(s) dispatched to bridge isolated nodes")
+                    self.event(
+                        u, "info",
+                        f"{u.id} ({u.utype.key}, {u.usable_endurance_s() / 60:.0f} min usable) -> coverage {s['label']} "
+                        f"over {s['size']} node(s) with weak next hop (worst {s['worst_rssi']:.0f} dBm)",
+                    )
+        if newly_relay and prior_relay_holders == 0:
+            b.notify_phones(f"[RELAY] {newly_relay} relay UAV(s) dispatched to bridge isolated nodes")
 
         self._run_reliefs()
 
-        # Assignments no longer needed (partition healed or cluster merged): release after a hold.
+        # Assignments no longer needed (partition healed, weak area recovered): release after a hold.
         for u in self.uavs.values():
             idle_auto = u.mode == MODE_AUTO and u.task is None and u.relieving is None and u.airborne \
                 and u.flight_state not in (FS_RETURNING, FS_LANDING, FS_TAKING_OFF)
-            stale_holder = u.task == TASK_RELAY and u.id not in matched and u.relieving is None
+            stale_holder = u.task in (TASK_RELAY, TASK_COVER) and u.id not in matched and u.relieving is None
             if not (idle_auto or stale_holder):
                 if u.task is not None:
                     u.unmatched_since = None
                 continue
             u.unmatched_since = u.unmatched_since if u.unmatched_since is not None else now
-            if now - u.unmatched_since > RELAY_RTB_HOLD_S:
-                was_relay = u.task == TASK_RELAY
+            hold_s = COVER_RELEASE_HOLD_S if u.task == TASK_COVER else RELAY_RTB_HOLD_S
+            if now - u.unmatched_since > hold_s:
+                reason = {TASK_RELAY: "relay slot no longer needed", TASK_COVER: "coverage area recovered"}.get(u.task, "idle")
                 self.release(u)
                 u.auto_after_land = True
                 u.rtl()
-                self.event(u, "info", f"{u.id} {'relay slot no longer needed' if was_relay else 'idle'}; returning to pad")
+                self.event(u, "info", f"{u.id} {reason}; returning to pad")
 
-        self.assigned = len(claimed)
-        self.shortfall = len(self.slots) - len(claimed)
-        report = (len(self.clusters), len(self.slots), self.shortfall)
+        relay_claimed = sum(1 for si in claimed if self.slots[si]["kind"] == SLOT_RELAY)
+        self.assigned = relay_claimed
+        self.cover_assigned = len(claimed) - relay_claimed
+        self.shortfall = len(relay_slots) - relay_claimed
+        self._report_coverage(now, len(cover_slots))
+        report = (len(self.clusters), len(relay_slots), self.shortfall)
         last = self._last_report or (0, 0, 0)
         state_flip = (bool(report[1]) != bool(last[1])) or (bool(report[2]) != bool(last[2]))
         due = now - self._last_report_at >= ALLOCATOR_REPORT_MIN_INTERVAL_S
         if report != self._last_report and (state_flip or due):
             self._last_report_at = now
-            if self.slots:
+            if relay_slots:
                 text = (
-                    f"Allocator: {len(self.clusters)} isolated cluster(s) need {len(self.slots)} relay slot(s); "
-                    f"{len(claimed)} assigned"
+                    f"Allocator: {len(self.clusters)} isolated cluster(s) need {len(relay_slots)} relay slot(s); "
+                    f"{relay_claimed} assigned"
                 )
                 if self.shortfall:
                     text += f"; need {self.shortfall} more relay UAV(s) (add UAVs or recharge the fleet)"
@@ -1807,13 +2161,30 @@ class FleetManager:
                 b.log_event("FLEET", "ok", "Allocator: no isolated clusters; relay slots cleared")
             self._last_report = report
 
+    def _report_coverage(self, now: float, areas: int) -> None:
+        """Rate-limited: weak links near the band edge flicker tick to tick."""
+        report = (areas, self.cover_assigned)
+        if report == (self._last_cover_report or (0, 0)) or now - self._last_cover_report_at < COVER_REPORT_MIN_INTERVAL_S:
+            return
+        self._last_cover_report_at = now
+        self._last_cover_report = report
+        if areas:
+            backlog = areas - self.cover_assigned
+            self.bridge.log_event(
+                "FLEET", "info",
+                f"Coverage: {len(self.weak_nodes)} node(s) with weak next hop (< {RSSI_GOOD_DBM:.0f} dBm) in {areas} area(s); "
+                f"{self.cover_assigned} UAV(s) covering" + (f", {backlog} area(s) waiting for a UAV" if backlog else ""),
+            )
+        else:
+            self.bridge.log_event("FLEET", "ok", "Coverage: every next hop at good or better; coverage slots cleared")
+
     def _run_reliefs(self) -> None:
         for u in list(self.uavs.values()):
             if u.task == TASK_RELAY and u.relief_by is None and u.battery_pct <= UAV_RELIEF_BATTERY_PCT and u.target:
                 candidates = [c for c in self.uavs.values() if self._available(c)]
-                if not candidates:
+                c = self._pick(candidates, {"lat": u.target[0], "lng": u.target[1], "kind": SLOT_RELAY})
+                if c is None:
                     continue
-                c = min(candidates, key=lambda c: c.distance_to(u.target) + (0.0 if c.airborne else 150.0))
                 c.task = TASK_RELIEF
                 c.relieving = u.id
                 c.slot_label = u.slot_label
@@ -1843,9 +2214,18 @@ class FleetManager:
     # -- snapshot --
     def uav_dict(self, u: UavAgent) -> dict:
         n = u.node
+        t = u.utype
         return {
             "id": u.id,
             "sysid": u.sysid,
+            "type": t.key,
+            "type_name": t.name,
+            "airframe": t.airframe,
+            "speed_min_mps": t.min_speed_mps,
+            "speed_max_mps": t.max_speed_mps,
+            "endurance_min": t.endurance_min,
+            "loiter_radius_m": t.loiter_radius_m,
+            "cover_radius_m": round(a2g_cover_radius_m(max(n.alt_m, UAV_MESH_MIN_ALT_M)), 1) if u.in_mesh else None,
             "mode": u.mode,
             "flight_state": u.flight_state,
             "armed": u.armed,
@@ -1864,7 +2244,8 @@ class FleetManager:
             "relieving": u.relieving,
             "relief_by": u.relief_by,
             "battery_pct": round(u.battery_pct, 1),
-            "endurance_remaining_s": round(u.endurance_remaining_s(self.endurance_s)),
+            "endurance_remaining_s": round(u.endurance_remaining_s()),
+            "usable_endurance_s": round(u.usable_endurance_s()),
             "failsafe": u.failsafe,
             "in_mesh": u.in_mesh,
             "reachable": n.reachable,
@@ -1884,12 +2265,15 @@ class FleetManager:
     def to_dict(self) -> dict:
         uavs = list(self.uavs.values())
         gw_lat, gw_lng = self.bridge.gateway_pos
+        holder_of = {u.slot_label: u.id for u in uavs if u.slot_label and u.task in (TASK_RELAY, TASK_COVER)}
         return {
             "uavs": [self.uav_dict(u) for u in uavs],
             "counts": {
                 "total": len(uavs),
                 "airborne": sum(1 for u in uavs if u.airborne),
                 "bridging": sum(1 for u in uavs if u.task in (TASK_RELAY, TASK_RELIEF) and u.flight_state == FS_ON_STATION),
+                "covering": sum(1 for u in uavs if u.task == TASK_COVER and u.flight_state == FS_ON_STATION),
+                "by_type": {k: sum(1 for u in uavs if u.utype.key == k) for k in UAV_TYPES},
                 "landed": sum(1 for u in uavs if not u.airborne),
                 "low_battery": sum(1 for u in uavs if u.battery_pct <= UAV_RELIEF_BATTERY_PCT),
                 "failsafe": sum(1 for u in uavs if u.failsafe),
@@ -1901,14 +2285,27 @@ class FleetManager:
                 "assigned": self.assigned,
                 "shortfall": self.shortfall,
                 "suspended": self.gateway_jammed,
-                "slots": [{"coords": _coord((s["lat"], s["lng"])), "label": s["label"], "cluster": s["cluster"]} for s in self.slots],
+                "slots": [
+                    {
+                        "coords": _coord((s["lat"], s["lng"])), "label": s["label"], "cluster": s["cluster"],
+                        "kind": s["kind"], "size": s["size"], "assigned_to": holder_of.get(s["label"]),
+                    }
+                    for s in self.slots
+                ],
+                "coverage": {
+                    "enabled": self.coverage_enabled,
+                    "weak_nodes": len(self.weak_nodes),
+                    "areas": self.cover_groups,
+                    "assigned": self.cover_assigned,
+                    "plan_radius_m": round(self.cover_plan_radius_m, 1),
+                    "threshold_dbm": RSSI_GOOD_DBM,
+                },
             },
             "geofence": {"center": [gw_lat, gw_lng], "radius_m": GEOFENCE_RADIUS_M, "ceiling_m": GEOFENCE_CEILING_M},
             "config": {
-                "endurance_min": round(self.endurance_s / 60.0, 1),
+                "types": [t.to_dict() for t in UAV_TYPES.values()],
+                "default_type": UAV_DEFAULT_TYPE,
                 "soft_limit": UAV_SOFT_LIMIT,
-                "speed_min_mps": UAV_SPEED_MIN_MPS,
-                "speed_max_mps": UAV_SPEED_MAX_MPS,
                 "alt_min_m": UAV_ALT_MIN_M,
                 "alt_max_m": GEOFENCE_CEILING_M,
                 "low_battery_pct": UAV_LOW_BATTERY_PCT,
@@ -1933,8 +2330,8 @@ class Bridge:
         ws_host: str,
         ws_port: int,
         swarm_size: int = SWARM_DEFAULT,
-        uav_count: int = UAV_DEFAULT_COUNT,
-        uav_endurance_min: float = UAV_ENDURANCE_MIN_DEFAULT,
+        uav_count: int | None = None,
+        uav_types: list[str] | None = None,
         mavlink_port: int = MAVLINK_PORT,
     ):
         self.serial_port = serial_port
@@ -1997,8 +2394,15 @@ class Bridge:
 
         # Relay UAV fleet + MAVLink
         self.isolated_ground: set[str] = set()
+        self.ground_link_rssi: dict[str, float] = {}
         self.mavlink = MavlinkGcsLink(MAVLINK_HOST, mavlink_port)
-        self.fleet = FleetManager(self, uav_count, uav_endurance_min)
+        if uav_types is None:
+            if uav_count is None:
+                uav_types = [key for key, k in UAV_DEFAULT_MIX for _ in range(k)]
+            else:
+                order = list(UAV_TYPES)
+                uav_types = [order[i % len(order)] for i in range(max(0, uav_count))]
+        self.fleet = FleetManager(self, uav_types)
 
         self.recompute_topology()
 
@@ -2101,7 +2505,7 @@ class Bridge:
                 return other.reported_rssi  # real measured hardware link
         if d > LINK_MAX_M:
             return None
-        return SIM_TX_POWER - 10 * SIM_PATH_LOSS_EXPONENT * math.log10(max(d, 1.0)) + self.rng.gauss(0, RSSI_SIGMA)
+        return ground_rssi_nominal(d) + self.rng.gauss(0, RSSI_SIGMA)
 
     def compute_spectrum(self) -> dict[str, float]:
         spectrum = {}
@@ -2188,6 +2592,7 @@ class Bridge:
         # Ground-only Dijkstra decides which nodes the relay fleet must bridge.
         _, ground_paths = nx.single_source_dijkstra(g, GATEWAY_KEY, weight="weight")
         self.ground_paths = ground_paths
+        self.ground_link_rssi = {nid: g.edges[p[-2], nid]["rssi"] for nid, p in ground_paths.items() if len(p) >= 2}
         self.isolated_ground = {
             n.id for n in nodes
             if n.id not in ground_paths and self.node_can_link(n) and not n.is_gateway
@@ -2222,14 +2627,11 @@ class Bridge:
         d = haversine_m(a.lat, a.lng, b.lat, b.lng)
         a_air, b_air = a.type == "uav", b.type == "uav"
         if a_air or b_air:
-            d = math.hypot(d, a.alt_m - b.alt_m)  # slant range to the airborne relay
-            if a_air and b_air:
-                max_m, gain = UAV_A2A_MAX_M, 2 * RELAY_ANTENNA_GAIN_DB
-            else:
-                max_m, gain = RELAY_LINK_MAX_M, RELAY_ANTENNA_GAIN_DB
-            if d > max_m:
+            d = math.hypot(d, a.alt_m - b.alt_m)
+            a2a = a_air and b_air
+            if d > (UAV_A2A_MAX_M if a2a else RELAY_LINK_MAX_M):
                 return
-            nominal = SIM_TX_POWER + gain - 10 * SIM_PATH_LOSS_EXPONENT * math.log10(max(d, 1.0)) + self.rng.gauss(0, RSSI_SIGMA)
+            nominal = air_rssi_nominal(d, abs(a.alt_m - b.alt_m), a2a) + self.rng.gauss(0, RSSI_SIGMA)
         else:
             nominal = self.link_rssi(a, b, d)
             if nominal is None:
@@ -2237,8 +2639,7 @@ class Bridge:
         rssi = nominal - max(a.rf_penalty_db, b.rf_penalty_db)
         if rssi <= LINK_RSSI_MIN:
             return
-        w = (100.0 / abs(rssi)) + 2.0
-        attrs = {"weight": w, "rssi": rssi, "nominal_rssi": nominal, "distance_m": d}
+        attrs = {"weight": link_cost(rssi), "rssi": rssi, "nominal_rssi": nominal, "distance_m": d}
         g.add_edge(a.id, b.id, **attrs)
         g.add_edge(b.id, a.id, **attrs)
         best_neighbor[a.id] = max(best_neighbor.get(a.id, -999.0), rssi)
@@ -2583,6 +2984,23 @@ class Bridge:
     # ------------------------------------------------------------------ #
     # Snapshot
     # ------------------------------------------------------------------ #
+    def signal_bands(self) -> dict[str, int]:
+        """Ground nodes bucketed by their next-hop RSSI (dashboard histogram bands)."""
+        bands = {"excellent": 0, "good": 0, "degraded": 0, "disconnected": 0}
+        for n in self.all_nodes():
+            if n.is_gateway:
+                continue
+            r = n.rssi if n.reachable else None
+            if r is None or r <= LINK_RSSI_MIN:
+                bands["disconnected"] += 1
+            elif r > RSSI_EXCELLENT_DBM:
+                bands["excellent"] += 1
+            elif r > RSSI_GOOD_DBM:
+                bands["good"] += 1
+            else:
+                bands["degraded"] += 1
+        return bands
+
     def node_to_dict(self, n: MeshNode) -> dict:
         return {
             "id": n.id,
@@ -2593,6 +3011,7 @@ class Bridge:
             "coords": [round(n.lat, 7), round(n.lng, 7)],
             "alt_m": round(n.alt_m, 1),
             "rssi": _round(n.rssi, 1),
+            "ground_rssi": _round(self.ground_link_rssi.get(n.id), 1),
             "snr": _round(n.snr, 1),
             "battery_mv": None if n.battery_mv is None else int(n.battery_mv),
             "parent_id": n.parent_id,
@@ -2620,6 +3039,8 @@ class Bridge:
             "virtual_count": self.swarm.count,
             "uav_count": len(self.fleet.uavs),
             "airborne_uav_count": sum(1 for u in self.fleet.uavs.values() if u.airborne),
+            "signal_bands": self.signal_bands(),
+            "uav_served_count": sum(1 for n in nodes if n.parent_id and n.parent_id.startswith(UAV_ID_PREFIX)),
             "reachable_count": self.metrics["reachable_count"],
             "link_count": self.mesh_graph.number_of_edges() // 2,
         }
@@ -2788,7 +3209,19 @@ class Bridge:
     def handle_extended_command(self, mtype, msg: dict) -> bool:
         """RF / ACS / fleet commands. Returns True if a topology refresh is needed."""
         if mtype == "FLEET_ADD":
-            self.fleet.add(int(msg.get("count", 1)))
+            try:
+                self.fleet.add(int(msg.get("count", 1)), msg.get("uav_type"))
+            except ValueError as exc:
+                self.log_event("FLEET", "warn", str(exc))
+                return False
+            return True
+        if mtype == "SET_COVERAGE":
+            self.fleet.coverage_enabled = bool(msg.get("enabled", True))
+            self.log_event(
+                "FLEET", "info",
+                "Coverage duty enabled: UAVs fly over weak next-hop areas" if self.fleet.coverage_enabled
+                else "Coverage duty disabled: UAVs only bridge isolated clusters",
+            )
             return True
         if mtype == "FLEET_REMOVE":
             ok, text = self.fleet.remove(str(msg["uav_id"]))
@@ -3126,14 +3559,19 @@ def main():
     parser.add_argument("--ws-host", default="localhost", help="WebSocket bind host (default: localhost)")
     parser.add_argument("--ws-port", type=int, default=8765, help="WebSocket port (default: 8765)")
     parser.add_argument("--swarm", type=int, default=SWARM_DEFAULT, help=f"Virtual node count {SWARM_MIN}-{SWARM_MAX} (default: {SWARM_DEFAULT})")
-    parser.add_argument("--uavs", type=int, default=UAV_DEFAULT_COUNT, help=f"Initial relay UAV fleet size (default: {UAV_DEFAULT_COUNT}; add more at runtime)")
-    parser.add_argument("--uav-endurance-min", type=float, default=UAV_ENDURANCE_MIN_DEFAULT, help=f"Relay UAV flight endurance in minutes (default: {UAV_ENDURANCE_MIN_DEFAULT:.0f})")
+    default_mix = ",".join(f"{k}:{n}" for k, n in UAV_DEFAULT_MIX)
+    parser.add_argument("--uav-mix", help=f"Initial relay fleet as TYPE:COUNT list (default: {default_mix}; types: {', '.join(UAV_TYPES)})")
+    parser.add_argument("--uavs", type=int, help="Initial fleet size cycling through every type (ignored with --uav-mix)")
     parser.add_argument("--mavlink-port", type=int, default=MAVLINK_PORT, help=f"Ground station UDP port on {MAVLINK_HOST} (default: {MAVLINK_PORT})")
     args = parser.parse_args()
+    try:
+        uav_types = parse_uav_mix(args.uav_mix) if args.uav_mix else None
+    except ValueError as exc:
+        parser.error(str(exc))
 
     bridge = Bridge(
         args.port, args.baud, args.ws_host, args.ws_port, args.swarm,
-        uav_count=max(0, args.uavs), uav_endurance_min=args.uav_endurance_min, mavlink_port=args.mavlink_port,
+        uav_count=args.uavs, uav_types=uav_types, mavlink_port=args.mavlink_port,
     )
     try:
         asyncio.run(bridge.run())
