@@ -7,7 +7,7 @@ directed graph, and streams a unified 1 Hz telemetry snapshot to every
 connected dashboard over WebSocket.
 
 Subsystems:
-    * SwarmSimulator     -- radial orbit / polygon infill kinematics for N virtual nodes
+    * SwarmSimulator     -- configurable concentric-orbit kinematics with lost-link position hold
     * RF attenuation     -- primary drop zone + fringe penalty, weighted centroid estimate
     * Adaptive Channel Switching (ACS) -- confirmation timer, CH_SWITCH over serial
     * RelayAutopilot     -- midpoint positioning of UAV-RELAY-01 over partitions
@@ -117,18 +117,26 @@ SIM_TICK_S = 1.0
 SWARM_MIN = 10
 SWARM_MAX = 100
 SWARM_DEFAULT = 40
-ORBIT_RADII_M = (120.0, 260.0, 420.0)
+ORBIT_RADII_DEFAULT_M = (120.0, 260.0, 420.0)
+ORBIT_MAX_RINGS = 5
+ORBIT_RADIUS_MIN_M = 50.0
+ORBIT_RADIUS_MAX_M = 1500.0
+ORBIT_MIN_RING_GAP_M = 40.0
 ORBIT_TANGENTIAL_SPEED_MPS = 3.0
+ORBIT_SPEED_MIN_MPS = 1.0
+ORBIT_SPEED_MAX_MPS = 10.0
 ORBIT_RADIAL_AMPLITUDE_M = 15.0
 ORBIT_RADIAL_FREQ = 0.05
 NODE_TRANSIT_SPEED_MPS = 12.0
-POLYGON_GRID_SHRINK = 0.9
-POLYGON_GRID_MAX_ITER = 60
 VIRTUAL_BATTERY_DRAIN_MV_PER_S = 0.08
 VIRTUAL_BATTERY_FLOOR_MV = 3300.0
 
-PLACEMENT_ORBIT = "ORBIT_PATROL"
-PLACEMENT_POLYGON = "POLYGON_INFILL"
+# Lost-link position hold: a disconnected node freezes where it lost the link
+# and only resumes its orbit after this many consecutive reachable ticks.
+HOLD_RELEASE_TICKS = 3
+HOLD_LOST_LINK = "LOST_LINK"
+HOLD_UAV_BRIDGED = "UAV_BRIDGED"
+HOLD_RECONNECTING = "RECONNECTING"
 
 # ------------------------------------------------------------------ #
 # Hardware topology watchdog
@@ -166,6 +174,7 @@ RF_ALERT_MIN_INTERVAL_S = 5.0
 # ------------------------------------------------------------------ #
 # Mobile relay (UAV-RELAY-01) & MAVLink telemetry
 # ------------------------------------------------------------------ #
+UAV_ID_PREFIX = "UAV-"
 RELAY_ID = "UAV-RELAY-01"
 RELAY_ALT_M = 60.0
 RELAY_SPEED_MPS = 18.0
@@ -266,30 +275,6 @@ def move_toward(lat: float, lng: float, tlat: float, tlng: float, step_m: float)
     return lat + (tlat - lat) * f, lng + (tlng - lng) * f, d - step_m
 
 
-def point_in_polygon(x: float, y: float, poly: list[tuple[float, float]]) -> bool:
-    """Ray casting (Jordan curve theorem) point-in-polygon test."""
-    inside = False
-    j = len(poly) - 1
-    for i in range(len(poly)):
-        xi, yi = poly[i]
-        xj, yj = poly[j]
-        if (yi > y) != (yj > y):
-            x_cross = (xj - xi) * (y - yi) / (yj - yi) + xi
-            if x < x_cross:
-                inside = not inside
-        j = i
-    return inside
-
-
-def polygon_area(poly: list[tuple[float, float]]) -> float:
-    s = 0.0
-    for i in range(len(poly)):
-        x1, y1 = poly[i]
-        x2, y2 = poly[(i + 1) % len(poly)]
-        s += x1 * y2 - x2 * y1
-    return abs(s) / 2.0
-
-
 def channel_freq_mhz(channel: int) -> int:
     return 2407 + 5 * channel
 
@@ -372,8 +357,11 @@ class MeshNode:
     ring: int = 0
     theta0: float = 0.0
     psi: float = 0.0
-    omega: float = 0.0
-    target: tuple[float, float] | None = None
+    # Lost-link position hold
+    hold_pos: tuple[float, float] | None = None
+    hold_reason: str | None = None
+    lost_link_since: float | None = None
+    reconnect_streak: int = 0
     # RF attenuation state (set by the interference engine)
     rf_state: str = "CLEAR"  # CLEAR | DEGRADED | JAMMED
     rf_penalty_db: float = 0.0
@@ -405,12 +393,13 @@ def virtual_id(index: int) -> str:
 # Virtual swarm simulator
 # ------------------------------------------------------------------ #
 class SwarmSimulator:
-    """Kinematics for N synthetic mesh nodes anchored on the gateway."""
+    """Concentric-orbit kinematics for N synthetic mesh nodes anchored on the gateway."""
 
     def __init__(self, count: int, rng: random.Random):
         self.rng = rng
-        self.mode = PLACEMENT_ORBIT
-        self.polygon: list[tuple[float, float]] | None = None
+        self.radii: list[float] = list(ORBIT_RADII_DEFAULT_M)
+        self.speed_mps = ORBIT_TANGENTIAL_SPEED_MPS
+        self.ring_phase: list[float] = [0.0] * len(self.radii)
         self.t = 0.0
         self.nodes: dict[str, MeshNode] = {}
         self._pending_count = max(SWARM_MIN, min(SWARM_MAX, int(count)))
@@ -441,32 +430,50 @@ class SwarmSimulator:
                     index=idx,
                     psi=self.rng.uniform(0, 2 * math.pi),
                     battery_mv=self.rng.uniform(3950, 4180),
+                    reachable=True,  # spawns beside the gateway; don't latch a lost-link hold
                 )
         for nid in [k for k, n in self.nodes.items() if n.index > count]:
             del self.nodes[nid]
         self.nodes = dict(sorted(self.nodes.items(), key=lambda kv: kv[1].index))
         self._layout_orbit()
-        if self.mode == PLACEMENT_POLYGON and self.polygon:
-            self._assign_polygon_targets()
         return count
 
-    def set_orbit(self) -> None:
-        self.mode = PLACEMENT_ORBIT
-        for n in self.nodes.values():
-            n.target = None
+    @staticmethod
+    def validate_orbit_config(radii, speed_mps) -> tuple[list[float], float]:
+        """Raises ValueError with an operator-readable reason on an invalid config."""
+        radii = [float(r) for r in radii]
+        if not 1 <= len(radii) <= ORBIT_MAX_RINGS:
+            raise ValueError(f"need 1-{ORBIT_MAX_RINGS} rings, got {len(radii)}")
+        radii.sort()
+        for r in radii:
+            if not ORBIT_RADIUS_MIN_M <= r <= ORBIT_RADIUS_MAX_M:
+                raise ValueError(f"ring radius {r:.0f} m outside {ORBIT_RADIUS_MIN_M:.0f}-{ORBIT_RADIUS_MAX_M:.0f} m")
+        for inner, outer in zip(radii, radii[1:]):
+            if outer - inner < ORBIT_MIN_RING_GAP_M:
+                raise ValueError(f"rings {inner:.0f} m and {outer:.0f} m closer than {ORBIT_MIN_RING_GAP_M:.0f} m")
+        speed = float(speed_mps)
+        if not ORBIT_SPEED_MIN_MPS <= speed <= ORBIT_SPEED_MAX_MPS:
+            raise ValueError(f"orbit speed {speed:.1f} m/s outside {ORBIT_SPEED_MIN_MPS:.0f}-{ORBIT_SPEED_MAX_MPS:.0f} m/s")
+        return radii, speed
 
-    def set_polygon(self, vertices: list[tuple[float, float]]) -> int:
-        """Returns the number of target points generated (0 on invalid polygon)."""
-        if len(vertices) < 3:
-            return 0
-        self.polygon = vertices
-        self.mode = PLACEMENT_POLYGON
-        return self._assign_polygon_targets()
+    def set_orbit_config(self, radii, speed_mps) -> None:
+        self.radii, self.speed_mps = self.validate_orbit_config(radii, speed_mps)
+        self.ring_phase = [0.0] * len(self.radii)
+        self._layout_orbit()
+
+    def max_ring_gap_m(self) -> float:
+        """Largest radial gap a packet must cross, including gateway -> innermost ring."""
+        edges = [0.0, *self.radii]
+        return max(b - a for a, b in zip(edges, edges[1:]))
+
+    def ring_omega(self, ring: int) -> float:
+        direction = 1.0 if ring % 2 == 0 else -1.0
+        return direction * self.speed_mps / self.radii[ring]
 
     def _layout_orbit(self) -> None:
         n = len(self.nodes)
-        total_r = sum(ORBIT_RADII_M)
-        raw = [n * r / total_r for r in ORBIT_RADII_M]
+        total_r = sum(self.radii)
+        raw = [n * r / total_r for r in self.radii]
         counts = [int(math.floor(x)) for x in raw]
         remainders = sorted(range(len(raw)), key=lambda k: raw[k] - counts[k], reverse=True)
         for k in remainders[: n - sum(counts)]:
@@ -474,83 +481,59 @@ class SwarmSimulator:
         ordered = list(self.nodes.values())
         pos = 0
         for ring, ring_count in enumerate(counts):
-            direction = 1.0 if ring % 2 == 0 else -1.0
-            omega = direction * ORBIT_TANGENTIAL_SPEED_MPS / ORBIT_RADII_M[ring]
             for j in range(ring_count):
                 node = ordered[pos]
                 node.ring = ring
                 node.theta0 = 2 * math.pi * j / ring_count + ring * 0.35
-                node.omega = omega
                 pos += 1
 
     def _orbit_position(self, node: MeshNode, anchor: tuple[float, float]) -> tuple[float, float]:
-        r = ORBIT_RADII_M[node.ring] + ORBIT_RADIAL_AMPLITUDE_M * math.sin(ORBIT_RADIAL_FREQ * self.t + node.psi)
-        theta = node.theta0 + node.omega * self.t
+        r = self.radii[node.ring] + ORBIT_RADIAL_AMPLITUDE_M * math.sin(ORBIT_RADIAL_FREQ * self.t + node.psi)
+        theta = node.theta0 + self.ring_phase[node.ring]
         return offset_m(anchor[0], anchor[1], r * math.sin(theta), r * math.cos(theta))
 
-    def _polygon_points(self, n: int) -> list[tuple[float, float]]:
-        verts = self.polygon or []
-        lat0, lng0 = verts[0]
-        local = [to_local_m(lat0, lng0, la, ln) for la, ln in verts]
-        area = polygon_area(local)
-        if area < 1.0:
-            return []
-        xs = [p[0] for p in local]
-        ys = [p[1] for p in local]
-        min_x, max_x, min_y, max_y = min(xs), max(xs), min(ys), max(ys)
-        spacing = math.sqrt(area / n)
-        inside: list[tuple[float, float]] = []
-        for _ in range(POLYGON_GRID_MAX_ITER):
-            inside = []
-            y = min_y + spacing / 2
-            while y < max_y:
-                x = min_x + spacing / 2
-                while x < max_x:
-                    if point_in_polygon(x, y, local):
-                        inside.append((x, y))
-                    x += spacing
-                y += spacing
-            if len(inside) >= n:
-                break
-            spacing *= POLYGON_GRID_SHRINK
-        if not inside:
-            return []
-        picked = [inside[int(i * len(inside) / n)] for i in range(n)] if len(inside) >= n else inside
-        return [offset_m(lat0, lng0, x, y) for x, y in picked]
+    def holding_count(self) -> int:
+        return sum(1 for n in self.nodes.values() if n.hold_pos is not None)
 
-    def _assign_polygon_targets(self) -> int:
-        nodes = list(self.nodes.values())
-        points = self._polygon_points(len(nodes))
-        if not points:
-            return 0
-        pairs = []
-        for ni, node in enumerate(nodes):
-            for pi, (plat, plng) in enumerate(points):
-                pairs.append((haversine_m(node.lat, node.lng, plat, plng), ni, pi))
-        pairs.sort()
-        node_done: set[int] = set()
-        point_done: set[int] = set()
-        for _, ni, pi in pairs:
-            if ni in node_done or pi in point_done:
-                continue
-            nodes[ni].target = points[pi]
-            node_done.add(ni)
-            point_done.add(pi)
-        # More nodes than points (degenerate polygon): stack leftovers on points round-robin.
-        for ni, node in enumerate(nodes):
-            if ni not in node_done:
-                node.target = points[ni % len(points)]
-        return len(points)
+    def _update_hold(self, node: MeshNode) -> bool:
+        """Lost-link hold state machine. Returns True while the node must stay put."""
+        lost = (not node.reachable) or node.status in (STATUS_OFFLINE, STATUS_JAMMED)
+        if lost:
+            node.reconnect_streak = 0
+            if node.hold_pos is None:
+                node.hold_pos = (node.lat, node.lng)
+                node.lost_link_since = self.t
+            node.hold_reason = HOLD_LOST_LINK
+            return True
+        if node.hold_pos is None:
+            return False
+        # A node served only by an airborne relay stays where the relay is covering it.
+        if any(hop.startswith(UAV_ID_PREFIX) for hop in node.hop_path):
+            node.reconnect_streak = 0
+            node.hold_reason = HOLD_UAV_BRIDGED
+            return True
+        node.reconnect_streak += 1
+        if node.reconnect_streak < HOLD_RELEASE_TICKS:
+            node.hold_reason = HOLD_RECONNECTING
+            return True
+        node.hold_pos = None
+        node.hold_reason = None
+        node.lost_link_since = None
+        node.reconnect_streak = 0
+        return False
 
     def step(self, dt: float, anchor: tuple[float, float]) -> None:
+        """Advances one tick using the link state from the previous topology pass."""
         self.t += dt
+        for ring in range(len(self.ring_phase)):
+            self.ring_phase[ring] += self.ring_omega(ring) * dt
         step_m = NODE_TRANSIT_SPEED_MPS * dt
         for node in self.nodes.values():
-            if self.mode == PLACEMENT_POLYGON and node.target is not None:
-                tlat, tlng = node.target
+            if self._update_hold(node):
+                node.lat, node.lng = node.hold_pos
             else:
                 tlat, tlng = self._orbit_position(node, anchor)
-            node.lat, node.lng, _ = move_toward(node.lat, node.lng, tlat, tlng, step_m)
+                node.lat, node.lng, _ = move_toward(node.lat, node.lng, tlat, tlng, step_m)
             if node.battery_mv is not None:
                 node.battery_mv = max(VIRTUAL_BATTERY_FLOOR_MV, node.battery_mv - VIRTUAL_BATTERY_DRAIN_MV_PER_S * dt)
 
@@ -1433,6 +1416,9 @@ class Bridge:
             "hop_path": n.hop_path,
             "hop_count": max(0, len(n.hop_path) - 1),
             "reachable": n.reachable,
+            "holding": n.hold_pos is not None,
+            "hold_reason": n.hold_reason,
+            "lost_link_s": round(self.swarm.t - n.lost_link_since, 1) if n.lost_link_since is not None else None,
         }
 
     def network_dict(self) -> dict:
@@ -1482,11 +1468,22 @@ class Bridge:
             },
             "gateway": {"id": GATEWAY_KEY, "coords": [self.gateway_pos[0], self.gateway_pos[1]]},
             "swarm": {
-                "mode": self.swarm.mode,
                 "count": self.swarm.count,
                 "min": SWARM_MIN,
                 "max": SWARM_MAX,
-                "polygon": [list(v) for v in self.swarm.polygon] if self.swarm.polygon else None,
+                "radii": [round(r, 1) for r in self.swarm.radii],
+                "speed_mps": round(self.swarm.speed_mps, 2),
+                "max_ring_gap_m": round(self.swarm.max_ring_gap_m(), 1),
+                "link_range_m": LINK_MAX_M,
+                "holding_count": self.swarm.holding_count(),
+                "limits": {
+                    "max_rings": ORBIT_MAX_RINGS,
+                    "radius_min_m": ORBIT_RADIUS_MIN_M,
+                    "radius_max_m": ORBIT_RADIUS_MAX_M,
+                    "min_gap_m": ORBIT_MIN_RING_GAP_M,
+                    "speed_min_mps": ORBIT_SPEED_MIN_MPS,
+                    "speed_max_mps": ORBIT_SPEED_MAX_MPS,
+                },
             },
             "network": self.network_dict(),
             "nodes": [self.node_to_dict(n) for n in self.all_nodes()],
@@ -1543,25 +1540,24 @@ class Bridge:
             count = self.swarm.set_size(int(msg["count"]), self.gateway_pos, self.active_channel)
             self.log_event("SERIAL", "info", f"Virtual swarm resized to {count} nodes")
 
-        elif mtype == "SET_PLACEMENT_MODE":
-            mode = msg.get("mode")
-            if mode == PLACEMENT_ORBIT:
-                self.swarm.set_orbit()
-                self.log_event("SERIAL", "info", "Placement mode: ORBIT_PATROL (concentric rings 120/260/420 m)")
-            elif mode == PLACEMENT_POLYGON and self.swarm.polygon:
-                points = self.swarm.set_polygon(self.swarm.polygon)
-                self.log_event("SERIAL", "info", f"Placement mode: POLYGON_INFILL ({points} target points)")
-            else:
+        elif mtype == "SET_ORBIT_CONFIG":
+            try:
+                self.swarm.set_orbit_config(msg["radii"], msg.get("speed_mps", self.swarm.speed_mps))
+            except ValueError as exc:
+                self.log_event("SERIAL", "warn", f"Orbit configuration rejected: {exc}")
                 refresh = False
-
-        elif mtype == "SET_DEPLOYMENT_POLYGON":
-            vertices = [(float(v[0]), float(v[1])) for v in msg["vertices"]]
-            points = self.swarm.set_polygon(vertices)
-            if points:
-                self.log_event("SERIAL", "ok", f"Coverage polygon set ({len(vertices)} vertices); {points} nodes transiting at {NODE_TRANSIT_SPEED_MPS:.0f} m/s")
             else:
-                self.log_event("SERIAL", "warn", "Coverage polygon rejected (needs >= 3 vertices and non-zero area)")
-                refresh = False
+                rings = "/".join(f"{r:.0f}" for r in self.swarm.radii)
+                gap = self.swarm.max_ring_gap_m()
+                self.log_event(
+                    "SERIAL", "ok",
+                    f"Orbit configuration: rings {rings} m at {self.swarm.speed_mps:.1f} m/s; nodes transiting to new slots",
+                )
+                if gap > LINK_MAX_M:
+                    self.log_event(
+                        "SERIAL", "warn",
+                        f"Ring gap {gap:.0f} m exceeds the {LINK_MAX_M:.0f} m link range; outer rings need relay UAVs",
+                    )
 
         elif mtype in ("UPLINK_TX", "MANUAL_PACKET"):
             target = str(msg.get("target_id", msg.get("target_node", "")))
