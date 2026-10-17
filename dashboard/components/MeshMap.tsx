@@ -21,10 +21,14 @@ import {
   DEFAULT_ZOOM,
   FLIGHT_MODE_COLORS,
   FLIGHT_STATE_LABEL,
+  RSSI_BUCKETS,
   STATUS_COLORS,
   batteryColor,
   isUavId,
   roleLabel,
+  rssiBucket,
+  uavTypeColor,
+  type Airframe,
   type FleetState,
   type FlightMode,
   type HoldReason,
@@ -120,22 +124,39 @@ function virtualIcon(status: NodeStatus, selected: boolean, hold: HoldReason | n
   });
 }
 
-function uavIcon(mode: FlightMode, airborne: boolean, selected: boolean, alert: boolean) {
-  return cachedIcon(`uav:${mode}:${airborne}:${selected}:${alert}`, () => {
+function rotorSvg(c: string, rotor: string, count: 4 | 6) {
+  const pts = Array.from({ length: count }, (_, i) => {
+    const a = ((i * 360) / count + (count === 4 ? 45 : 0)) * (Math.PI / 180);
+    return [20 + 12 * Math.cos(a), 20 + 12 * Math.sin(a)] as const;
+  });
+  const arms = pts.map(([x, y]) => `<line x1="20" y1="20" x2="${x.toFixed(1)}" y2="${y.toFixed(1)}"/>`).join("");
+  const rotors = pts.map(([x, y]) => `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${count === 4 ? 5 : 4}" stroke="${rotor}"/>`).join("");
+  return `<g stroke="${c}" stroke-width="2" fill="none">${arms}${rotors}</g>
+    <rect x="15.5" y="15.5" width="9" height="9" rx="2" fill="${c}" fill-opacity="0.55" stroke="#ede9fe" stroke-width="1.2"/>`;
+}
+
+function planeSvg(c: string, rotor: string) {
+  return `<g fill="${c}" fill-opacity="0.6" stroke="#ede9fe" stroke-width="1.1" stroke-linejoin="round">
+      <path d="M20 4 L22.5 12 L22.5 17 L36 21 L36 24 L22.5 22.5 L22 31 L26 34 L26 36 L20 34.5 L14 36 L14 34 L18 31 L17.5 22.5 L4 24 L4 21 L17.5 17 L17.5 12 Z"/>
+    </g>
+    <g stroke="${rotor}" stroke-width="1.4" fill="none"><circle cx="10" cy="20.5" r="3"/><circle cx="30" cy="20.5" r="3"/></g>`;
+}
+
+/** VTOL heading buckets: 24 x 15 deg keeps the icon cache small. */
+const HEADING_STEP_DEG = 15;
+
+function uavIcon(mode: FlightMode, type: string, airframe: Airframe, heading: number, airborne: boolean, selected: boolean, alert: boolean) {
+  const fixedWing = airframe === "VTOL_FIXED_WING";
+  const hdg = fixedWing && airborne ? (Math.round(heading / HEADING_STEP_DEG) * HEADING_STEP_DEG) % 360 : 0;
+  return cachedIcon(`uav:${mode}:${type}:${hdg}:${airborne}:${selected}:${alert}`, () => {
     const c = FLIGHT_MODE_COLORS[mode];
     const size = airborne ? 36 : 26;
-    const rotor = alert ? "#f43f5e" : "#38bdf8";
+    const rotor = alert ? "#f43f5e" : uavTypeColor(type);
+    const body = fixedWing ? planeSvg(c, rotor) : rotorSvg(c, rotor, type === "HEXA-H" ? 6 : 4);
     return L.divIcon({
       className: "",
       html: `<div class="mk mk-relay${airborne ? " mk-relay-active" : " mk-offline"}${selected ? " mk-selected" : ""}" style="--mk:${c}">
-        <svg viewBox="0 0 40 40" width="${size}" height="${size}">
-          <g stroke="${c}" stroke-width="2" fill="none">
-            <line x1="11" y1="11" x2="29" y2="29"/><line x1="29" y1="11" x2="11" y2="29"/>
-            <circle cx="11" cy="11" r="5" stroke="${rotor}"/><circle cx="29" cy="11" r="5" stroke="${rotor}"/>
-            <circle cx="11" cy="29" r="5" stroke="${rotor}"/><circle cx="29" cy="29" r="5" stroke="${rotor}"/>
-          </g>
-          <rect x="15.5" y="15.5" width="9" height="9" rx="2" fill="${c}" fill-opacity="0.55" stroke="#ede9fe" stroke-width="1.2"/>
-        </svg>
+        <svg viewBox="0 0 40 40" width="${size}" height="${size}" style="transform:rotate(${hdg}deg)">${body}</svg>
       </div>`,
       iconSize: [size, size],
       iconAnchor: [size / 2, size / 2],
@@ -143,20 +164,24 @@ function uavIcon(mode: FlightMode, airborne: boolean, selected: boolean, alert: 
   });
 }
 
-function slotIcon() {
-  return cachedIcon("slot", () =>
-    L.divIcon({
+const COVER_COLOR = "#22d3ee";
+
+function slotIcon(kind: "RELAY" | "COVER", assigned: boolean) {
+  return cachedIcon(`slot:${kind}:${assigned}`, () => {
+    const c = kind === "COVER" ? COVER_COLOR : "#a78bfa";
+    const shape =
+      kind === "COVER"
+        ? `<circle cx="8" cy="8" r="6.2" fill="none" stroke="${c}" stroke-width="1.4" stroke-dasharray="${assigned ? "0" : "2 1.5"}"/>`
+        : `<polygon points="8,1 15,8 8,15 1,8" fill="none" stroke="${c}" stroke-width="1.4" stroke-dasharray="${assigned ? "0" : "2 1.5"}"/>`;
+    return L.divIcon({
       className: "",
-      html: `<div class="mk" style="--mk:#a78bfa;cursor:default">
-        <svg viewBox="0 0 16 16" width="16" height="16">
-          <polygon points="8,1 15,8 8,15 1,8" fill="none" stroke="#a78bfa" stroke-width="1.4" stroke-dasharray="2 1.5"/>
-          <circle cx="8" cy="8" r="1.6" fill="#a78bfa"/>
-        </svg>
+      html: `<div class="mk" style="--mk:${c};cursor:default">
+        <svg viewBox="0 0 16 16" width="16" height="16">${shape}<circle cx="8" cy="8" r="1.6" fill="${c}"/></svg>
       </div>`,
       iconSize: [16, 16],
       iconAnchor: [8, 8],
-    }),
-  );
+    });
+  });
 }
 
 function crosshairIcon(kind: "wp" | "est") {
@@ -186,11 +211,10 @@ function nodeIcon(n: MeshNodeState, selected: boolean) {
   return virtualIcon(n.status, selected, n.holding ? n.hold_reason : null);
 }
 
-function linkColor(quality: number) {
-  if (quality >= 0.5) return "#22d3ee";
-  if (quality >= 0.2) return "#14b8a6";
-  return "#f59e0b";
-}
+const BUCKET_COLOR = Object.fromEntries(RSSI_BUCKETS.map((b) => [b.key, b.color]));
+
+/** Tree links are next hops, so the link color is the child node's next-hop band. */
+const linkColor = (rssi: number) => BUCKET_COLOR[rssiBucket(rssi)];
 
 /* ------------------------------------------------------------------ */
 /* Map helpers                                                         */
@@ -228,9 +252,12 @@ const NodeMarker = memo(function NodeMarker({
             [{roleLabel(node)}] {node.id}
           </div>
           <div>
-            {node.status} · CH {node.channel} · {node.rssi !== null ? `${node.rssi.toFixed(0)} dBm` : "--"} ·{" "}
-            {node.reachable ? `${node.hop_count} hop(s)` : "no route"}
+            {node.status} · CH {node.channel} · next hop {node.rssi !== null ? `${node.rssi.toFixed(0)} dBm` : "--"}
+            {node.parent_id ? ` via ${node.parent_id}` : ""} · {node.reachable ? `${node.hop_count} hop(s)` : "no route"}
           </div>
+          {node.ground_rssi !== null && node.parent_id !== null && isUavId(node.parent_id) && (
+            <div style={{ color: COVER_COLOR }}>UAV coverage · ground next hop would be {node.ground_rssi.toFixed(0)} dBm</div>
+          )}
           {node.holding && (
             <div style={{ color: node.hold_reason ? HOLD_COLORS[node.hold_reason] : undefined }}>
               {node.hold_reason === "RECONNECTING" ? "RECONNECTING · resuming orbit" : "LOST LINK · holding position"}
@@ -263,7 +290,7 @@ const UavMarker = memo(function UavMarker({
   return (
     <Marker
       position={uav.coords}
-      icon={uavIcon(uav.mode, airborne, selected, alert)}
+      icon={uavIcon(uav.mode, uav.type, uav.airframe, uav.bearing_deg, airborne, selected, alert)}
       eventHandlers={handlers}
       zIndexOffset={airborne ? 2000 : 900}
     >
@@ -275,7 +302,7 @@ const UavMarker = memo(function UavMarker({
         className="hud-tooltip hud-tooltip-violet"
       >
         <span className="font-mono text-[10px]">
-          {uav.id} · {uav.mode} · {airborne ? `${uav.alt_m.toFixed(0)} m` : FLIGHT_STATE_LABEL[uav.flight_state]}
+          {uav.id} {uav.type} · {uav.mode} · {airborne ? `${uav.alt_m.toFixed(0)} m` : FLIGHT_STATE_LABEL[uav.flight_state]}
           {uav.slot_label ? ` · ${uav.slot_label}` : ""}
           {" · "}
           <span style={{ color: batteryColor(uav.battery_pct, cfg) }}>{uav.battery_pct.toFixed(0)}%</span>
@@ -494,7 +521,7 @@ function MeshMap({
               key={`${l.source}>${l.target}`}
               positions={[a, b]}
               pathOptions={{
-                color: viaRelay ? "#a78bfa" : linkColor(l.quality),
+                color: viaRelay ? "#a78bfa" : linkColor(l.rssi),
                 weight: viaRelay ? 2 : 1.4,
                 opacity: viaRelay ? 0.9 : 0.5,
                 dashArray: viaRelay ? "5 5" : undefined,
@@ -534,10 +561,35 @@ function MeshMap({
             interactive={false}
           />
         ))}
+        {fleet?.allocator.coverage.areas.map((a) => (
+          <Circle
+            key={`cover-${a.label}`}
+            center={a.centroid}
+            radius={fleet.allocator.coverage.plan_radius_m}
+            pathOptions={{ color: COVER_COLOR, weight: 1, opacity: 0.45, dashArray: "2 6", fillColor: COVER_COLOR, fillOpacity: 0.04 }}
+            interactive={false}
+          />
+        ))}
+        {uavs.map((u) =>
+          u.task === "COVER" && u.flight_state === "ON_STATION" && u.cover_radius_m ? (
+            <Circle
+              key={`footprint-${u.id}`}
+              center={u.coords}
+              radius={u.cover_radius_m}
+              pathOptions={{ color: uavTypeColor(u.type), weight: 0.8, opacity: 0.35, fillColor: uavTypeColor(u.type), fillOpacity: 0.06 }}
+              interactive={false}
+            />
+          ) : null,
+        )}
         {fleet?.allocator.slots.map((s) => (
-          <Marker key={`slot-${s.label}`} position={s.coords} icon={slotIcon()} zIndexOffset={1100}>
-            <Tooltip direction="top" offset={[0, -8]} className="hud-tooltip hud-tooltip-violet">
-              RELAY SLOT {s.label}
+          <Marker key={`slot-${s.kind}-${s.label}`} position={s.coords} icon={slotIcon(s.kind, s.assigned_to !== null)} zIndexOffset={1100}>
+            <Tooltip
+              direction="top"
+              offset={[0, -8]}
+              className={`hud-tooltip ${s.kind === "COVER" ? "hud-tooltip-sky" : "hud-tooltip-violet"}`}
+            >
+              {s.kind === "COVER" ? `COVERAGE ${s.label} · ${s.size} weak next hop(s)` : `RELAY SLOT ${s.label}`}
+              {` · ${s.assigned_to ?? "unassigned"}`}
             </Tooltip>
           </Marker>
         ))}
@@ -609,7 +661,11 @@ function MeshMap({
           <div><span className="text-amber-300">◆</span> HW EDGE &nbsp;<span className="text-yellow-300">⬢</span> GATEWAY</div>
           <div><span className="text-teal-300">▲</span> ONLINE <span className="text-amber-300">▲</span> DEGRADED <span className="text-rose-400">▲</span> JAMMED</div>
           <div><span className="text-rose-400">⬚</span> LOST-LINK HOLD <span className="text-sky-300">⬚</span> RECONNECTING</div>
-          <div><span className="text-violet-300">✚</span> RELAY UAV <span className="text-violet-300">◇</span> SLOT &nbsp;<span className="text-cyan-300">━</span> DIJKSTRA LINK</div>
+          <div><span className="text-violet-300">✚</span> UAV <span className="text-violet-300">◇</span> RELAY SLOT <span className="text-cyan-300">◯</span> COVERAGE AREA</div>
+          <div>
+            NEXT HOP <span className="text-emerald-400">━</span> EXCELLENT <span className="text-cyan-300">━</span> GOOD{" "}
+            <span className="text-amber-300">━</span> DEGRADED <span className="text-violet-300">┅</span> VIA UAV
+          </div>
         </div>
       </div>
     </div>

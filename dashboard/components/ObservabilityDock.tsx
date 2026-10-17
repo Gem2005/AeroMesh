@@ -122,7 +122,11 @@ function RssiHistogram({ snapshot }: { snapshot: Snapshot | null }) {
   const total = Math.max(1, Object.values(counts).reduce((a, b) => a + b, 0));
 
   return (
-    <Panel title="RSSI Distribution" right={<span className="text-[10px] tabular-nums text-slate-500">{total} nodes</span>} bodyClassName="flex flex-col justify-center gap-2 px-3 py-2">
+    <Panel
+      title="Next-Hop RSSI"
+      right={<span className="text-[10px] tabular-nums text-slate-500">{total} nodes</span>}
+      bodyClassName="flex flex-col justify-center gap-2 px-3 py-2"
+    >
       {RSSI_BUCKETS.map((b) => {
         const v = counts[b.key];
         return (

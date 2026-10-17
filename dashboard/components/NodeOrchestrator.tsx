@@ -121,11 +121,15 @@ function MessageInspector({
       <div className="mb-2 grid grid-cols-2 gap-x-3 gap-y-0.5">
         <Stat label="STATUS" value={<span style={{ color: STATUS_COLORS[node.status] }}>{node.status}</span>} />
         <Stat label="CHANNEL" value={`CH ${node.channel}`} />
-        <Stat label="RSSI" value={node.rssi !== null ? `${node.rssi.toFixed(1)} dBm` : "--"} />
+        <Stat label="NEXT HOP" value={node.rssi !== null ? `${node.rssi.toFixed(1)} dBm` : "--"} />
         <Stat label="SNR" value={node.snr !== null ? `${node.snr.toFixed(1)} dB` : "--"} />
         <Stat label="BATTERY" value={node.battery_mv !== null ? `${node.battery_mv} mV` : "USB/--"} />
         <Stat label="HOPS" value={node.reachable ? node.hop_count : "NO ROUTE"} />
       </div>
+      <Stat label="PARENT" value={node.parent_id ?? "--"} />
+      {node.ground_rssi !== null && node.ground_rssi !== node.rssi && (
+        <Stat label="WITHOUT UAV" value={`${node.ground_rssi.toFixed(1)} dBm`} tone="text-slate-400" />
+      )}
       <Stat label="POSITION" value={fmtCoord(node.coords)} />
       <div className="mt-1 truncate text-[10px] text-slate-500" title={node.hop_path.join(" → ")}>
         ROUTE: {node.hop_path.length > 1 ? node.hop_path.join(" → ") : node.role === "gateway" ? "ROOT" : "partitioned"}

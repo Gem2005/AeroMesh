@@ -26,7 +26,10 @@ export interface MeshNodeState {
   coords: LatLng;
   /** AGL; non-zero only for airborne relay UAVs */
   alt_m: number;
+  /** RSSI of this node's own next hop (link to its parent in the routing tree) */
   rssi: number | null;
+  /** next-hop RSSI in the ground-only tree, i.e. what this node would get without UAVs */
+  ground_rssi: number | null;
   snr: number | null;
   battery_mv: number | null;
   parent_id: string | null;
@@ -62,9 +65,15 @@ export interface NetworkState {
   virtual_count: number;
   uav_count: number;
   airborne_uav_count: number;
+  /** ground nodes bucketed by next-hop RSSI */
+  signal_bands: Record<SignalBand, number>;
+  /** ground nodes whose next hop is a UAV */
+  uav_served_count: number;
   reachable_count: number;
   link_count: number;
 }
+
+export type SignalBand = "excellent" | "good" | "degraded" | "disconnected";
 
 export interface ThreatState {
   active: boolean;
@@ -107,16 +116,40 @@ export interface SwarmState {
   };
 }
 
-/** ArduCopter custom modes as used on the MAVLink link. */
+/** ArduPilot flight modes as used on the MAVLink link. */
 export type FlightMode = "AUTO" | "GUIDED" | "LOITER" | "RTL" | "LAND";
 export type FlightState = "LANDED" | "TAKING_OFF" | "TRANSIT" | "ON_STATION" | "HOLDING" | "RETURNING" | "LANDING";
-export type UavTask = "RELAY" | "RELIEF" | "GOTO";
+export type UavTask = "RELAY" | "RELIEF" | "COVER" | "GOTO";
 export type Failsafe = "LOW_BATTERY" | "CRITICAL_BATTERY" | "LOST_LINK" | "GEOFENCE";
+export type Airframe = "MULTIROTOR" | "VTOL_FIXED_WING";
+
+/** Airframe profile; every type carries the same relay radio. */
+export interface UavTypeInfo {
+  key: string;
+  name: string;
+  airframe: Airframe;
+  cruise_speed_mps: number;
+  min_speed_mps: number;
+  max_speed_mps: number;
+  climb_mps: number;
+  endurance_min: number;
+  /** 0 = hovers on station */
+  loiter_radius_m: number;
+}
 
 export interface UavState {
   id: string;
   /** MAVLink system id; null once the fleet exceeds 255 vehicles */
   sysid: number | null;
+  type: string;
+  type_name: string;
+  airframe: Airframe;
+  speed_min_mps: number;
+  speed_max_mps: number;
+  endurance_min: number;
+  loiter_radius_m: number;
+  /** ground radius where this UAV's air-to-ground link stays good; null when not in the mesh */
+  cover_radius_m: number | null;
   mode: FlightMode;
   flight_state: FlightState;
   armed: boolean;
@@ -136,6 +169,8 @@ export interface UavState {
   relief_by: string | null;
   battery_pct: number;
   endurance_remaining_s: number;
+  /** flight time left before the low-battery RTL failsafe */
+  usable_endurance_s: number;
   failsafe: Failsafe | null;
   in_mesh: boolean;
   reachable: boolean;
@@ -181,25 +216,64 @@ export interface GcsLinkState {
   last_command_age_s: number | null;
 }
 
+export interface CoverageArea {
+  id: number;
+  label: string;
+  size: number;
+  centroid: LatLng;
+  /** weakest ground-only next hop among the members */
+  worst_rssi: number;
+  members: string[];
+}
+
+export type SlotKind = "RELAY" | "COVER";
+
+export interface AllocatorSlot {
+  coords: LatLng;
+  label: string;
+  cluster: number;
+  kind: SlotKind;
+  size: number;
+  assigned_to: string | null;
+}
+
 export interface FleetState {
   uavs: UavState[];
-  counts: { total: number; airborne: number; bridging: number; landed: number; low_battery: number; failsafe: number };
+  counts: {
+    total: number;
+    airborne: number;
+    bridging: number;
+    covering: number;
+    landed: number;
+    low_battery: number;
+    failsafe: number;
+    by_type: Record<string, number>;
+  };
   allocator: {
     clusters: IsolatedCluster[];
     isolated: number;
+    /** relay slots for isolated clusters */
     needed: number;
     assigned: number;
     shortfall: number;
     /** gateway jammed: relays cannot restore C2 */
     suspended: boolean;
-    slots: { coords: LatLng; label: string; cluster: number }[];
+    slots: AllocatorSlot[];
+    coverage: {
+      enabled: boolean;
+      /** ground nodes with a persistently weak next hop (ground-only tree) */
+      weak_nodes: number;
+      areas: CoverageArea[];
+      assigned: number;
+      plan_radius_m: number;
+      threshold_dbm: number;
+    };
   };
   geofence: { center: LatLng; radius_m: number; ceiling_m: number };
   config: {
-    endurance_min: number;
+    types: UavTypeInfo[];
+    default_type: string;
     soft_limit: number;
-    speed_min_mps: number;
-    speed_max_mps: number;
     alt_min_m: number;
     alt_max_m: number;
     low_battery_pct: number;
@@ -283,7 +357,8 @@ export type BridgeCommand =
   | { type: "SET_PLACEMENT_MODE"; mode: PlacementMode }
   | { type: "SET_DEPLOYMENT_POLYGON"; vertices: LatLng[] }
   | { type: "SET_ORBIT_CONFIG"; radii: number[]; speed_mps: number }
-  | { type: "FLEET_ADD"; count: number }
+  | { type: "FLEET_ADD"; count: number; uav_type?: string }
+  | { type: "SET_COVERAGE"; enabled: boolean }
   | { type: "FLEET_REMOVE"; uav_id: string }
   | {
       type: "UAV_COMMAND";
@@ -378,6 +453,14 @@ export const FLIGHT_MODE_COLORS: Record<FlightMode, string> = {
   RTL: "#fbbf24",
   LAND: "#fb923c",
 };
+
+/** Badge color per airframe type key; unknown keys fall back to slate. */
+export const UAV_TYPE_COLORS: Record<string, string> = {
+  "QUAD-S": "#38bdf8",
+  "HEXA-H": "#f472b6",
+  "VTOL-FW": "#a3e635",
+};
+export const uavTypeColor = (key: string) => UAV_TYPE_COLORS[key] ?? "#94a3b8";
 
 export const FLIGHT_STATE_LABEL: Record<FlightState, string> = {
   LANDED: "LANDED",

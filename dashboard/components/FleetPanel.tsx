@@ -4,13 +4,16 @@ import { memo, useState } from "react";
 import {
   FLIGHT_MODE_COLORS,
   FLIGHT_STATE_LABEL,
+  RSSI_BUCKETS,
   STATUS_COLORS,
   batteryColor,
   fmtCoord,
   fmtDuration,
+  uavTypeColor,
   type BridgeCommand,
   type FleetAction,
   type FleetState,
+  type NetworkState,
   type Snapshot,
   type UavAction,
   type UavState,
@@ -40,6 +43,42 @@ function ModeBadge({ uav }: { uav: UavState }) {
   );
 }
 
+function TypeBadge({ type, className = "" }: { type: string; className?: string }) {
+  const color = uavTypeColor(type);
+  return (
+    <span
+      className={`shrink-0 rounded px-1 text-center text-[8px] font-semibold tracking-wide ${className}`}
+      style={{ color, background: `${color}1a`, border: `1px solid ${color}55` }}
+    >
+      {type}
+    </span>
+  );
+}
+
+/** Stacked bar of ground nodes by next-hop RSSI band. */
+function SignalBandsBar({ bands }: { bands: NetworkState["signal_bands"] }) {
+  const total = RSSI_BUCKETS.reduce((s, b) => s + (bands[b.key] ?? 0), 0);
+  return (
+    <div>
+      <div className="flex h-2 overflow-hidden rounded-sm bg-slate-800">
+        {total > 0 &&
+          RSSI_BUCKETS.map((b) =>
+            bands[b.key] ? (
+              <span key={b.key} style={{ width: `${(100 * bands[b.key]) / total}%`, background: b.color }} title={`${b.label}: ${bands[b.key]}`} />
+            ) : null,
+          )}
+      </div>
+      <div className="mt-0.5 flex justify-between text-[8.5px] tabular-nums">
+        {RSSI_BUCKETS.map((b) => (
+          <span key={b.key} style={{ color: b.color }}>
+            {b.label.slice(0, 4).toUpperCase()} {bands[b.key] ?? 0}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 const UavRow = memo(function UavRow({
   uav,
   cfg,
@@ -61,14 +100,14 @@ const UavRow = memo(function UavRow({
       }`}
     >
       <span className="w-[44px] shrink-0 font-semibold text-violet-200">{uav.id}</span>
-      <span className="w-[22px] shrink-0 text-[8.5px] text-slate-500">{uav.sysid ?? "--"}</span>
+      <TypeBadge type={uav.type} className="w-[46px]" />
       <ModeBadge uav={uav} />
       <span className={`min-w-0 flex-1 truncate text-[9px] ${alert ? "text-amber-300" : "text-slate-400"}`}>
         {uav.failsafe ?? (uav.slot_label ? `${FLIGHT_STATE_LABEL[uav.flight_state]} ${uav.slot_label}` : FLIGHT_STATE_LABEL[uav.flight_state])}
       </span>
       <BatteryBar pct={uav.battery_pct} cfg={cfg} />
       <span className="w-[30px] shrink-0 text-right tabular-nums text-slate-300">{uav.alt_m.toFixed(0)}m</span>
-      <span className="w-[16px] shrink-0 text-right tabular-nums text-emerald-300" title="ground nodes bridged">
+      <span className="w-[16px] shrink-0 text-right tabular-nums text-emerald-300" title="ground nodes routed through this UAV">
         {uav.bridged_count || ""}
       </span>
     </button>
@@ -108,8 +147,9 @@ function UavControls({
     <div className="space-y-2.5 p-3">
       <div className="flex items-center justify-between">
         <div>
-          <div className="text-xs font-semibold text-violet-200">
-            {uav.id} <span className="text-[10px] font-normal text-slate-500">sysid {uav.sysid ?? "n/a"}</span>
+          <div className="flex items-center gap-1.5 text-xs font-semibold text-violet-200">
+            {uav.id} <TypeBadge type={uav.type} />
+            <span className="text-[10px] font-normal text-slate-500">sysid {uav.sysid ?? "n/a"}</span>
           </div>
           <div className="text-[9.5px] text-slate-500">
             {uav.armed ? "ARMED" : "DISARMED"} · {FLIGHT_STATE_LABEL[uav.flight_state]}
@@ -117,6 +157,11 @@ function UavControls({
           </div>
         </div>
         <ModeBadge uav={uav} />
+      </div>
+      <div className="rounded border border-slate-800 bg-slate-900/40 px-2 py-1 text-[9.5px] leading-snug text-slate-400">
+        {uav.type_name}: {uav.endurance_min} min rated, {uav.speed_min_mps}-{uav.speed_max_mps} m/s,{" "}
+        {uav.loiter_radius_m > 0 ? `loiters r=${uav.loiter_radius_m} m on station` : "hovers on station"}
+        {uav.cover_radius_m !== null && ` · good-link footprint ${uav.cover_radius_m.toFixed(0)} m`}
       </div>
 
       {uav.failsafe && (
@@ -133,7 +178,7 @@ function UavControls({
 
       <div className="grid grid-cols-2 gap-x-3 gap-y-0.5">
         <Stat label="BATTERY" value={<span style={{ color: batteryColor(uav.battery_pct, cfg) }}>{uav.battery_pct.toFixed(0)}%</span>} />
-        <Stat label="ENDUR." value={fmtDuration(uav.endurance_remaining_s)} />
+        <Stat label="USABLE" value={fmtDuration(uav.usable_endurance_s)} />
         <Stat label="ALT" value={`${uav.alt_m.toFixed(0)}/${uav.cruise_alt_m.toFixed(0)} m`} />
         <Stat label="CLIMB" value={`${uav.climb_mps.toFixed(1)} m/s`} />
         <Stat label="SPEED" value={`${uav.speed_mps.toFixed(1)}/${uav.cruise_speed_mps.toFixed(0)}`} />
@@ -152,8 +197,8 @@ function UavControls({
             )
           }
         />
-        <Stat label="RSSI" value={uav.link_rssi !== null ? `${uav.link_rssi.toFixed(0)} dBm` : "--"} />
-        <Stat label="BRIDGED" value={<span className="text-emerald-300">{uav.bridged_count}</span>} />
+        <Stat label="NEXT HOP" value={uav.link_rssi !== null ? `${uav.link_rssi.toFixed(0)} dBm` : "--"} />
+        <Stat label="SERVING" value={<span className="text-emerald-300">{uav.bridged_count}</span>} />
         <Stat label="FLIGHT" value={fmtDuration(uav.mission_time_s)} />
       </div>
       {uav.c2_lost_s !== null && (
@@ -216,8 +261,8 @@ function UavControls({
         </div>
         <input
           type="range"
-          min={cfg.speed_min_mps}
-          max={cfg.speed_max_mps}
+          min={uav.speed_min_mps}
+          max={uav.speed_max_mps}
           step={1}
           value={speed}
           onChange={(e) => setSpeed(Number(e.target.value))}
@@ -294,12 +339,17 @@ export default function FleetPanel({
 }) {
   const fleet = snapshot?.fleet;
   const [addCount, setAddCount] = useState(1);
-  if (!fleet) {
+  const [addType, setAddType] = useState<string | null>(null);
+  if (!fleet || !snapshot) {
     return <div className="p-6 text-center text-[10px] text-slate-600">Waiting for bridge snapshot...</div>;
   }
   const { counts, allocator, config } = fleet;
+  const coverage = allocator.coverage;
+  const coverBacklog = coverage.areas.length - coverage.assigned;
   const selected = selectedUavId ? fleet.uavs.find((u) => u.id === selectedUavId) ?? null : null;
   const fleetCmd = (action: FleetAction) => send({ type: "FLEET_COMMAND", action });
+  const typeKey = addType ?? config.default_type;
+  const typeInfo = config.types.find((t) => t.key === typeKey) ?? config.types[0];
 
   return (
     <div className="hud-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
@@ -325,7 +375,7 @@ export default function FleetPanel({
                 ["TOTAL", counts.total, "text-slate-100"],
                 ["AIRBORNE", counts.airborne, "text-sky-300"],
                 ["BRIDGING", counts.bridging, "text-violet-300"],
-                ["LANDED", counts.landed, "text-slate-300"],
+                ["COVERING", counts.covering, "text-cyan-300"],
                 ["LOW BATT", counts.low_battery, counts.low_battery ? "text-amber-300" : "text-slate-500"],
                 ["FAILSAFE", counts.failsafe, counts.failsafe ? "text-rose-300" : "text-slate-500"],
               ] as const
@@ -368,6 +418,60 @@ export default function FleetPanel({
             )}
           </div>
 
+          <div className="rounded border border-slate-800 bg-slate-900/40 p-2 text-[10px]">
+            <div className="mb-1 flex items-center justify-between">
+              <span className="text-[9px] tracking-[0.2em] text-slate-500">COVERAGE · NEXT HOP &lt; {coverage.threshold_dbm} dBm</span>
+              <HudButton
+                tone="cyan"
+                active={coverage.enabled}
+                disabled={!connected}
+                onClick={() => send({ type: "SET_COVERAGE", enabled: !coverage.enabled })}
+                className="px-1.5 py-0"
+                title="Fly idle UAVs over areas whose ground next hop is degraded"
+              >
+                {coverage.enabled ? "Auto on" : "Auto off"}
+              </HudButton>
+            </div>
+            <SignalBandsBar bands={snapshot.network.signal_bands} />
+            <div className="mt-1.5">
+              <Stat label="WEAK NEXT HOP (NO UAV)" value={coverage.weak_nodes} tone={coverage.weak_nodes ? "text-amber-300" : undefined} />
+              <Stat label="AREAS COVERED" value={`${coverage.assigned} / ${coverage.areas.length}`} />
+              <Stat label="NODES VIA UAV" value={snapshot.network.uav_served_count} tone="text-cyan-300" />
+            </div>
+            {coverage.enabled && coverBacklog > 0 && (
+              <div className="mt-1 text-[9.5px] text-slate-400">
+                {coverBacklog} weak area{coverBacklog === 1 ? "" : "s"} waiting: add UAVs or let relays recharge.
+              </div>
+            )}
+          </div>
+
+          <div className="flex flex-wrap gap-1" role="radiogroup" aria-label="UAV type to add">
+            {config.types.map((t) => {
+              const on = t.key === typeKey;
+              const color = uavTypeColor(t.key);
+              return (
+                <button
+                  key={t.key}
+                  type="button"
+                  role="radio"
+                  aria-checked={on}
+                  onClick={() => setAddType(t.key)}
+                  className="flex-1 rounded border px-1 py-0.5 text-[9px] font-semibold tracking-wide transition-colors"
+                  style={on ? { color, borderColor: color, background: `${color}1f` } : { color: "#64748b", borderColor: "#334155" }}
+                  title={t.name}
+                >
+                  {t.key} <span className="font-normal">{counts.by_type[t.key] ?? 0}</span>
+                </button>
+              );
+            })}
+          </div>
+          {typeInfo && (
+            <div className="-mt-1 text-[9px] text-slate-500">
+              {typeInfo.name}: {typeInfo.endurance_min} min, cruise {typeInfo.cruise_speed_mps} m/s
+              {typeInfo.loiter_radius_m > 0 ? `, loiters r=${typeInfo.loiter_radius_m} m` : ", hovers"} · same relay radio
+            </div>
+          )}
+
           <div className="flex items-center gap-1.5">
             <div className="flex items-center rounded border border-slate-700">
               <button
@@ -390,8 +494,14 @@ export default function FleetPanel({
                 +
               </button>
             </div>
-            <HudButton tone="violet" active disabled={!connected} onClick={() => send({ type: "FLEET_ADD", count: addCount })} className="flex-1">
-              Add {addCount} UAV{addCount === 1 ? "" : "s"}
+            <HudButton
+              tone="violet"
+              active
+              disabled={!connected}
+              onClick={() => send({ type: "FLEET_ADD", count: addCount, uav_type: typeKey })}
+              className="flex-1"
+            >
+              Add {addCount} {typeKey}
             </HudButton>
           </div>
           {counts.total >= config.soft_limit && (
@@ -415,7 +525,7 @@ export default function FleetPanel({
             </HudButton>
           </div>
           <div className="text-[9px] text-slate-600">
-            ALL-FLEET · endurance {config.endurance_min} min · relief at {config.relief_battery_pct}% · RTL at {config.low_battery_pct}%
+            ALL-FLEET · relief / handoff at {config.relief_battery_pct}% · RTL at {config.low_battery_pct}%
           </div>
         </div>
       </Panel>
