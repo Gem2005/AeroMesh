@@ -4,17 +4,18 @@
  * AeroMesh -- single-pane HIL mesh telemetry & simulation dashboard.
  *
  * Layout: status header / node orchestrator / geospatial map /
- * RF + relay controls / observability dock. Every value is rendered from
- * the bridge's 1 Hz SNAPSHOT; user actions are sent back as commands.
+ * RF + fleet controls (tabbed) / observability dock. Every value is rendered
+ * from the bridge's 1 Hz SNAPSHOT; user actions are sent back as commands.
  */
 
 import dynamic from "next/dynamic";
 import { useCallback, useState } from "react";
-import { BLEED_RATIO, channelFreqMhz, type LatLng } from "@/lib/mesh";
+import { BLEED_RATIO, channelFreqMhz, isUavId, type LatLng } from "@/lib/mesh";
 import { useBridge } from "@/lib/useBridge";
 import HeaderBar from "@/components/HeaderBar";
 import NodeOrchestrator, { type InteractionMode } from "@/components/NodeOrchestrator";
 import RfControlPanel, { type ZoneChannelChoice } from "@/components/RfControlPanel";
+import FleetPanel from "@/components/FleetPanel";
 import ObservabilityDock from "@/components/ObservabilityDock";
 
 const MeshMap = dynamic(() => import("@/components/MeshMap"), {
@@ -26,28 +27,40 @@ const MeshMap = dynamic(() => import("@/components/MeshMap"), {
   ),
 });
 
+type RightTab = "rf" | "fleet";
+
 export default function Home() {
-  const { wsStatus, snapshot, history, logs, animations, send, clearLogs, pushLog } = useBridge();
+  const { wsStatus, snapshot, history, logs, animations, send, clearLogs, pushLog, getRecord } = useBridge();
 
   const [mode, setMode] = useState<InteractionMode>("none");
   const [draftPolygon, setDraftPolygon] = useState<LatLng[]>([]);
   const [zoneRadius, setZoneRadius] = useState(200);
   const [zoneChannel, setZoneChannel] = useState<ZoneChannelChoice>("active");
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedUavId, setSelectedUavId] = useState<string | null>(null);
+  const [tab, setTab] = useState<RightTab>("fleet");
 
   const connected = wsStatus === "connected";
   const activeChannel = snapshot?.network.channel ?? 6;
+  const fleet = snapshot?.fleet;
+  const selectedUavExists = !!selectedUavId && !!fleet?.uavs.some((u) => u.id === selectedUavId);
+  const effectiveMode: InteractionMode = mode === "uav_goto" && !selectedUavExists ? "none" : mode;
 
   const changeMode = useCallback((m: InteractionMode) => {
     setMode(m);
     setDraftPolygon([]);
   }, []);
 
+  const selectUav = useCallback((id: string | null) => {
+    setSelectedUavId(id);
+    setMode((m) => (m === "uav_goto" ? "none" : m));
+  }, []);
+
   const onMapClick = useCallback(
     (p: LatLng) => {
-      if (mode === "draw_polygon") {
+      if (effectiveMode === "draw_polygon") {
         setDraftPolygon((prev) => [...prev, p]);
-      } else if (mode === "place_zone") {
+      } else if (effectiveMode === "place_zone") {
         const channel = zoneChannel === "active" ? activeChannel : zoneChannel;
         send({
           type: "DEPLOY_JAMMER",
@@ -59,9 +72,12 @@ export default function Home() {
           channel,
         });
         setMode("none");
+      } else if (effectiveMode === "uav_goto" && selectedUavId) {
+        send({ type: "UAV_COMMAND", uav_id: selectedUavId, action: "GOTO", lat: p[0], lng: p[1] });
+        setMode("none");
       }
     },
-    [mode, zoneChannel, activeChannel, zoneRadius, send],
+    [effectiveMode, zoneChannel, activeChannel, zoneRadius, selectedUavId, send],
   );
 
   const finishPolygon = useCallback(() => {
@@ -75,9 +91,27 @@ export default function Home() {
 
   const onNodeClick = useCallback(
     (id: string) => {
-      if (mode === "none") setSelectedId(id);
+      if (effectiveMode !== "none") return;
+      if (isUavId(id)) {
+        selectUav(id);
+        setTab("fleet");
+      } else {
+        setSelectedId(id);
+      }
     },
-    [mode],
+    [effectiveMode, selectUav],
+  );
+
+  const onRosterSelect = useCallback(
+    (id: string | null) => {
+      if (id && isUavId(id)) {
+        selectUav(id);
+        setTab("fleet");
+        return;
+      }
+      setSelectedId(id);
+    },
+    [selectUav],
   );
 
   const anchorGps = useCallback(() => {
@@ -96,31 +130,34 @@ export default function Home() {
     );
   }, [send, pushLog]);
 
+  const shortfall = fleet?.allocator.shortfall ?? 0;
+
   return (
-    <main className="grid h-screen grid-cols-[300px_minmax(0,1fr)_320px] grid-rows-[auto_minmax(0,1fr)_212px] overflow-hidden bg-[#0a0e17] font-mono text-slate-100">
+    <main className="grid h-screen grid-cols-[300px_minmax(0,1fr)_340px] grid-rows-[auto_minmax(0,1fr)_212px] overflow-hidden bg-[#0a0e17] font-mono text-slate-100">
       <HeaderBar wsStatus={wsStatus} snapshot={snapshot} onAnchorGps={anchorGps} />
 
       <NodeOrchestrator
         snapshot={snapshot}
         connected={connected}
         send={send}
-        mode={mode}
+        mode={effectiveMode}
         onModeChange={changeMode}
         draftPolygon={draftPolygon}
         onUndoVertex={undoVertex}
         onFinishPolygon={finishPolygon}
         selectedId={selectedId}
-        onSelect={setSelectedId}
+        onSelect={onRosterSelect}
       />
 
       <div className="relative min-h-0 min-w-0">
         <MeshMap
           snapshot={snapshot}
           animations={animations}
-          mode={mode}
+          mode={effectiveMode}
           draftPolygon={draftPolygon}
           zonePreviewRadius={zoneRadius}
           selectedId={selectedId}
+          selectedUavId={selectedUavId}
           onMapClick={onMapClick}
           onNodeClick={onNodeClick}
         />
@@ -132,19 +169,56 @@ export default function Home() {
         )}
       </div>
 
-      <RfControlPanel
-        snapshot={snapshot}
-        connected={connected}
-        send={send}
-        mode={mode}
-        onModeChange={changeMode}
-        zoneRadius={zoneRadius}
-        onZoneRadius={setZoneRadius}
-        zoneChannel={zoneChannel}
-        onZoneChannel={setZoneChannel}
-      />
+      <aside className="flex min-h-0 flex-col border-l border-slate-800 bg-[#0b101c]">
+        <div className="flex shrink-0 border-b border-slate-800" role="tablist">
+          {(
+            [
+              ["fleet", `UAV FLEET${fleet ? ` (${fleet.counts.total})` : ""}`],
+              ["rf", "RF / CHANNEL"],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              role="tab"
+              aria-selected={tab === key}
+              onClick={() => setTab(key)}
+              className={`flex flex-1 items-center justify-center gap-1.5 border-b-2 px-2 py-2 text-[10px] font-semibold tracking-[0.18em] ${
+                tab === key ? "border-cyan-400 text-cyan-200" : "border-transparent text-slate-500 hover:text-slate-300"
+              }`}
+            >
+              {label}
+              {key === "fleet" && shortfall > 0 && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-rose-400" />}
+              {key === "rf" && snapshot?.threat.active && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-rose-400" />}
+            </button>
+          ))}
+        </div>
+        {tab === "fleet" ? (
+          <FleetPanel
+            snapshot={snapshot}
+            connected={connected}
+            send={send}
+            mode={effectiveMode}
+            onModeChange={changeMode}
+            selectedUavId={selectedUavExists ? selectedUavId : null}
+            onSelectUav={selectUav}
+          />
+        ) : (
+          <RfControlPanel
+            snapshot={snapshot}
+            connected={connected}
+            send={send}
+            mode={effectiveMode}
+            onModeChange={changeMode}
+            zoneRadius={zoneRadius}
+            onZoneRadius={setZoneRadius}
+            zoneChannel={zoneChannel}
+            onZoneChannel={setZoneChannel}
+          />
+        )}
+      </aside>
 
-      <ObservabilityDock snapshot={snapshot} history={history} logs={logs} onClearLogs={clearLogs} />
+      <ObservabilityDock snapshot={snapshot} history={history} logs={logs} onClearLogs={clearLogs} getRecord={getRecord} />
     </main>
   );
 }

@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef } from "react";
 import { RSSI_BUCKETS, rssiBucket, type LogTag, type Severity, type Snapshot } from "@/lib/mesh";
-import type { LogEntry, MetricSample } from "@/lib/useBridge";
+import type { LogEntry, MetricSample, TelemetryRecord } from "@/lib/useBridge";
 import { LineChart } from "@/components/charts";
 import { Panel } from "@/components/ui";
 
@@ -10,6 +10,7 @@ const TAG_COLORS: Record<LogTag, string> = {
   SERIAL: "text-sky-300",
   "RF-ALERT": "text-rose-400",
   "CH-SWITCH": "text-emerald-300",
+  FLEET: "text-violet-300",
   MAVLINK: "text-violet-300",
   MSG: "text-amber-300",
   SYSTEM: "text-slate-400",
@@ -21,6 +22,50 @@ const SEVERITY_TEXT: Record<Severity, string> = {
   warn: "text-amber-200/90",
   critical: "text-rose-200",
 };
+
+const RECORD_COLUMNS: (keyof TelemetryRecord)[] = [
+  "ts",
+  "tick",
+  "channel",
+  "pdr_percent",
+  "avg_latency_ms",
+  "health_score",
+  "node_count",
+  "reachable_count",
+  "holding_count",
+  "isolated_count",
+  "uav_total",
+  "uav_airborne",
+  "uav_bridging",
+  "relay_shortfall",
+  "zone_active",
+];
+
+function csvCell(v: unknown): string {
+  const s = String(v ?? "");
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/** Single file, two sections: per-tick metrics, then the event log. */
+function buildCsv(record: TelemetryRecord[], logs: LogEntry[]): string {
+  const lines = ["# AeroMesh run record: metrics (1 Hz)", RECORD_COLUMNS.join(",")];
+  for (const r of record) lines.push(RECORD_COLUMNS.map((k) => csvCell(r[k])).join(","));
+  lines.push("", "# event log", "ts,tag,severity,text");
+  for (const l of logs) lines.push([l.ts, l.tag, l.severity, l.text].map(csvCell).join(","));
+  return lines.join("\n");
+}
+
+function downloadCsv(record: TelemetryRecord[], logs: LogEntry[]) {
+  const blob = new Blob([buildCsv(record, logs)], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `aeromesh-run-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 function PdrPanel({ history, current }: { history: MetricSample[]; current: number | null }) {
   const values = history.map((h) => h.pdr);
@@ -69,7 +114,7 @@ function RssiHistogram({ snapshot }: { snapshot: Snapshot | null }) {
   const counts = useMemo(() => {
     const c = { excellent: 0, good: 0, degraded: 0, disconnected: 0 };
     for (const n of snapshot?.nodes ?? []) {
-      if (n.role === "gateway") continue;
+      if (n.role === "gateway" || n.role === "uav") continue;
       c[rssiBucket(n.rssi, n.status)] += 1;
     }
     return c;
@@ -98,7 +143,7 @@ function RssiHistogram({ snapshot }: { snapshot: Snapshot | null }) {
   );
 }
 
-function EventLog({ logs, onClear }: { logs: LogEntry[]; onClear: () => void }) {
+function EventLog({ logs, onClear, onExport }: { logs: LogEntry[]; onClear: () => void; onExport: () => void }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const stickRef = useRef(true);
 
@@ -111,9 +156,19 @@ function EventLog({ logs, onClear }: { logs: LogEntry[]; onClear: () => void }) 
     <Panel
       title="Live System Event Log"
       right={
-        <button type="button" onClick={onClear} className="text-[9.5px] tracking-wider text-slate-500 hover:text-white">
-          CLEAR
-        </button>
+        <span className="flex gap-3">
+          <button
+            type="button"
+            onClick={onExport}
+            className="text-[9.5px] tracking-wider text-cyan-400 hover:text-cyan-200"
+            title="Download metrics history (up to 1 h) and the event log as CSV"
+          >
+            EXPORT CSV
+          </button>
+          <button type="button" onClick={onClear} className="text-[9.5px] tracking-wider text-slate-500 hover:text-white">
+            CLEAR
+          </button>
+        </span>
       }
       bodyClassName="flex flex-col"
     >
@@ -143,11 +198,13 @@ export default function ObservabilityDock({
   history,
   logs,
   onClearLogs,
+  getRecord,
 }: {
   snapshot: Snapshot | null;
   history: MetricSample[];
   logs: LogEntry[];
   onClearLogs: () => void;
+  getRecord: () => TelemetryRecord[];
 }) {
   const net = snapshot?.network;
   return (
@@ -155,7 +212,7 @@ export default function ObservabilityDock({
       <PdrPanel history={history} current={net?.pdr_percent ?? null} />
       <LatencyPanel history={history} current={net?.avg_latency_ms ?? null} convergenceMs={net?.self_heal_convergence_ms ?? null} />
       <RssiHistogram snapshot={snapshot} />
-      <EventLog logs={logs} onClear={onClearLogs} />
+      <EventLog logs={logs} onClear={onClearLogs} onExport={() => downloadCsv(getRecord(), logs)} />
     </footer>
   );
 }

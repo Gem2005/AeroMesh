@@ -39,6 +39,9 @@ export default function HeaderBar({
   const auto = snapshot?.threat.eccm_auto ?? true;
   const hw = net?.hardware_count ?? 0;
   const virt = net?.virtual_count ?? 0;
+  const uavs = net?.uav_count ?? 0;
+  const airborne = net?.airborne_uav_count ?? 0;
+  const gcs = snapshot?.fleet.gcs;
   const acsState = snapshot?.threat.acs_state ?? "IDLE";
 
   const wsTone = wsStatus === "connected" ? "emerald" : wsStatus === "connecting" ? "amber" : "red";
@@ -74,6 +77,9 @@ export default function HeaderBar({
           ACS {auto ? "AUTO" : "MANUAL"}
           {acsState !== "IDLE" ? ` · ${acsState}` : ""}
         </Badge>
+        <Badge tone={gcs?.connected ? "violet" : "slate"}>
+          GCS {gcs?.connected ? "LINKED" : "UDP"} :{gcs?.port ?? 14550}
+        </Badge>
       </div>
 
       <div className="ml-auto flex items-center gap-4">
@@ -91,8 +97,11 @@ export default function HeaderBar({
           </div>
         )}
         <div className="whitespace-nowrap rounded border border-slate-700 bg-slate-900/70 px-3 py-1 text-[11px] font-semibold tracking-wider text-slate-200">
-          <span className="text-amber-300">{hw} HW</span> + <span className="text-cyan-300">{virt} VIRTUAL</span> ={" "}
-          <span className="text-white">{hw + virt} NODES</span>
+          <span className="text-amber-300">{hw} HW</span> + <span className="text-cyan-300">{virt} VIRTUAL</span> +{" "}
+          <span className="text-violet-300" title={`${airborne} airborne`}>
+            {uavs} UAV
+          </span>{" "}
+          = <span className="text-white">{hw + virt + uavs} NODES</span>
         </div>
         <button
           type="button"

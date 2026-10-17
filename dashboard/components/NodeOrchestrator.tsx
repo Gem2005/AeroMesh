@@ -10,11 +10,12 @@ import {
   type LatLng,
   type MeshNodeState,
   type Snapshot,
+  type SwarmState,
 } from "@/lib/mesh";
 import { Badge, HudButton, Panel, Stat } from "@/components/ui";
 
-export type InteractionMode = "none" | "draw_polygon" | "place_zone";
-type RosterFilter = "ALL" | "HW" | "VIRTUAL" | "ALERT";
+export type InteractionMode = "none" | "draw_polygon" | "place_zone" | "uav_goto";
+type RosterFilter = "ALL" | "HW" | "VIRTUAL" | "UAV" | "ALERT";
 
 const SLIDER_DEBOUNCE_MS = 250;
 
@@ -43,6 +44,7 @@ const RosterRow = memo(function RosterRow({
   onSelect: (id: string) => void;
 }) {
   const isHw = node.type === "hardware";
+  const isUav = node.type === "uav";
   const color = STATUS_COLORS[node.status];
   return (
     <button
@@ -53,12 +55,22 @@ const RosterRow = memo(function RosterRow({
       } ${isHw ? "bg-amber-500/[0.04]" : ""}`}
     >
       <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: color }} />
-      <span className={`w-[72px] shrink-0 text-[9.5px] font-semibold ${isHw ? "text-amber-300" : "text-slate-500"}`}>
+      <span className={`w-[72px] shrink-0 text-[9.5px] font-semibold ${isHw ? "text-amber-300" : isUav ? "text-violet-300" : "text-slate-500"}`}>
         [{roleLabel(node)}]
       </span>
-      <span className={`min-w-0 flex-1 truncate ${isHw ? "text-amber-100" : "text-slate-200"}`} title={node.id}>
+      <span className={`min-w-0 flex-1 truncate ${isHw ? "text-amber-100" : isUav ? "text-violet-100" : "text-slate-200"}`} title={node.id}>
         {node.id}
       </span>
+      {node.holding && (
+        <span
+          className={`shrink-0 rounded px-1 text-[8px] font-semibold tracking-wider ${
+            node.hold_reason === "RECONNECTING" ? "bg-sky-500/15 text-sky-300" : "bg-rose-500/15 text-rose-300"
+          }`}
+          title={node.hold_reason === "RECONNECTING" ? "Link restored; resuming orbit" : "Lost link; holding last position"}
+        >
+          {node.hold_reason === "RECONNECTING" ? "RECON" : "HOLD"}
+        </span>
+      )}
       <span className="w-6 shrink-0 rounded bg-slate-800 text-center text-[9px] text-slate-300">{node.channel}</span>
       <RssiBars rssi={node.role === "gateway" ? -40 : node.rssi} color={color} />
       <span className="w-[46px] shrink-0 text-right text-[8.5px] tracking-wide" style={{ color }}>
@@ -150,6 +162,119 @@ function MessageInspector({
   );
 }
 
+function OrbitConfig({
+  swarm,
+  connected,
+  send,
+}: {
+  swarm: SwarmState;
+  connected: boolean;
+  send: (cmd: BridgeCommand) => boolean;
+}) {
+  const lim = swarm.limits;
+  const [draft, setDraft] = useState<{ radii: number[]; speed: number } | null>(null);
+  const radii = draft?.radii ?? swarm.radii;
+  const speed = draft?.speed ?? swarm.speed_mps;
+  const edit = (next: Partial<{ radii: number[]; speed: number }>) => setDraft({ radii, speed, ...next });
+
+  const gaps = radii.map((r, i) => (i === 0 ? r : r - radii[i - 1]));
+  const tooClose = gaps.findIndex((g, i) => i > 0 && g < lim.min_gap_m);
+  const tooWide = gaps.map((g, i) => (g > swarm.link_range_m ? i : -1)).filter((i) => i >= 0);
+  const canAddRing = radii.length < lim.max_rings && radii[radii.length - 1] + lim.min_gap_m <= lim.radius_max_m;
+
+  const setRadius = (i: number, value: number) => {
+    const next = [...radii];
+    next[i] = value;
+    edit({ radii: next });
+  };
+  const addRing = () => {
+    const last = radii[radii.length - 1];
+    edit({ radii: [...radii, Math.min(lim.radius_max_m, last + Math.min(swarm.link_range_m, 150))] });
+  };
+  const apply = () => {
+    if (send({ type: "SET_ORBIT_CONFIG", radii, speed_mps: speed })) setDraft(null);
+  };
+
+  return (
+    <div className="rounded border border-slate-800 bg-slate-900/40 p-2">
+      <div className="mb-1.5 flex items-center justify-between">
+        <span className="text-[10px] tracking-wider text-slate-400">ORBIT CONFIGURATION</span>
+        <span className="text-[9px] text-slate-600">
+          {radii.length}/{lim.max_rings} rings
+        </span>
+      </div>
+      <div className="space-y-1">
+        {radii.map((r, i) => (
+          <div key={i} className="flex items-center gap-1.5">
+            <span className={`w-6 text-[9px] ${tooWide.includes(i) ? "text-amber-300" : "text-slate-500"}`}>R{i + 1}</span>
+            <input
+              type="range"
+              min={lim.radius_min_m}
+              max={lim.radius_max_m}
+              step={10}
+              value={r}
+              disabled={!connected}
+              onChange={(e) => setRadius(i, Number(e.target.value))}
+              className="hud-range min-w-0 flex-1"
+              aria-label={`Ring ${i + 1} radius`}
+            />
+            <span className="w-11 text-right text-[10px] tabular-nums text-cyan-300">{r} m</span>
+            <button
+              type="button"
+              disabled={!connected || radii.length <= 1}
+              onClick={() => edit({ radii: radii.filter((_, j) => j !== i) })}
+              className="w-4 text-[11px] text-slate-500 hover:text-rose-300 disabled:opacity-20"
+              aria-label={`Remove ring ${i + 1}`}
+            >
+              ×
+            </button>
+          </div>
+        ))}
+      </div>
+      <div className="mt-1.5 flex items-center gap-1.5">
+        <span className="w-6 text-[9px] text-slate-500">SPD</span>
+        <input
+          type="range"
+          min={lim.speed_min_mps}
+          max={lim.speed_max_mps}
+          step={0.5}
+          value={speed}
+          disabled={!connected}
+          onChange={(e) => edit({ speed: Number(e.target.value) })}
+          className="hud-range min-w-0 flex-1"
+          aria-label="Orbit speed"
+        />
+        <span className="w-[60px] text-right text-[10px] tabular-nums text-cyan-300">{speed.toFixed(1)} m/s</span>
+      </div>
+      {tooClose > 0 && (
+        <div className="mt-1.5 text-[9.5px] text-rose-300">
+          R{tooClose} and R{tooClose + 1} are closer than {lim.min_gap_m} m: rings must increase outward.
+        </div>
+      )}
+      {tooClose <= 0 && tooWide.length > 0 && (
+        <div className="mt-1.5 text-[9.5px] leading-snug text-amber-300">
+          {tooWide.map((i) => `R${i + 1}`).join(", ")} gap exceeds the {swarm.link_range_m} m link range: those nodes partition
+          unless relay UAVs bridge them.
+        </div>
+      )}
+      {swarm.mode !== "ORBIT_PATROL" && (
+        <div className="mt-1.5 text-[9.5px] text-slate-500">Applies when Orbit Patrol is active.</div>
+      )}
+      <div className="mt-2 grid grid-cols-3 gap-1">
+        <HudButton disabled={!connected || !canAddRing} onClick={addRing}>
+          + Ring
+        </HudButton>
+        <HudButton disabled={!draft} onClick={() => setDraft(null)}>
+          Reset
+        </HudButton>
+        <HudButton tone="emerald" active={!!draft} disabled={!connected || !draft || tooClose > 0} onClick={apply}>
+          Apply
+        </HudButton>
+      </div>
+    </div>
+  );
+}
+
 export default function NodeOrchestrator({
   snapshot,
   connected,
@@ -196,13 +321,14 @@ export default function NodeOrchestrator({
     return nodes.filter((n) => {
       if (filter === "HW" && n.type !== "hardware") return false;
       if (filter === "VIRTUAL" && n.type !== "virtual") return false;
-      if (filter === "ALERT" && n.status === "ONLINE") return false;
+      if (filter === "UAV" && n.type !== "uav") return false;
+      if (filter === "ALERT" && n.status === "ONLINE" && !n.holding) return false;
       return !q || n.id.toLowerCase().includes(q);
     });
   }, [nodes, filter, query]);
 
   const selected = selectedId ? nodes.find((n) => n.id === selectedId) ?? null : null;
-  const alertCount = nodes.filter((n) => n.status !== "ONLINE").length;
+  const alertCount = nodes.filter((n) => n.status !== "ONLINE" || n.holding).length;
   const drawing = mode === "draw_polygon";
 
   return (
@@ -268,6 +394,14 @@ export default function NodeOrchestrator({
               </div>
             )}
           </div>
+
+          {swarm && <OrbitConfig swarm={swarm} connected={connected} send={send} />}
+
+          {(swarm?.holding_count ?? 0) > 0 && (
+            <div className="rounded border border-rose-500/30 bg-rose-500/5 px-2 py-1 text-[10px] text-rose-200">
+              {swarm?.holding_count} node{swarm?.holding_count === 1 ? "" : "s"} holding at the last known position (lost link)
+            </div>
+          )}
         </div>
       </Panel>
 
@@ -278,12 +412,12 @@ export default function NodeOrchestrator({
         bodyClassName="flex flex-col"
       >
         <div className="flex shrink-0 gap-1 px-2 pt-2">
-          {(["ALL", "HW", "VIRTUAL", "ALERT"] as RosterFilter[]).map((f) => (
+          {(["ALL", "HW", "VIRTUAL", "UAV", "ALERT"] as RosterFilter[]).map((f) => (
             <button
               key={f}
               type="button"
               onClick={() => setFilter(f)}
-              className={`flex-1 rounded px-1 py-1 text-[9.5px] font-semibold tracking-wider ${
+              className={`flex-1 rounded px-0.5 py-1 text-[9px] font-semibold tracking-wide ${
                 filter === f ? "bg-slate-700 text-white" : "text-slate-500 hover:text-slate-300"
               }`}
             >

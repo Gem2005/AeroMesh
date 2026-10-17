@@ -19,6 +19,25 @@ export interface MetricSample {
   latency: number;
 }
 
+/** One row of the exportable run record (one per bridge tick). */
+export interface TelemetryRecord {
+  ts: string;
+  tick: number;
+  channel: number;
+  pdr_percent: number;
+  avg_latency_ms: number;
+  health_score: number;
+  node_count: number;
+  reachable_count: number;
+  holding_count: number;
+  isolated_count: number;
+  uav_total: number;
+  uav_airborne: number;
+  uav_bridging: number;
+  relay_shortfall: number;
+  zone_active: boolean;
+}
+
 export interface LogEntry extends LogEventFrame {
   id: number;
 }
@@ -33,6 +52,8 @@ export interface ActiveAnimation {
 const RETRY_MS = 2000;
 const HISTORY_LEN = 60;
 const MAX_LOGS = 250;
+/** One hour of 1 Hz samples for CSV export. */
+const RECORD_LEN = 3600;
 export const ANIMATION_MS = 2600;
 
 /**
@@ -49,6 +70,7 @@ export function useBridge() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const idRef = useRef(0);
+  const recordRef = useRef<TelemetryRecord[]>([]);
 
   const pushLog = useCallback((tag: LogTag, severity: Severity, text: string) => {
     const entry: LogEntry = {
@@ -70,8 +92,29 @@ export function useBridge() {
 
     const handleFrame = (frame: BridgeFrame) => {
       switch (frame.type) {
-        case "SNAPSHOT":
+        case "SNAPSHOT": {
           setSnapshot(frame);
+          const record = recordRef.current;
+          if (record.length === 0 || record[record.length - 1].tick !== frame.tick) {
+            record.push({
+              ts: frame.ts,
+              tick: frame.tick,
+              channel: frame.network.channel,
+              pdr_percent: frame.network.pdr_percent,
+              avg_latency_ms: frame.network.avg_latency_ms,
+              health_score: frame.network.health_score,
+              node_count: frame.network.node_count,
+              reachable_count: frame.network.reachable_count,
+              holding_count: frame.swarm.holding_count,
+              isolated_count: frame.fleet.allocator.isolated,
+              uav_total: frame.fleet.counts.total,
+              uav_airborne: frame.fleet.counts.airborne,
+              uav_bridging: frame.fleet.counts.bridging,
+              relay_shortfall: frame.fleet.allocator.shortfall,
+              zone_active: frame.threat.active,
+            });
+            if (record.length > RECORD_LEN) record.splice(0, record.length - RECORD_LEN);
+          }
           setHistory((prev) => {
             const last = prev[prev.length - 1];
             if (last && last.tick === frame.tick) return prev;
@@ -83,6 +126,7 @@ export function useBridge() {
             return [...prev.slice(-(HISTORY_LEN - 1)), sample];
           });
           break;
+        }
         case "LOG_EVENT":
           setLogs((prev) => [...prev.slice(-(MAX_LOGS - 1)), { ...frame, id: ++idRef.current }]);
           break;
@@ -160,6 +204,7 @@ export function useBridge() {
   }, []);
 
   const clearLogs = useCallback(() => setLogs([]), []);
+  const getRecord = useCallback(() => recordRef.current.slice(), []);
 
-  return { wsStatus, snapshot, history, logs, animations, send, clearLogs, pushLog };
+  return { wsStatus, snapshot, history, logs, animations, send, clearLogs, pushLog, getRecord };
 }

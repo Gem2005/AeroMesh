@@ -8,7 +8,7 @@ import {
   type BridgeCommand,
   type Snapshot,
 } from "@/lib/mesh";
-import { Badge, HudButton, Panel, Stat, type Tone } from "@/components/ui";
+import { Badge, HudButton, Panel, Stat } from "@/components/ui";
 import type { InteractionMode } from "@/components/NodeOrchestrator";
 
 export type ZoneChannelChoice = "active" | 1 | 6 | 11;
@@ -68,12 +68,6 @@ function SpectrumChart({
   );
 }
 
-const MISSION_TONES: Record<string, Tone> = {
-  LOITERING: "slate",
-  DISPATCHED: "amber",
-  BRIDGING_ACTIVE: "violet",
-};
-
 export default function RfControlPanel({
   snapshot,
   connected,
@@ -97,7 +91,6 @@ export default function RfControlPanel({
 }) {
   const net = snapshot?.network;
   const threat = snapshot?.threat;
-  const ap = snapshot?.autopilot;
   const activeChannel = net?.channel ?? 6;
   const placing = mode === "place_zone";
   const switching = threat?.acs_state === "SWITCHING" || threat?.acs_state === "SCANNING";
@@ -108,7 +101,7 @@ export default function RfControlPanel({
   const fhss = (ch: number) => send({ type: "EXECUTE_FHSS", target_channel: ch });
 
   return (
-    <aside className="hud-scroll flex min-h-0 flex-col overflow-y-auto border-l border-slate-800 bg-[#0b101c]">
+    <div className="hud-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
       <Panel
         title="RF Interference Simulator"
         right={threat?.active ? <Badge tone="red" pulse>ZONE ACTIVE</Badge> : <Badge>STANDBY</Badge>}
@@ -234,31 +227,6 @@ export default function RfControlPanel({
           />
         </div>
       </Panel>
-
-      <Panel
-        title="MAVLink Relay Monitor"
-        right={<Badge tone={MISSION_TONES[ap?.mission_state ?? "LOITERING"]} pulse={ap?.mission_state === "DISPATCHED"}>{ap?.mission_state ?? "--"}</Badge>}
-        className="shrink-0 border-t border-slate-800"
-      >
-        <div className="space-y-1 p-3">
-          <div className="mb-1.5 flex items-center justify-between rounded border border-violet-500/30 bg-violet-500/5 px-2 py-1 text-[10px]">
-            <span className="text-violet-300">
-              UDP {ap?.mavlink_host ?? "127.0.0.1"}:{ap?.mavlink_port ?? 14550}
-            </span>
-            <span className="text-slate-500">{ap?.mavlink_backend ?? "--"} · v2</span>
-          </div>
-          <Stat label="ASSET" value={ap?.id ?? "UAV-RELAY-01"} tone="text-violet-200" />
-          <Stat label="COMMAND" value={ap?.last_command ?? "HEARTBEAT"} />
-          <Stat label="RELAY POS" value={fmtCoord(ap?.coords)} />
-          <Stat label="WP-ALPHA" value={fmtCoord(ap?.target_waypoint)} tone="text-sky-300" />
-          <Stat label="ALTITUDE" value={`${(ap?.alt_m ?? 60).toFixed(1)} m AGL`} />
-          <Stat label="GROUND SPEED" value={`${(ap?.speed_mps ?? 0).toFixed(1)} / ${(ap?.cruise_speed_mps ?? 18).toFixed(0)} m/s`} />
-          <Stat label="BEARING" value={`${(ap?.bearing_deg ?? 0).toFixed(0)}°`} />
-          <Stat label="ETA" value={ap?.eta_s != null && ap.mission_state === "DISPATCHED" ? `${ap.eta_s.toFixed(0)} s` : "--"} />
-          <Stat label="ISOLATED / BRIDGED" value={`${ap?.isolated_count ?? 0} / ${ap?.bridged_count ?? 0}`} />
-          <Stat label="WAYPOINTS / PACKETS" value={`${ap?.waypoint_count ?? 0} / ${ap?.packet_count ?? 0}`} />
-        </div>
-      </Panel>
-    </aside>
+    </div>
   );
 }

@@ -19,13 +19,20 @@ import {
   BLEED_RATIO,
   DEFAULT_CENTER,
   DEFAULT_ZOOM,
-  RELAY_ID,
+  FLIGHT_MODE_COLORS,
+  FLIGHT_STATE_LABEL,
   STATUS_COLORS,
+  batteryColor,
+  isUavId,
   roleLabel,
+  type FleetState,
+  type FlightMode,
+  type HoldReason,
   type LatLng,
   type MeshNodeState,
   type NodeStatus,
   type Snapshot,
+  type UavState,
 } from "@/lib/mesh";
 import type { ActiveAnimation } from "@/lib/useBridge";
 import type { InteractionMode } from "@/components/NodeOrchestrator";
@@ -88,38 +95,66 @@ function edgeIcon(status: NodeStatus, selected: boolean) {
   });
 }
 
-function virtualIcon(status: NodeStatus, selected: boolean) {
-  return cachedIcon(`v:${status}:${selected}`, () => {
+const HOLD_COLORS: Record<HoldReason, string> = {
+  LOST_LINK: "#f43f5e",
+  RECONNECTING: "#38bdf8",
+};
+
+function virtualIcon(status: NodeStatus, selected: boolean, hold: HoldReason | null) {
+  return cachedIcon(`v:${status}:${selected}:${hold}`, () => {
     const c = status === "ONLINE" ? "#2dd4bf" : STATUS_COLORS[status];
+    const holdFrame = hold
+      ? `<rect x="1" y="1" width="22" height="22" rx="2" fill="none" stroke="${HOLD_COLORS[hold]}" stroke-width="1.4" stroke-dasharray="3 2"/>`
+      : "";
     return L.divIcon({
       className: "",
       html: `<div class="mk mk-virtual mk-${status.toLowerCase()}${selected ? " mk-selected" : ""}" style="--mk:${c}">
-        <svg viewBox="0 0 20 20" width="20" height="20">
-          <path d="M10 2 L18 17 L10 12.6 L2 17 Z" fill="${c}" fill-opacity="0.85" stroke="${c}" stroke-width="1.2" stroke-linejoin="round"/>
+        <svg viewBox="0 0 24 24" width="24" height="24">
+          ${holdFrame}
+          <path d="M12 4 L20 19 L12 14.6 L4 19 Z" fill="${c}" fill-opacity="0.85" stroke="${c}" stroke-width="1.2" stroke-linejoin="round"/>
         </svg>
       </div>`,
-      iconSize: [20, 20],
-      iconAnchor: [10, 10],
+      iconSize: [24, 24],
+      iconAnchor: [12, 12],
     });
   });
 }
 
-function relayIcon(state: string) {
-  return cachedIcon(`relay:${state}`, () =>
-    L.divIcon({
+function uavIcon(mode: FlightMode, airborne: boolean, selected: boolean, alert: boolean) {
+  return cachedIcon(`uav:${mode}:${airborne}:${selected}:${alert}`, () => {
+    const c = FLIGHT_MODE_COLORS[mode];
+    const size = airborne ? 36 : 26;
+    const rotor = alert ? "#f43f5e" : "#38bdf8";
+    return L.divIcon({
       className: "",
-      html: `<div class="mk mk-relay${state !== "LOITERING" ? " mk-relay-active" : ""}">
-        <svg viewBox="0 0 40 40" width="40" height="40">
-          <g stroke="#a78bfa" stroke-width="2" fill="none">
+      html: `<div class="mk mk-relay${airborne ? " mk-relay-active" : " mk-offline"}${selected ? " mk-selected" : ""}" style="--mk:${c}">
+        <svg viewBox="0 0 40 40" width="${size}" height="${size}">
+          <g stroke="${c}" stroke-width="2" fill="none">
             <line x1="11" y1="11" x2="29" y2="29"/><line x1="29" y1="11" x2="11" y2="29"/>
-            <circle cx="11" cy="11" r="5" stroke="#38bdf8"/><circle cx="29" cy="11" r="5" stroke="#38bdf8"/>
-            <circle cx="11" cy="29" r="5" stroke="#38bdf8"/><circle cx="29" cy="29" r="5" stroke="#38bdf8"/>
+            <circle cx="11" cy="11" r="5" stroke="${rotor}"/><circle cx="29" cy="11" r="5" stroke="${rotor}"/>
+            <circle cx="11" cy="29" r="5" stroke="${rotor}"/><circle cx="29" cy="29" r="5" stroke="${rotor}"/>
           </g>
-          <rect x="15.5" y="15.5" width="9" height="9" rx="2" fill="#7c3aed" stroke="#c4b5fd" stroke-width="1.2"/>
+          <rect x="15.5" y="15.5" width="9" height="9" rx="2" fill="${c}" fill-opacity="0.55" stroke="#ede9fe" stroke-width="1.2"/>
         </svg>
       </div>`,
-      iconSize: [40, 40],
-      iconAnchor: [20, 20],
+      iconSize: [size, size],
+      iconAnchor: [size / 2, size / 2],
+    });
+  });
+}
+
+function slotIcon() {
+  return cachedIcon("slot", () =>
+    L.divIcon({
+      className: "",
+      html: `<div class="mk" style="--mk:#a78bfa;cursor:default">
+        <svg viewBox="0 0 16 16" width="16" height="16">
+          <polygon points="8,1 15,8 8,15 1,8" fill="none" stroke="#a78bfa" stroke-width="1.4" stroke-dasharray="2 1.5"/>
+          <circle cx="8" cy="8" r="1.6" fill="#a78bfa"/>
+        </svg>
+      </div>`,
+      iconSize: [16, 16],
+      iconAnchor: [8, 8],
     }),
   );
 }
@@ -148,7 +183,7 @@ function crosshairIcon(kind: "wp" | "est") {
 function nodeIcon(n: MeshNodeState, selected: boolean) {
   if (n.role === "gateway") return gatewayIcon(n.status, selected);
   if (n.role === "edge") return edgeIcon(n.status, selected);
-  return virtualIcon(n.status, selected);
+  return virtualIcon(n.status, selected, n.holding ? n.hold_reason : null);
 }
 
 function linkColor(quality: number) {
@@ -196,11 +231,65 @@ const NodeMarker = memo(function NodeMarker({
             {node.status} · CH {node.channel} · {node.rssi !== null ? `${node.rssi.toFixed(0)} dBm` : "--"} ·{" "}
             {node.reachable ? `${node.hop_count} hop(s)` : "no route"}
           </div>
+          {node.holding && (
+            <div style={{ color: node.hold_reason ? HOLD_COLORS[node.hold_reason] : undefined }}>
+              {node.hold_reason === "RECONNECTING" ? "RECONNECTING · resuming orbit" : "LOST LINK · holding position"}
+              {node.lost_link_s !== null ? ` · ${node.lost_link_s.toFixed(0)} s` : ""}
+            </div>
+          )}
         </div>
       </Tooltip>
     </Marker>
   );
 });
+
+const UavMarker = memo(function UavMarker({
+  uav,
+  cfg,
+  selected,
+  pinLabel,
+  onNodeClick,
+}: {
+  uav: UavState;
+  cfg: FleetState["config"];
+  selected: boolean;
+  pinLabel: boolean;
+  onNodeClick: (id: string) => void;
+}) {
+  const handlers = useMemo(() => ({ click: () => onNodeClick(uav.id) }), [uav.id, onNodeClick]);
+  const airborne = uav.flight_state !== "LANDED";
+  const alert = uav.failsafe !== null || uav.battery_pct <= cfg.relief_battery_pct;
+  const permanent = selected || (airborne && pinLabel && uav.dist_home_m > PAD_LABEL_CLEARANCE_M);
+  return (
+    <Marker
+      position={uav.coords}
+      icon={uavIcon(uav.mode, airborne, selected, alert)}
+      eventHandlers={handlers}
+      zIndexOffset={airborne ? 2000 : 900}
+    >
+      <Tooltip
+        key={permanent ? "pinned" : "hover"}
+        permanent={permanent}
+        direction="bottom"
+        offset={[0, 14]}
+        className="hud-tooltip hud-tooltip-violet"
+      >
+        <span className="font-mono text-[10px]">
+          {uav.id} · {uav.mode} · {airborne ? `${uav.alt_m.toFixed(0)} m` : FLIGHT_STATE_LABEL[uav.flight_state]}
+          {uav.slot_label ? ` · ${uav.slot_label}` : ""}
+          {" · "}
+          <span style={{ color: batteryColor(uav.battery_pct, cfg) }}>{uav.battery_pct.toFixed(0)}%</span>
+          {uav.failsafe ? ` · ${uav.failsafe}` : ""}
+        </span>
+      </Tooltip>
+    </Marker>
+  );
+});
+
+/** Above this many airborne UAVs, labels show on hover only to keep the map readable. */
+const PINNED_LABEL_LIMIT = 12;
+/** UAVs climbing out of / descending onto the pad cluster stay hover-only so labels don't stack. */
+const PAD_LABEL_CLEARANCE_M = 80;
 
 /* ------------------------------------------------------------------ */
 /* Main map                                                            */
@@ -213,6 +302,7 @@ function MeshMap({
   draftPolygon,
   zonePreviewRadius,
   selectedId,
+  selectedUavId,
   onMapClick,
   onNodeClick,
 }: {
@@ -222,6 +312,7 @@ function MeshMap({
   draftPolygon: LatLng[];
   zonePreviewRadius: number;
   selectedId: string | null;
+  selectedUavId: string | null;
   onMapClick: (p: LatLng) => void;
   onNodeClick: (id: string) => void;
 }) {
@@ -229,16 +320,28 @@ function MeshMap({
   const fittedRef = useRef(false);
 
   const nodes = useMemo(() => snapshot?.nodes ?? [], [snapshot]);
+  const groundNodes = useMemo(() => nodes.filter((n) => n.type !== "uav"), [nodes]);
   const links = useMemo(() => snapshot?.links ?? [], [snapshot]);
   const threat = snapshot?.threat;
-  const autopilot = snapshot?.autopilot;
+  const fleet = snapshot?.fleet;
+  const swarm = snapshot?.swarm;
+  const gateway = snapshot?.gateway.coords;
+  const uavs = useMemo(() => fleet?.uavs ?? [], [fleet]);
+  const pinLabels = (fleet?.counts.airborne ?? 0) <= PINNED_LABEL_LIMIT;
 
   const coordById = useMemo(() => {
     const m = new Map<string, LatLng>();
     for (const n of nodes) m.set(n.id, n.coords);
-    if (autopilot) m.set(RELAY_ID, autopilot.coords);
+    for (const u of uavs) m.set(u.id, u.coords);
     return m;
-  }, [nodes, autopilot]);
+  }, [nodes, uavs]);
+
+  const ringGapTooWide = useMemo(() => {
+    if (!swarm) return [] as boolean[];
+    return swarm.radii.map((r, i) => (i === 0 ? r : r - swarm.radii[i - 1]) > swarm.link_range_m);
+  }, [swarm]);
+
+  const selectedUav = selectedUavId ? uavs.find((u) => u.id === selectedUavId) : undefined;
 
   const fitAll = useCallback(() => {
     if (!map || coordById.size < 2) return;
@@ -264,8 +367,6 @@ function MeshMap({
     return pts.length >= 2 ? pts : null;
   }, [selectedNode, coordById]);
 
-  const relayDispatched = autopilot && autopilot.mission_state !== "LOITERING" && autopilot.target_waypoint;
-
   return (
     <div className={`relative h-full w-full ${mode !== "none" ? "map-crosshair" : ""}`}>
       <MapContainer
@@ -282,6 +383,43 @@ function MeshMap({
           maxZoom={20}
         />
         <ClickCapture onMapClick={onMapClick} />
+
+        {/* UAV geofence */}
+        {fleet && (
+          <Circle
+            center={fleet.geofence.center}
+            radius={fleet.geofence.radius_m}
+            pathOptions={{
+              color: "#a78bfa",
+              weight: mode === "uav_goto" ? 1.8 : 1,
+              opacity: mode === "uav_goto" ? 0.8 : 0.35,
+              dashArray: "2 8",
+              fill: mode === "uav_goto",
+              fillColor: "#a78bfa",
+              fillOpacity: 0.03,
+            }}
+            interactive={false}
+          />
+        )}
+
+        {/* Orbit rings */}
+        {swarm?.mode === "ORBIT_PATROL" &&
+          gateway &&
+          swarm.radii.map((r, i) => (
+            <Circle
+              key={`ring-${i}`}
+              center={gateway}
+              radius={r}
+              pathOptions={{
+                color: ringGapTooWide[i] ? "#f59e0b" : "#22d3ee",
+                weight: 1.2,
+                opacity: ringGapTooWide[i] ? 0.7 : 0.4,
+                dashArray: "3 7",
+                fill: false,
+              }}
+              interactive={false}
+            />
+          ))}
 
         {/* Deployment polygon */}
         {snapshot?.swarm.polygon && snapshot.swarm.mode === "POLYGON_INFILL" && (
@@ -350,7 +488,7 @@ function MeshMap({
           const a = coordById.get(l.source);
           const b = coordById.get(l.target);
           if (!a || !b) return null;
-          const viaRelay = l.source === RELAY_ID || l.target === RELAY_ID;
+          const viaRelay = isUavId(l.source) || isUavId(l.target);
           return (
             <Polyline
               key={`${l.source}>${l.target}`}
@@ -386,46 +524,76 @@ function MeshMap({
           );
         })}
 
-        {/* Mobile relay */}
-        {relayDispatched && autopilot?.target_waypoint && (
-          <>
+        {/* Relay fleet: home pads, allocator slots, flight paths */}
+        {uavs.map((u) => (
+          <CircleMarker
+            key={`pad-${u.id}`}
+            center={u.home}
+            radius={3}
+            pathOptions={{ color: "#7c3aed", weight: 1, opacity: 0.6, fillColor: "#7c3aed", fillOpacity: 0.25 }}
+            interactive={false}
+          />
+        ))}
+        {fleet?.allocator.slots.map((s) => (
+          <Marker key={`slot-${s.label}`} position={s.coords} icon={slotIcon()} zIndexOffset={1100}>
+            <Tooltip direction="top" offset={[0, -8]} className="hud-tooltip hud-tooltip-violet">
+              RELAY SLOT {s.label}
+            </Tooltip>
+          </Marker>
+        ))}
+        {uavs.map((u) =>
+          u.target && u.flight_state !== "LANDED" ? (
             <Polyline
-              positions={[autopilot.coords, autopilot.target_waypoint]}
-              pathOptions={{ color: "#38bdf8", weight: 1.8, dashArray: "6 6", opacity: 0.9 }}
+              key={`path-${u.id}`}
+              positions={[u.coords, u.target]}
+              pathOptions={{
+                color: u.id === selectedUavId ? "#38bdf8" : FLIGHT_MODE_COLORS[u.mode],
+                weight: u.id === selectedUavId ? 2.2 : 1.3,
+                dashArray: "6 6",
+                opacity: u.id === selectedUavId ? 0.95 : 0.55,
+              }}
               interactive={false}
             />
-            <Marker position={autopilot.target_waypoint} icon={crosshairIcon("wp")} interactive={false} zIndexOffset={1200}>
-              <Tooltip permanent direction="right" offset={[16, 0]} className="hud-tooltip hud-tooltip-sky">
-                WP-ALPHA · {autopilot.alt_m.toFixed(0)} m
-              </Tooltip>
-            </Marker>
-          </>
+          ) : null,
         )}
-
-        {nodes.map((n) => (
-          <NodeMarker key={n.id} node={n} selected={n.id === selectedId} onNodeClick={onNodeClick} />
-        ))}
-
-        {autopilot && (
-          <Marker position={autopilot.coords} icon={relayIcon(autopilot.mission_state)} zIndexOffset={2000}>
-            <Tooltip
-              key={autopilot.mission_state === "LOITERING" ? "hover" : "pinned"}
-              permanent={autopilot.mission_state !== "LOITERING"}
-              direction="bottom"
-              offset={[0, 16]}
-              className="hud-tooltip hud-tooltip-violet"
-            >
-              {RELAY_ID} · {autopilot.mission_state}
+        {selectedUav?.target && selectedUav.flight_state !== "LANDED" && (
+          <Marker position={selectedUav.target} icon={crosshairIcon("wp")} interactive={false} zIndexOffset={1200}>
+            <Tooltip permanent direction="right" offset={[16, 0]} className="hud-tooltip hud-tooltip-sky">
+              {selectedUav.id} TARGET · {selectedUav.cruise_alt_m.toFixed(0)} m
+              {selectedUav.eta_s !== null ? ` · ETA ${selectedUav.eta_s.toFixed(0)} s` : ""}
             </Tooltip>
           </Marker>
         )}
+
+        {groundNodes.map((n) => (
+          <NodeMarker key={n.id} node={n} selected={n.id === selectedId} onNodeClick={onNodeClick} />
+        ))}
+
+        {fleet &&
+          uavs.map((u) => (
+            <UavMarker
+              key={u.id}
+              uav={u}
+              cfg={fleet.config}
+              selected={u.id === selectedUavId}
+              pinLabel={pinLabels}
+              onNodeClick={onNodeClick}
+            />
+          ))}
       </MapContainer>
 
       {mode !== "none" && (
         <div className="pointer-events-none absolute left-1/2 top-3 z-[1000] -translate-x-1/2 rounded border border-amber-500/50 bg-[#0a0e17]/90 px-3 py-1.5 text-[10px] font-semibold tracking-wider text-amber-200">
           {mode === "draw_polygon"
             ? "DRAW COVERAGE AREA: click to add vertices, then FINISH AREA"
-            : `PLACE INTERFERENCE ZONE: click map (primary ${zonePreviewRadius} m / fringe ${Math.round(zonePreviewRadius * BLEED_RATIO)} m)`}
+            : mode === "uav_goto"
+              ? `FLY ${selectedUavId ?? "UAV"} TO: click inside the ${fleet?.geofence.radius_m ?? 1500} m geofence`
+              : `PLACE INTERFERENCE ZONE: click map (primary ${zonePreviewRadius} m / fringe ${Math.round(zonePreviewRadius * BLEED_RATIO)} m)`}
+        </div>
+      )}
+      {(swarm?.holding_count ?? 0) > 0 && (
+        <div className="pointer-events-none absolute left-3 top-3 z-[1000] rounded border border-rose-500/40 bg-[#0a0e17]/90 px-2.5 py-1 text-[10px] font-semibold tracking-wider text-rose-200">
+          {swarm?.holding_count} NODE{swarm?.holding_count === 1 ? "" : "S"} HOLDING POSITION (LOST LINK)
         </div>
       )}
 
@@ -440,7 +608,8 @@ function MeshMap({
         <div className="rounded border border-slate-800 bg-[#0a0e17]/90 px-2.5 py-1.5 text-[9.5px] leading-relaxed text-slate-400">
           <div><span className="text-amber-300">◆</span> HW EDGE &nbsp;<span className="text-yellow-300">⬢</span> GATEWAY</div>
           <div><span className="text-teal-300">▲</span> ONLINE <span className="text-amber-300">▲</span> DEGRADED <span className="text-rose-400">▲</span> JAMMED</div>
-          <div><span className="text-violet-300">✚</span> RELAY &nbsp;<span className="text-cyan-300">━</span> DIJKSTRA LINK</div>
+          <div><span className="text-rose-400">⬚</span> LOST-LINK HOLD <span className="text-sky-300">⬚</span> RECONNECTING</div>
+          <div><span className="text-violet-300">✚</span> RELAY UAV <span className="text-violet-300">◇</span> SLOT &nbsp;<span className="text-cyan-300">━</span> DIJKSTRA LINK</div>
         </div>
       </div>
     </div>
