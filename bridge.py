@@ -2281,7 +2281,7 @@ class FleetManager:
             "allocator": {
                 "clusters": self.clusters,
                 "isolated": len(self.bridge.isolated_ground),
-                "needed": len(self.slots),
+                "needed": sum(1 for s in self.slots if s["kind"] == SLOT_RELAY),
                 "assigned": self.assigned,
                 "shortfall": self.shortfall,
                 "suspended": self.gateway_jammed,
