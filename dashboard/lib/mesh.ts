@@ -16,6 +16,9 @@ export type NodeRole = "gateway" | "edge" | "virtual" | "uav";
 export type PlacementMode = "ORBIT_PATROL" | "POLYGON_INFILL";
 export type AcsState = "IDLE" | "CONFIRMING" | "SWITCHING" | "SCANNING";
 export type HoldReason = "LOST_LINK" | "RECONNECTING";
+/** Interference modes (bridge.py ZONE_MODES). */
+export type ZoneMode = "SPOT" | "BARRAGE" | "SWEEPER";
+export type RfState = "CLEAR" | "DEGRADED" | "JAMMED";
 
 export interface MeshNodeState {
   id: string;
@@ -40,6 +43,15 @@ export interface MeshNodeState {
   holding: boolean;
   hold_reason: HoldReason | null;
   lost_link_s: number | null;
+  /** Last Known Good Position: the only coordinates the gateway may use for a silent node */
+  lkgp: LatLng;
+  /** seconds since the LKGP was last refreshed (0 while reachable) */
+  lkgp_age_s: number;
+  /** stuck on an old channel: it never heard the CH_SWITCH broadcast */
+  stranded: boolean;
+  stranded_s: number | null;
+  /** seconds without a route to the gateway */
+  orphan_s: number | null;
 }
 
 export interface MeshLink {
@@ -77,6 +89,21 @@ export type SignalBand = "excellent" | "good" | "degraded" | "disconnected";
 
 export interface ThreatState {
   active: boolean;
+  mode: ZoneMode;
+  /** wideband: every channel 1..11 is noisy, ACS cannot evade it */
+  barrage: boolean;
+  /** SWEEPER only: seconds until the interference hops to the next channel */
+  sweeper_next_hop_s: number | null;
+  /** nodes still on an old channel awaiting Shepherd burn-through / beacon hunt */
+  stranded_count: number;
+  shepherd_assigned: number;
+  /** a HIGH-MAST UAV is on station above the gateway */
+  mast_active: boolean;
+  mast_uav_id: string | null;
+  /** alias of mast_active: the gateway radio is surviving via the overhead proxy */
+  gateway_protected: boolean;
+  gateway_in_zone: boolean;
+  gateway_rf_state: RfState;
   epicenter: LatLng | null;
   estimated_epicenter: LatLng | null;
   estimation_error_m: number | null;
@@ -119,7 +146,7 @@ export interface SwarmState {
 /** ArduPilot flight modes as used on the MAVLink link. */
 export type FlightMode = "AUTO" | "GUIDED" | "LOITER" | "RTL" | "LAND";
 export type FlightState = "LANDED" | "TAKING_OFF" | "TRANSIT" | "ON_STATION" | "HOLDING" | "RETURNING" | "LANDING";
-export type UavTask = "RELAY" | "RELIEF" | "COVER" | "GOTO";
+export type UavTask = "RELAY" | "RELIEF" | "COVER" | "GOTO" | "SHEPHERD" | "MAST";
 export type Failsafe = "LOW_BATTERY" | "CRITICAL_BATTERY" | "LOST_LINK" | "GEOFENCE";
 export type Airframe = "MULTIROTOR" | "VTOL_FIXED_WING";
 
@@ -226,7 +253,7 @@ export interface CoverageArea {
   members: string[];
 }
 
-export type SlotKind = "RELAY" | "COVER";
+export type SlotKind = "RELAY" | "COVER" | "SHEPHERD" | "MAST";
 
 export interface AllocatorSlot {
   coords: LatLng;
@@ -235,6 +262,12 @@ export interface AllocatorSlot {
   kind: SlotKind;
   size: number;
   assigned_to: string | null;
+  /** MAST slots carry the high-mast altitude; others fly their layer altitude */
+  alt_m: number | null;
+  /** relay waypoint pushed out of the kill radius onto the flanking arc */
+  flanked: boolean;
+  /** original (unsafe) waypoint before flanking */
+  flank_from: LatLng | null;
 }
 
 export interface FleetState {
@@ -244,6 +277,8 @@ export interface FleetState {
     airborne: number;
     bridging: number;
     covering: number;
+    shepherding: number;
+    mast: number;
     landed: number;
     low_battery: number;
     failsafe: number;
@@ -252,12 +287,18 @@ export interface FleetState {
   allocator: {
     clusters: IsolatedCluster[];
     isolated: number;
-    /** relay slots for isolated clusters */
+    /** mission slots (relay + shepherd + mast) */
     needed: number;
     assigned: number;
     shortfall: number;
-    /** gateway jammed: relays cannot restore C2 */
-    suspended: boolean;
+    /** nodes stuck on an old channel or silent inside the zone */
+    stranded_count: number;
+    shepherd_assigned: number;
+    mast_assigned: number;
+    /** HIGH-MAST UAV on station above the gateway */
+    mast_active: boolean;
+    /** Protocol HIGH-MAST engaged: the gateway radio itself is inside the interference */
+    gateway_in_zone: boolean;
     slots: AllocatorSlot[];
     coverage: {
       enabled: boolean;
@@ -282,6 +323,9 @@ export interface FleetState {
     lost_link_s: number;
     relay_range_m: number;
     a2a_range_m: number;
+    shepherd_slant_m: number;
+    mast_alt_m: number;
+    flank_margin_m: number;
   };
   gcs: GcsLinkState;
 }
@@ -301,7 +345,7 @@ export interface Snapshot {
   fleet: FleetState;
 }
 
-export type LogTag = "SERIAL" | "RF-ALERT" | "CH-SWITCH" | "FLEET" | "MAVLINK" | "MSG" | "SYSTEM";
+export type LogTag = "SERIAL" | "RF-ALERT" | "CH-SWITCH" | "SHEPHERD" | "FLEET" | "MAVLINK" | "MSG" | "SYSTEM";
 export type Severity = "info" | "ok" | "warn" | "critical";
 
 export interface LogEventFrame {
@@ -379,8 +423,10 @@ export type BridgeCommand =
       bleed_radius_m: number;
       freq_mhz: number;
       channel: number;
+      mode: ZoneMode;
     }
   | { type: "CLEAR_JAMMER" }
+  | { type: "SET_JAMMER_MODE"; mode: ZoneMode }
   | { type: "SET_ECCM_MODE"; auto: boolean }
   | { type: "EXECUTE_FHSS"; target_channel: number }
   | { type: "REQUEST_SNAPSHOT" };
@@ -401,6 +447,38 @@ export const WIFI_CHANNELS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 export const DEFAULT_CHANNEL = 6;
 /** Fringe radius is scaled from the primary drop radius (200 m -> 450 m). */
 export const BLEED_RATIO = 2.25;
+/** Shepherd UAV air-to-ground burn-through slant range (bridge.py SHEPHERD_BURNTHROUGH_SLANT_M). */
+export const SHEPHERD_SLANT_M = 140;
+/** Protocol HIGH-MAST altitude AGL (bridge.py MAST_ALT_M). */
+export const MAST_ALT_M = 95;
+/** SWEEPER hop interval (bridge.py SWEEPER_INTERVAL_S). */
+export const SWEEPER_INTERVAL_S = 12;
+
+export const ZONE_MODES: ZoneMode[] = ["SPOT", "BARRAGE", "SWEEPER"];
+
+export const ZONE_MODE_META: Record<ZoneMode, { label: string; short: string; color: string; description: string }> = {
+  SPOT: {
+    label: "SPOT (Single-Ch)",
+    short: "SPOT",
+    color: "#f43f5e",
+    description: "20 MHz on one channel (+/- 1 adjacent). Evadable: ACS hops the mesh, stranded nodes recover via Shepherd UAV burn-through or their own beacon hunt.",
+  },
+  BARRAGE: {
+    label: "BARRAGE (Wideband All-Ch)",
+    short: "BARRAGE",
+    color: "#a855f7",
+    description: "Wideband CH 1-11. No clean channel at ground level: triggers Protocol HIGH-MAST over the gateway and pushes relay slots onto flanking arcs around the drop zone.",
+  },
+  SWEEPER: {
+    label: "SWEEPER (Hopping)",
+    short: "SWEEPER",
+    color: "#f59e0b",
+    description: `Reactive hopper: sweeps CH 1 -> 6 -> 11 every ${SWEEPER_INTERVAL_S} s, forcing ACS to keep re-evaluating the clean channel.`,
+  },
+};
+
+/** Ground radius of the Shepherd burn-through cone at a given UAV altitude. */
+export const shepherdFootprintM = (altM: number) => Math.sqrt(Math.max(0, SHEPHERD_SLANT_M ** 2 - altM ** 2));
 
 export const channelFreqMhz = (ch: number) => 2407 + 5 * ch;
 

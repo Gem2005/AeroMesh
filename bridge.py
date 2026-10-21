@@ -197,8 +197,41 @@ ACS_SCAN_DELAY_S = 1.5
 ACS_NON_OVERLAPPING = (1, 6, 11)
 ACS_MIN_SEPARATION = 5  # channels closer than this overlap on 2.4 GHz (20 MHz width)
 ACS_CLEAN_MARGIN_DB = 6.0  # noise within this margin of the base floor counts as clean
+ACS_GATEWAY_EMERGENCY_CONFIRM_S = 2.0  # the gateway's own CCA saturates: evacuate the channel faster
 
 RF_ALERT_MIN_INTERVAL_S = 5.0
+
+# Interference modes. SPOT: one 20 MHz channel (+/- 1 adjacent). BARRAGE: wideband across
+# CH 1..11, so no channel is clean at ground level. SWEEPER: hops CH 1 -> 6 -> 11 every 12 s.
+ZONE_MODE_SPOT = "SPOT"
+ZONE_MODE_BARRAGE = "BARRAGE"
+ZONE_MODE_SWEEPER = "SWEEPER"
+ZONE_MODES = (ZONE_MODE_SPOT, ZONE_MODE_BARRAGE, ZONE_MODE_SWEEPER)
+SWEEPER_INTERVAL_S = 12.0
+SWEEPER_CYCLE = (1, 6, 11)
+
+# Causal node recovery after a channel switch. A node that could not hear the CH_SWITCH
+# broadcast stays on the old channel at its Last Known Good Position (LKGP) until either a
+# Shepherd UAV flies within burn-through slant range on the clean channel, or its own
+# orphan watchdog sweeps the channels and finds a beacon within link range.
+SHEPHERD_BURNTHROUGH_SLANT_M = 140.0   # steep elevation angle beats the local ground noise
+ORPHAN_BEACON_HUNT_S = 45.0            # sim watchdog counted from stranded_since; firmware uses 14 s
+ORPHAN_HUNT_JITTER_MAX_S = 3.0         # per-node random jitter so sweeps don't synchronise
+MISSING_EDGE_WEIGHT_DB = 15.0          # tomography weight of a surviving-parent / silent-child midpoint
+SHEPHERD_PLAN_RADIUS_M = 0.8 * math.sqrt(SHEPHERD_BURNTHROUGH_SLANT_M ** 2 - 60.0 ** 2)  # ~100 m LKGP disc
+
+# Protocol HIGH-MAST: a multirotor climbs over the gateway so the short vertical link keeps
+# the gateway alive inside a kill zone (airborne gateway proxy).
+MAST_ALT_M = 95.0
+MAST_HORIZONTAL_RADIUS_M = 25.0
+MAST_MIN_ALT_M = 80.0
+MAST_BURNTHROUGH_PENALTY_DB = 12.0
+# Wideband barrage: a UAV almost directly overhead gives a ground node a high-angle LOS bonus.
+BARRAGE_VERTICAL_MIN_ALT_M = 85.0
+BARRAGE_VERTICAL_BONUS_DB = 22.0
+BARRAGE_VERTICAL_MIN_ELEV_DEG = 60.0
+# Relay slots inside an active kill radius are pushed out to a safe flanking arc.
+FLANK_MARGIN_M = 40.0
 
 # ------------------------------------------------------------------ #
 # Relay UAV fleet
@@ -334,9 +367,14 @@ TASK_RELAY = "RELAY"
 TASK_RELIEF = "RELIEF"
 TASK_COVER = "COVER"
 TASK_GOTO = "GOTO"
+TASK_SHEPHERD = "SHEPHERD"   # fly over stranded nodes' LKGP and burn the channel handoff through
+TASK_MAST = "MAST"           # Protocol HIGH-MAST: hover over the gateway as an airborne proxy
 
 SLOT_RELAY = "RELAY"
 SLOT_COVER = "COVER"
+SLOT_SHEPHERD = "SHEPHERD"
+SLOT_MAST = "MAST"
+SLOT_TASK = {SLOT_RELAY: TASK_RELAY, SLOT_COVER: TASK_COVER, SLOT_SHEPHERD: TASK_SHEPHERD, SLOT_MAST: TASK_MAST}
 
 FAILSAFE_LOW_BATTERY = "LOW_BATTERY"
 FAILSAFE_CRITICAL_BATTERY = "CRITICAL_BATTERY"
@@ -628,6 +666,17 @@ class MeshNode:
     # RF attenuation state (set by the interference engine)
     rf_state: str = "CLEAR"  # CLEAR | DEGRADED | JAMMED
     rf_penalty_db: float = 0.0
+    # Last Known Good Position: the only coordinates the gateway may use for a silent node.
+    lkgp_lat: float = 0.0
+    lkgp_lng: float = 0.0
+    lkgp_ts: float = 0.0
+    last_reachable_parent_id: str | None = None
+    orphan_since: float | None = None      # sim time the node last lost its route
+    stranded_since: float | None = None    # sim time a channel switch left it on the old channel
+    hunt_jitter_s: float = 0.0             # per-node jitter on the orphan beacon-hunt watchdog
+
+    def __post_init__(self) -> None:
+        self.lkgp_lat, self.lkgp_lng = self.lat, self.lng
 
     @property
     def role(self) -> str:
@@ -648,6 +697,15 @@ class InterferenceZone:
     channel: int
     freq_mhz: int
     deployed_at: float
+    mode: str = ZONE_MODE_SPOT  # SPOT | BARRAGE | SWEEPER
+    last_sweep_at: float = 0.0
+
+    @property
+    def barrage(self) -> bool:
+        return self.mode == ZONE_MODE_BARRAGE
+
+    def affects_channel(self, channel: int) -> bool:
+        return self.barrage or channel == self.channel
 
 
 def virtual_id(index: int) -> str:
@@ -698,6 +756,7 @@ class SwarmSimulator:
                     psi=self.rng.uniform(0, 2 * math.pi),
                     battery_mv=self.rng.uniform(3950, 4180),
                     reachable=True,  # spawns beside the gateway; don't latch a lost-link hold
+                    hunt_jitter_s=self.rng.uniform(0.0, ORPHAN_HUNT_JITTER_MAX_S),
                 )
         for nid in [k for k, n in self.nodes.items() if n.index > count]:
             del self.nodes[nid]
@@ -1305,7 +1364,8 @@ class UavAgent:
         self.sysid: int | None = index + 1 if index + 1 <= UAV_MAX_SYSID else None
         self.home = home
         self.node = MeshNode(id=self.id, type="uav", lat=home[0], lng=home[1])
-        self.cruise_alt_m = UAV_BASE_ALT_M + UAV_ALT_LAYER_STEP_M * ((index - 1) % UAV_ALT_LAYERS)
+        self.default_cruise_alt_m = UAV_BASE_ALT_M + UAV_ALT_LAYER_STEP_M * ((index - 1) % UAV_ALT_LAYERS)
+        self.cruise_alt_m = self.default_cruise_alt_m
         self.cruise_speed_mps = utype.cruise_speed_mps
         self.mode = MODE_AUTO
         self.flight_state = FS_LANDED
@@ -1416,6 +1476,8 @@ class UavAgent:
         goal = None
         if fs in (FS_TRANSIT, FS_ON_STATION) and self.target is not None:
             goal = self.target
+        elif fs == FS_TAKING_OFF and self.target is not None and n.alt_m >= UAV_MESH_MIN_ALT_M:
+            goal = self.target  # clear of the pad: climb diagonally toward the slot instead of vertically
         elif fs == FS_HOLDING and self.hold_pos is not None:
             goal = self.hold_pos
         elif fs == FS_RETURNING:
@@ -1505,11 +1567,14 @@ class FleetManager:
         self.shortfall = 0
         self.assigned = 0
         self.cover_assigned = 0
+        self.shepherd_assigned = 0
+        self.mast_assigned = 0
+        self.mission_slot_count = 0
         self._last_report: tuple | None = None
         self._last_report_at = -1e9
         self._last_cover_report: tuple | None = None
         self._last_cover_report_at = -1e9
-        self.gateway_jammed = False
+        self.gateway_in_zone = False
         self.cover_plan_radius_m = COVER_RADIUS_MARGIN * a2g_cover_radius_m(COVER_PLAN_ALT_M)
         for key in types:
             self.add(1, key, announce=False)
@@ -1584,7 +1649,9 @@ class FleetManager:
         return True, f"{uav_id} removed from fleet ({len(self.uavs)} remaining)"
 
     def release(self, u: UavAgent) -> None:
-        """Drops any relay/relief assignment held by this UAV."""
+        """Drops any relay/relief/shepherd/mast assignment held by this UAV."""
+        if u.task == TASK_MAST:
+            u.cruise_alt_m = u.default_cruise_alt_m  # leave the high-mast layer
         if u.relieving:
             other = self.uavs.get(u.relieving)
             if other is not None:
@@ -1784,6 +1851,18 @@ class FleetManager:
             elif u.task == TASK_COVER:
                 how = f"loitering r={u.utype.loiter_radius_m:.0f} m" if u.loiters else "hovering"
                 self.event(u, "ok", f"{u.id} on station over coverage {u.slot_label} at {u.cruise_alt_m:.0f} m, {how}")
+            elif u.task == TASK_MAST:
+                self.event(
+                    u, "ok",
+                    f"{u.id} HIGH-MAST on station {u.cruise_alt_m:.0f} m above the gateway; vertical burn-through link up, "
+                    f"acting as airborne gateway proxy",
+                )
+            elif u.task == TASK_SHEPHERD:
+                self.event(
+                    u, "ok",
+                    f"{u.id} shepherd over {u.slot_label} LKGP at {u.cruise_alt_m:.0f} m; beaming CH {self.bridge.active_channel} "
+                    f"handoff to stranded nodes within {SHEPHERD_BURNTHROUGH_SLANT_M:.0f} m slant",
+                )
             elif u.task == TASK_GOTO:
                 self.event(u, "ok", f"{u.id} reached Go-To target; holding position")
         elif ev == "LANDED":
@@ -1836,6 +1915,11 @@ class FleetManager:
         elif not self.inside_geofence(u.node.lat, u.node.lng):
             self._trigger_failsafe(u, FAILSAFE_GEOFENCE, False, f"left the {GEOFENCE_RADIUS_M:.0f} m geofence; returning to pad")
         elif u.unreachable_since is not None and now - u.unreachable_since >= UAV_LOST_LINK_S:
+            # While the gateway itself sits in the interference the loss of C2 is the gateway's
+            # fault, not the airframe's: the fleet keeps flying its AUTO mission (HIGH-MAST
+            # especially must be allowed to climb through the jammed layer to reach station).
+            if u.task == TASK_MAST or self.bridge.gateway_in_zone():
+                return
             self._trigger_failsafe(u, FAILSAFE_LOST_LINK, False, f"no C2 route to gateway for {UAV_LOST_LINK_S:.0f} s; returning to pad")
 
     # -- relay allocator --
@@ -1849,27 +1933,113 @@ class FleetManager:
             and u.battery_pct >= UAV_DISPATCH_MIN_BATTERY_PCT
         )
 
+    @staticmethod
+    def _known_pos(n: MeshNode) -> tuple[float, float]:
+        """Coordinates the gateway may legitimately plan with: live if routed, else the LKGP."""
+        return (n.lat, n.lng) if n.reachable else (n.lkgp_lat, n.lkgp_lng)
+
+    def _flank(self, lat: float, lng: float) -> tuple[float, float, tuple[float, float] | None]:
+        """Pushes a waypoint inside the active kill radius out to the safe flanking arc.
+
+        A relay at normal altitude inside the drop zone (on the interfered channel, or in a
+        wideband barrage on any channel) would be jammed itself, so the slot is projected
+        radially from the zone centre to kill_radius_m + FLANK_MARGIN_M.
+        """
+        zone = self.bridge.zone
+        if zone is None or not zone.affects_channel(self.bridge.active_channel):
+            return lat, lng, None
+        d = haversine_m(zone.lat, zone.lng, lat, lng)
+        if d > zone.kill_radius_m:
+            return lat, lng, None
+        gw_lat, gw_lng = self.bridge.gateway_pos
+        bearing = calculate_bearing(zone.lat, zone.lng, lat, lng) if d >= 1.0 else calculate_bearing(zone.lat, zone.lng, gw_lat, gw_lng)
+        flat, flng = destination(zone.lat, zone.lng, zone.kill_radius_m + FLANK_MARGIN_M, bearing)
+        return flat, flng, (lat, lng)
+
+    def _plan_shepherd_slots(self, stranded: list[MeshNode]) -> list[dict]:
+        """Greedy LKGP discs: one Shepherd UAV over each disc burns the handoff through."""
+        b = self.bridge
+        gw_lat, gw_lng = b.gateway_pos
+
+        def xy(lat: float, lng: float) -> tuple[float, float]:
+            return (
+                haversine_m(gw_lat, gw_lng, gw_lat, lng) * (1 if lng >= gw_lng else -1),
+                haversine_m(gw_lat, gw_lng, lat, gw_lng) * (1 if lat >= gw_lat else -1),
+            )
+
+        pts = {n.id: xy(n.lkgp_lat, n.lkgp_lng) for n in stranded}
+        by_id = {n.id: n for n in stranded}
+        r = SHEPHERD_PLAN_RADIUS_M
+        left = set(pts)
+        near = {a: {c for c in left if math.hypot(pts[a][0] - pts[c][0], pts[a][1] - pts[c][1]) <= r} for a in left}
+        groups: list[list[str]] = []
+        while left:
+            seed = max(left, key=lambda a: (len(near[a] & left), -math.hypot(*pts[a]), a))
+            members = sorted(near[seed] & left)
+            left -= set(members)
+            groups.append(members)
+        groups.sort(key=len, reverse=True)
+        slots = []
+        for gi, members in enumerate(groups, start=1):
+            lat = sum(by_id[m].lkgp_lat for m in members) / len(members)
+            lng = sum(by_id[m].lkgp_lng for m in members) / len(members)
+            if not self.inside_geofence(lat, lng):
+                lat, lng = destination(gw_lat, gw_lng, GEOFENCE_RADIUS_M * 0.95, calculate_bearing(gw_lat, gw_lng, lat, lng))
+            slots.append({
+                "kind": SLOT_SHEPHERD, "lat": lat, "lng": lng, "alt_m": None, "cluster": gi, "index": 1, "of": 1,
+                "size": len(members), "label": f"SH-{gi}", "members": members, "flanked": False, "flank_from": None,
+            })
+        return slots
+
     def _plan_slots(self) -> list[dict]:
-        """Relay points for every isolated cluster: one midpoint, or an evenly spaced chain."""
+        """Mission slots in priority order: HIGH-MAST over the gateway, Shepherd discs over
+        stranded LKGPs, then relay points (midpoint or chain) for every isolated cluster."""
         b = self.bridge
         by_id = {n.id: n for n in b.all_nodes()}
-        isolated = [nid for nid in b.isolated_ground if nid in by_id]
+        gw_lat, gw_lng = b.gateway_pos
+        zone = b.zone
+        slots: list[dict] = []
+        self.clusters = []
+
+        # 1. Protocol HIGH-MAST: the gateway itself is inside the interference.
+        if b.gateway_in_zone():
+            slots.append({
+                "kind": SLOT_MAST, "lat": gw_lat, "lng": gw_lng, "alt_m": MAST_ALT_M, "cluster": 0, "index": 1, "of": 1,
+                "size": 1, "label": "MAST-GW", "flanked": False, "flank_from": None,
+            })
+
+        # 2. Shepherd slots for nodes stuck on an old channel. Inside a barrage kill radius no
+        #    channel is clean, so those nodes cannot be retuned until the zone clears.
+        stranded = [
+            n for n in b.all_nodes()
+            if not n.is_gateway and n.channel != b.active_channel
+            and not (n.type == "hardware" and n.reported_status == STATUS_OFFLINE)
+        ]
+        if zone is not None and zone.barrage:
+            stranded = [n for n in stranded if haversine_m(n.lkgp_lat, n.lkgp_lng, zone.lat, zone.lng) > zone.kill_radius_m]
+        slots += self._plan_shepherd_slots(stranded)
+
+        # 3. Relay slots. While the gateway radio is fully jammed every node looks isolated,
+        #    so relay planning waits for the mast (or a channel evacuation) to bring it back.
+        if b.gateway.rf_state == STATUS_JAMMED:
+            return slots
+        isolated = [nid for nid in b.isolated_ground if nid in by_id and by_id[nid].channel == b.active_channel]
         components = nx.connected_components(b.mesh_graph.subgraph(isolated).to_undirected())
         clusters = sorted((list(c) for c in components), key=len, reverse=True)
         anchors = [n for n in b.all_nodes() if n.id in b.ground_paths and n.status != STATUS_JAMMED]
         hop_m = RELAY_CHAIN_SPACING_FACTOR * RELAY_LINK_MAX_M
         a2a_hop_m = RELAY_CHAIN_SPACING_FACTOR * UAV_A2A_MAX_M
-        slots: list[dict] = []
-        self.clusters = []
+        pos = {nid: self._known_pos(by_id[nid]) for nid in isolated}
         for ci, members in enumerate(clusters, start=1):
-            c_lat = sum(by_id[m].lat for m in members) / len(members)
-            c_lng = sum(by_id[m].lng for m in members) / len(members)
+            c_lat = sum(pos[m][0] for m in members) / len(members)
+            c_lng = sum(pos[m][1] for m in members) / len(members)
             # Bridge the shortest gap between the connected mesh and the cluster; the
             # cluster is internally connected, so one bridged member reconnects all of it.
             dist, anchor, entry = min(
-                (haversine_m(a.lat, a.lng, by_id[m].lat, by_id[m].lng), a, by_id[m])
+                (haversine_m(a.lat, a.lng, pos[m][0], pos[m][1]), a, by_id[m])
                 for a in (anchors or [b.gateway]) for m in members
             )
+            entry_pos = pos[entry.id]
             # End relays sit one air-to-ground hop from each side; any middle
             # relays only need the longer air-to-air hop between UAVs.
             if dist <= 2 * hop_m:
@@ -1883,19 +2053,19 @@ class FleetManager:
             self.clusters.append({
                 "id": ci, "size": len(members), "centroid": _coord((c_lat, c_lng)),
                 "anchor_id": anchor.id, "anchor": _coord((anchor.lat, anchor.lng)),
-                "entry_id": entry.id, "entry": _coord((entry.lat, entry.lng)),
+                "entry_id": entry.id, "entry": _coord(entry_pos),
                 "distance_m": round(dist, 1), "relays_needed": k,
             })
             for i, f in enumerate(fractions, start=1):
-                lat = anchor.lat + (entry.lat - anchor.lat) * f
-                lng = anchor.lng + (entry.lng - anchor.lng) * f
+                lat = anchor.lat + (entry_pos[0] - anchor.lat) * f
+                lng = anchor.lng + (entry_pos[1] - anchor.lng) * f
                 if not self.inside_geofence(lat, lng):
-                    gw_lat, gw_lng = b.gateway_pos
                     lat, lng = destination(gw_lat, gw_lng, GEOFENCE_RADIUS_M * 0.95, calculate_bearing(gw_lat, gw_lng, lat, lng))
+                lat, lng, flank_from = self._flank(lat, lng)
                 label = f"C{ci}-R{i}" if k > 1 else f"C{ci}"
                 slots.append({
-                    "kind": SLOT_RELAY, "lat": lat, "lng": lng, "cluster": ci, "index": i, "of": k,
-                    "size": len(members), "label": label,
+                    "kind": SLOT_RELAY, "lat": lat, "lng": lng, "alt_m": None, "cluster": ci, "index": i, "of": k,
+                    "size": len(members), "label": label, "flanked": flank_from is not None, "flank_from": flank_from,
                 })
         return slots
 
@@ -1997,10 +2167,16 @@ class FleetManager:
             eta += UAV_ARM_DELAY_S + u.cruise_alt_m / t.climb_mps
         back = haversine_m(point[0], point[1], u.home[0], u.home[1]) / u.cruise_speed_mps + u.cruise_alt_m / t.descent_mps
         station = u.usable_endurance_s() - eta - back
-        if station < (RELAY_MIN_STATION_S if kind == SLOT_RELAY else COVER_MIN_STATION_S):
+        if station < (COVER_MIN_STATION_S if kind == SLOT_COVER else RELAY_MIN_STATION_S):
             return None
-        if kind == SLOT_RELAY:
-            return eta  # partitions are urgent: fastest arrival wins
+        if kind == SLOT_MAST:
+            # The mast hovers over the gateway for as long as the zone lasts: the healthiest
+            # multirotor wins (a fixed-wing cannot hold a 25 m vertical station).
+            if u.utype.airframe != AIRFRAME_MULTIROTOR:
+                return None
+            return -u.battery_pct + eta / 1000.0
+        if kind in (SLOT_RELAY, SLOT_SHEPHERD):
+            return eta  # partitions and stranded nodes are urgent: fastest arrival wins
         return eta - COVER_ENDURANCE_WEIGHT * station  # persistent duty favours long-endurance airframes
 
     def _pick(self, pool: list[UavAgent], s: dict) -> UavAgent | None:
@@ -2017,50 +2193,63 @@ class FleetManager:
                 u.rtl()
                 self.event(u, "info", f"{u.id} handing off coverage {label} at {u.battery_pct:.0f}% battery; returning to pad")
 
+    MISSION_TASKS = (TASK_RELAY, TASK_SHEPHERD, TASK_MAST)
+
     def allocate(self, now: float) -> None:
         b = self.bridge
-        isolated = bool(b.isolated_ground)
-        self.isolation_streak = self.isolation_streak + 1 if isolated else 0
+        gateway_in_zone = b.gateway_in_zone()
+        # Stranded nodes (old channel / jammed) are invisible to the ground-only Dijkstra pass,
+        # so they and a gateway inside the zone must trigger planning on their own.
+        need = bool(b.isolated_ground) or bool(b.stranded_nodes) or gateway_in_zone
+        self.isolation_streak = self.isolation_streak + 1 if need else 0
         self._update_weak()
-        if isolated and self.isolation_streak < RELAY_DISPATCH_CONFIRM_TICKS:
+        if need and self.isolation_streak < RELAY_DISPATCH_CONFIRM_TICKS:
             return  # wait for the partition to persist before committing aircraft
-        gateway_jammed = b.gateway.status == STATUS_JAMMED
-        if gateway_jammed != self.gateway_jammed:
-            self.gateway_jammed = gateway_jammed
-            if gateway_jammed:
-                b.log_event("FLEET", "critical", "Allocator suspended: gateway is jammed, relays cannot restore C2; change channel or clear the zone")
+        if gateway_in_zone != self.gateway_in_zone:
+            self.gateway_in_zone = gateway_in_zone
+            if gateway_in_zone:
+                b.log_event(
+                    "FLEET", "critical",
+                    f"Protocol HIGH-MAST engaged: gateway radio is {b.gateway.rf_state} inside the interference zone; "
+                    f"dispatching a multirotor to {MAST_ALT_M:.0f} m AGL over the gateway as airborne proxy",
+                )
             else:
-                b.log_event("FLEET", "ok", "Allocator resumed: gateway link restored")
-        if isolated and not gateway_jammed:
-            relay_slots = self._plan_slots()
+                b.log_event("FLEET", "ok", "Protocol HIGH-MAST stood down: gateway radio clear of interference")
+        if need:
+            mission_slots = self._plan_slots()
         else:
-            relay_slots, self.clusters = [], []
-        if gateway_jammed or not self.coverage_enabled:
+            mission_slots, self.clusters = [], []
+        if b.gateway.rf_state == STATUS_JAMMED or not self.coverage_enabled:
             cover_slots, self.cover_groups = [], []
         else:
             cover_slots = self._plan_cover_slots()
-        self.slots = relay_slots + cover_slots
+        self.slots = mission_slots + cover_slots
         self._handoff_low_cover()
 
         holders = [
             u for u in self.uavs.values()
-            if u.task in (TASK_RELAY, TASK_COVER) and u.mode == MODE_AUTO and u.failsafe is None
+            if u.task in (*self.MISSION_TASKS, TASK_COVER) and u.mode == MODE_AUTO and u.failsafe is None
         ]
         prior_relay_holders = sum(1 for u in holders if u.task == TASK_RELAY)
         claimed: dict[int, UavAgent] = {}
         matched: set[str] = set()
-        cover_by_label = {s["label"]: si for si, s in enumerate(self.slots) if s["kind"] == SLOT_COVER}
+        # Sticky-label slots: coverage areas keep their W-label, the mast slot is always MAST-GW.
+        by_label = {s["label"]: si for si, s in enumerate(self.slots) if s["kind"] in (SLOT_COVER, SLOT_MAST)}
         for u in holders:
-            si = cover_by_label.get(u.slot_label) if u.task == TASK_COVER else None
-            if si is not None and si not in claimed:
+            si = by_label.get(u.slot_label) if u.task in (TASK_COVER, TASK_MAST) else None
+            if si is not None and si not in claimed and SLOT_TASK[self.slots[si]["kind"]] == u.task:
                 claimed[si] = u
                 matched.add(u.id)
-        task_of = {SLOT_RELAY: TASK_RELAY, SLOT_COVER: TASK_COVER}
-        match_m = {SLOT_RELAY: 3 * RELAY_WAYPOINT_DEADBAND_M, SLOT_COVER: COVER_MATCH_FACTOR * self.cover_plan_radius_m}
+        match_m = {
+            SLOT_RELAY: 3 * RELAY_WAYPOINT_DEADBAND_M,
+            SLOT_COVER: COVER_MATCH_FACTOR * self.cover_plan_radius_m,
+            SLOT_SHEPHERD: SHEPHERD_PLAN_RADIUS_M,
+            SLOT_MAST: 3 * RELAY_WAYPOINT_DEADBAND_M,
+        }
         pairs = sorted(
             (haversine_m(u.target[0], u.target[1], s["lat"], s["lng"]), u.id, si)
             for u in holders if u.target is not None
-            for si, s in enumerate(self.slots) if task_of[s["kind"]] == u.task
+            for si, s in enumerate(self.slots) if SLOT_TASK[s["kind"]] == u.task
         )
         for d, uid, si in pairs:
             if uid in matched or si in claimed or d > match_m[self.slots[si]["kind"]]:
@@ -2073,9 +2262,9 @@ class FleetManager:
             if si in claimed:
                 continue
             pool = [u for u in self.uavs.values() if u.id not in matched and self._available(u)]
-            pool += [u for u in holders if u.task == TASK_COVER and u.id not in matched]
-            if s["kind"] == SLOT_RELAY:
-                # Isolation outranks weak coverage: a covering UAV may be pulled onto a relay slot.
+            pool += [u for u in holders if u.id not in matched]  # holders whose slot vanished
+            if s["kind"] != SLOT_COVER:
+                # Isolation / stranding / gateway loss outrank weak coverage: a covering UAV may be pulled.
                 pool += [u for u in holders if u.task == TASK_COVER and u.id in matched]
             best = self._pick(pool, s)
             if best is None:
@@ -2083,7 +2272,9 @@ class FleetManager:
             if best.id in matched:
                 lost = next(sj for sj, v in claimed.items() if v is best)
                 del claimed[lost]
-                self.event(best, "warn", f"{best.id} pulled off coverage {self.slots[lost]['label']} for relay slot {s['label']}")
+                self.event(best, "warn", f"{best.id} pulled off coverage {self.slots[lost]['label']} for {s['kind'].lower()} slot {s['label']}")
+            elif best.task is not None:
+                self.release(best)  # stale holder re-tasked: drop the old assignment cleanly
             claimed[si] = best
             matched.add(best.id)
             if s["kind"] == SLOT_RELAY:
@@ -2092,22 +2283,37 @@ class FleetManager:
         for si, u in claimed.items():
             s = self.slots[si]
             point = (s["lat"], s["lng"])
-            task = task_of[s["kind"]]
+            task = SLOT_TASK[s["kind"]]
             first = u.task != task
             u.task = task
             u.slot_label = s["label"]
             u.unmatched_since = None
+            if task == TASK_MAST and u.cruise_alt_m != MAST_ALT_M:
+                u.cruise_alt_m = MAST_ALT_M
             if first or u.target is None or haversine_m(u.target[0], u.target[1], *point) > RELAY_WAYPOINT_DEADBAND_M:
                 self._send_to(u, point, keep_station=not first and task == TASK_COVER)
                 if not first:
-                    if task == TASK_RELAY:
+                    if task in self.MISSION_TASKS:
                         self.bridge.log_event("FLEET", "info", f"{u.id} retargeted {s['label']} -> {point[0]:.5f}, {point[1]:.5f}")
                 elif task == TASK_RELAY:
                     self.event(
                         u, "warn",
                         f"{u.id} ({u.utype.key}) -> {s['label']} ({point[0]:.5f}, {point[1]:.5f}, {u.cruise_alt_m:.0f} m) "
                         f"bridging cluster of {s['size']} isolated node(s)"
-                        + (f"; relay chain hop {s['index']}/{s['of']}" if s["of"] > 1 else ""),
+                        + (f"; relay chain hop {s['index']}/{s['of']}" if s["of"] > 1 else "")
+                        + ("; slot pushed to the perimeter flanking arc around the drop zone" if s.get("flanked") else ""),
+                    )
+                elif task == TASK_MAST:
+                    self.event(
+                        u, "critical",
+                        f"{u.id} ({u.utype.key}) -> {s['label']}: climbing to {MAST_ALT_M:.0f} m AGL over the gateway "
+                        f"({point[0]:.5f}, {point[1]:.5f}) for vertical burn-through",
+                    )
+                elif task == TASK_SHEPHERD:
+                    self.event(
+                        u, "warn",
+                        f"{u.id} ({u.utype.key}) -> shepherd {s['label']} over the LKGP of {s['size']} node(s) stranded on "
+                        f"the old channel ({point[0]:.5f}, {point[1]:.5f}, {u.cruise_alt_m:.0f} m)",
                     )
                 else:
                     self.event(
@@ -2124,7 +2330,7 @@ class FleetManager:
         for u in self.uavs.values():
             idle_auto = u.mode == MODE_AUTO and u.task is None and u.relieving is None and u.airborne \
                 and u.flight_state not in (FS_RETURNING, FS_LANDING, FS_TAKING_OFF)
-            stale_holder = u.task in (TASK_RELAY, TASK_COVER) and u.id not in matched and u.relieving is None
+            stale_holder = u.task in (*self.MISSION_TASKS, TASK_COVER) and u.id not in matched and u.relieving is None
             if not (idle_auto or stale_holder):
                 if u.task is not None:
                     u.unmatched_since = None
@@ -2132,33 +2338,48 @@ class FleetManager:
             u.unmatched_since = u.unmatched_since if u.unmatched_since is not None else now
             hold_s = COVER_RELEASE_HOLD_S if u.task == TASK_COVER else RELAY_RTB_HOLD_S
             if now - u.unmatched_since > hold_s:
-                reason = {TASK_RELAY: "relay slot no longer needed", TASK_COVER: "coverage area recovered"}.get(u.task, "idle")
+                reason = {
+                    TASK_RELAY: "relay slot no longer needed", TASK_COVER: "coverage area recovered",
+                    TASK_SHEPHERD: "stranded nodes retuned; shepherd duty complete",
+                    TASK_MAST: "gateway clear of interference; HIGH-MAST released",
+                }.get(u.task, "idle")
                 self.release(u)
                 u.auto_after_land = True
                 u.rtl()
                 self.event(u, "info", f"{u.id} {reason}; returning to pad")
 
-        relay_claimed = sum(1 for si in claimed if self.slots[si]["kind"] == SLOT_RELAY)
-        self.assigned = relay_claimed
-        self.cover_assigned = len(claimed) - relay_claimed
-        self.shortfall = len(relay_slots) - relay_claimed
+        kind_of = {si: self.slots[si]["kind"] for si in claimed}
+        relay_claimed = sum(1 for k in kind_of.values() if k == SLOT_RELAY)
+        self.shepherd_assigned = sum(1 for k in kind_of.values() if k == SLOT_SHEPHERD)
+        self.mast_assigned = sum(1 for k in kind_of.values() if k == SLOT_MAST)
+        self.assigned = relay_claimed + self.shepherd_assigned + self.mast_assigned
+        self.cover_assigned = len(claimed) - self.assigned
+        self.mission_slot_count = len(mission_slots)
+        self.shortfall = len(mission_slots) - self.assigned
         self._report_coverage(now, len(cover_slots))
-        report = (len(self.clusters), len(relay_slots), self.shortfall)
+        report = (len(self.clusters), len(mission_slots), self.shortfall)
         last = self._last_report or (0, 0, 0)
         state_flip = (bool(report[1]) != bool(last[1])) or (bool(report[2]) != bool(last[2]))
         due = now - self._last_report_at >= ALLOCATOR_REPORT_MIN_INTERVAL_S
         if report != self._last_report and (state_flip or due):
             self._last_report_at = now
-            if relay_slots:
-                text = (
-                    f"Allocator: {len(self.clusters)} isolated cluster(s) need {len(relay_slots)} relay slot(s); "
-                    f"{relay_claimed} assigned"
-                )
+            if mission_slots:
+                n_relay = sum(1 for s in mission_slots if s["kind"] == SLOT_RELAY)
+                n_shep = sum(1 for s in mission_slots if s["kind"] == SLOT_SHEPHERD)
+                n_mast = sum(1 for s in mission_slots if s["kind"] == SLOT_MAST)
+                parts = []
+                if n_relay:
+                    parts.append(f"{len(self.clusters)} isolated cluster(s) need {n_relay} relay slot(s)")
+                if n_shep:
+                    parts.append(f"{len(b.stranded_nodes)} stranded node(s) need {n_shep} shepherd slot(s)")
+                if n_mast:
+                    parts.append("gateway needs a HIGH-MAST proxy")
+                text = f"Allocator: {'; '.join(parts)}; {self.assigned} assigned"
                 if self.shortfall:
-                    text += f"; need {self.shortfall} more relay UAV(s) (add UAVs or recharge the fleet)"
+                    text += f"; need {self.shortfall} more UAV(s) (add UAVs or recharge the fleet)"
                 b.log_event("FLEET", "warn" if self.shortfall else "info", text)
             elif self._last_report and self._last_report[1]:
-                b.log_event("FLEET", "ok", "Allocator: no isolated clusters; relay slots cleared")
+                b.log_event("FLEET", "ok", "Allocator: no isolated clusters or stranded nodes; mission slots cleared")
             self._last_report = report
 
     def _report_coverage(self, now: float, areas: int) -> None:
@@ -2265,7 +2486,8 @@ class FleetManager:
     def to_dict(self) -> dict:
         uavs = list(self.uavs.values())
         gw_lat, gw_lng = self.bridge.gateway_pos
-        holder_of = {u.slot_label: u.id for u in uavs if u.slot_label and u.task in (TASK_RELAY, TASK_COVER)}
+        holder_of = {u.slot_label: u.id for u in uavs if u.slot_label and u.task in (*self.MISSION_TASKS, TASK_COVER)}
+        b = self.bridge
         return {
             "uavs": [self.uav_dict(u) for u in uavs],
             "counts": {
@@ -2273,6 +2495,8 @@ class FleetManager:
                 "airborne": sum(1 for u in uavs if u.airborne),
                 "bridging": sum(1 for u in uavs if u.task in (TASK_RELAY, TASK_RELIEF) and u.flight_state == FS_ON_STATION),
                 "covering": sum(1 for u in uavs if u.task == TASK_COVER and u.flight_state == FS_ON_STATION),
+                "shepherding": sum(1 for u in uavs if u.task == TASK_SHEPHERD),
+                "mast": sum(1 for u in uavs if u.task == TASK_MAST),
                 "by_type": {k: sum(1 for u in uavs if u.utype.key == k) for k in UAV_TYPES},
                 "landed": sum(1 for u in uavs if not u.airborne),
                 "low_battery": sum(1 for u in uavs if u.battery_pct <= UAV_RELIEF_BATTERY_PCT),
@@ -2280,15 +2504,20 @@ class FleetManager:
             },
             "allocator": {
                 "clusters": self.clusters,
-                "isolated": len(self.bridge.isolated_ground),
-                "needed": sum(1 for s in self.slots if s["kind"] == SLOT_RELAY),
+                "isolated": len(b.isolated_ground),
+                "needed": self.mission_slot_count,
                 "assigned": self.assigned,
                 "shortfall": self.shortfall,
-                "suspended": self.gateway_jammed,
+                "stranded_count": len(b.stranded_nodes),
+                "shepherd_assigned": self.shepherd_assigned,
+                "mast_assigned": self.mast_assigned,
+                "mast_active": b.mast_overhead_uav() is not None,
+                "gateway_in_zone": self.gateway_in_zone,
                 "slots": [
                     {
                         "coords": _coord((s["lat"], s["lng"])), "label": s["label"], "cluster": s["cluster"],
                         "kind": s["kind"], "size": s["size"], "assigned_to": holder_of.get(s["label"]),
+                        "alt_m": s.get("alt_m"), "flanked": bool(s.get("flanked")), "flank_from": _coord(s.get("flank_from")),
                     }
                     for s in self.slots
                 ],
@@ -2314,6 +2543,9 @@ class FleetManager:
                 "lost_link_s": UAV_LOST_LINK_S,
                 "relay_range_m": RELAY_LINK_MAX_M,
                 "a2a_range_m": UAV_A2A_MAX_M,
+                "shepherd_slant_m": SHEPHERD_BURNTHROUGH_SLANT_M,
+                "mast_alt_m": MAST_ALT_M,
+                "flank_margin_m": FLANK_MARGIN_M,
             },
             "gcs": self.bridge.mavlink.status_dict(),
         }
@@ -2389,6 +2621,12 @@ class Bridge:
         self.acs_confirm_token = 0
         self.acs_target_channel: int | None = None
         self.self_heal_convergence_ms: float | None = None
+        self.acs_confirm_duration_s = ACS_CONFIRM_S
+        self._switch_t0: float | None = None       # perf counter of the last channel switch
+        self._switch_sim_t = 0.0
+        self._switch_old_channel: int | None = None
+        self._barrage_acs_notice = False
+        self.stranded_nodes: set[str] = set()
         self._last_rf_counts = (0, 0)
         self._last_rf_alert_at = 0.0
 
@@ -2507,10 +2745,37 @@ class Bridge:
             return None
         return ground_rssi_nominal(d) + self.rng.gauss(0, RSSI_SIGMA)
 
+    def advance_sweeper(self) -> None:
+        """SWEEPER mode: the interference hops CH 1 -> 6 -> 11 every SWEEPER_INTERVAL_S."""
+        zone = self.zone
+        if zone is None or zone.mode != ZONE_MODE_SWEEPER:
+            return
+        now = time.monotonic()
+        if now - zone.last_sweep_at < SWEEPER_INTERVAL_S:
+            return
+        idx = SWEEPER_CYCLE.index(zone.channel) if zone.channel in SWEEPER_CYCLE else -1
+        prev = zone.channel
+        zone.channel = SWEEPER_CYCLE[(idx + 1) % len(SWEEPER_CYCLE)]
+        zone.freq_mhz = channel_freq_mhz(zone.channel)
+        zone.last_sweep_at = now
+        self._last_rf_counts = (0, 0)
+        self.log_event(
+            "RF-ALERT", "warn",
+            f"SWEEPER hopped CH {prev} -> CH {zone.channel} ({zone.freq_mhz} MHz)"
+            + ("; mesh channel is now inside the sweep" if zone.channel == self.active_channel else ""),
+        )
+
+    def sweeper_next_hop_s(self) -> float | None:
+        zone = self.zone
+        if zone is None or zone.mode != ZONE_MODE_SWEEPER:
+            return None
+        return max(0.0, SWEEPER_INTERVAL_S - (time.monotonic() - zone.last_sweep_at))
+
     def compute_spectrum(self) -> dict[str, float]:
         spectrum = {}
+        zone = self.zone
         for ch in WIFI_CHANNELS:
-            if self.zone is not None and abs(ch - self.zone.channel) <= 1:
+            if zone is not None and (zone.barrage or abs(ch - zone.channel) <= 1):
                 spectrum[str(ch)] = INTERFERED_NOISE_DBM + self.rng.uniform(-1.5, 1.5)
             else:
                 spectrum[str(ch)] = BASE_NOISE_FLOOR_DBM + self.rng.uniform(-1.0, 1.0)
@@ -2521,22 +2786,73 @@ class Bridge:
             return False
         return n.rf_state != STATUS_JAMMED
 
+    def mast_uavs(self) -> list["UavAgent"]:
+        fleet = getattr(self, "fleet", None)
+        if fleet is None:
+            return []
+        return [u for u in fleet.uavs.values() if u.task == TASK_MAST and u.in_mesh and u.node.alt_m >= MAST_MIN_ALT_M]
+
+    def mast_overhead_uav(self) -> "UavAgent | None":
+        """The HIGH-MAST UAV on station above the gateway (vertical burn-through link), if any."""
+        gw_lat, gw_lng = self.gateway_pos
+        for u in self.mast_uavs():
+            if haversine_m(gw_lat, gw_lng, u.node.lat, u.node.lng) <= MAST_HORIZONTAL_RADIUS_M:
+                return u
+        return None
+
+    def _overhead_uav_bonus(self, n: MeshNode, uavs: list[MeshNode]) -> bool:
+        """BARRAGE: a UAV almost straight overhead at >= 85 m gives a high-angle LOS bonus."""
+        for un in uavs:
+            if un.alt_m < BARRAGE_VERTICAL_MIN_ALT_M:
+                continue
+            horiz = haversine_m(n.lat, n.lng, un.lat, un.lng)
+            if math.degrees(math.atan2(un.alt_m, max(horiz, 0.1))) >= BARRAGE_VERTICAL_MIN_ELEV_DEG:
+                return True
+        return False
+
     def apply_rf_environment(self, nodes: list[MeshNode]) -> None:
-        """Dual-zone attenuation physics: primary drop zone + proportional fringe penalty."""
+        """Dual-zone attenuation physics: primary drop zone + proportional fringe penalty.
+
+        Vertical burn-through exceptions keep a node linked inside the kill radius:
+        the HIGH-MAST UAV itself, the gateway under an on-station Mast UAV, and (in a
+        wideband barrage) a ground node with a UAV almost directly overhead.
+        """
         self.interference_reports = []
         zone = self.zone
         for n in nodes:
             n.rf_state = "CLEAR"
             n.rf_penalty_db = 0.0
-            if zone is None or n.channel != zone.channel:
+        if zone is None:
+            self.estimated_epicenter = None
+            return
+        mast_overhead = self.mast_overhead_uav()
+        mast_ids = {u.id for u in self.mast_uavs()}
+        high_uavs = [n for n in nodes if n.type == "uav" and n.alt_m >= BARRAGE_VERTICAL_MIN_ALT_M]
+        for n in nodes:
+            if not zone.affects_channel(n.channel):
                 continue
             d = haversine_m(n.lat, n.lng, zone.lat, zone.lng)
             if d <= zone.kill_radius_m:
-                n.rf_state = STATUS_JAMMED
+                if n.id in mast_ids or (n.is_gateway and mast_overhead is not None):
+                    n.rf_state = STATUS_DEGRADED
+                    n.rf_penalty_db = MAST_BURNTHROUGH_PENALTY_DB
+                elif zone.barrage and n.type != "uav" and self._overhead_uav_bonus(n, high_uavs):
+                    n.rf_state = STATUS_DEGRADED
+                    n.rf_penalty_db = max(0.0, FRINGE_MAX_PENALTY_DB - BARRAGE_VERTICAL_BONUS_DB)
+                else:
+                    n.rf_state = STATUS_JAMMED
             elif d <= zone.bleed_radius_m:
                 penalty = ((zone.bleed_radius_m - d) / (zone.bleed_radius_m - zone.kill_radius_m)) * FRINGE_MAX_PENALTY_DB
+                if n.type == "uav" and n.alt_m > 0:
+                    # A ground-based source radiates least toward the zenith: an airborne receiver
+                    # in the fringe sees the penalty shrink with its elevation angle above the source.
+                    penalty *= 1.0 - min(1.0, math.degrees(math.atan2(n.alt_m, max(d, 1.0))) / 90.0)
+                if n.is_gateway and mast_overhead is not None:
+                    penalty = min(penalty, MAST_BURNTHROUGH_PENALTY_DB)
                 n.rf_state = STATUS_DEGRADED
                 n.rf_penalty_db = penalty
+                if not (n.reachable or n.is_gateway):
+                    continue  # a fringe node without a route cannot deliver its report
                 noise_floor = BASE_NOISE_FLOOR_DBM + (penalty / FRINGE_MAX_PENALTY_DB) * (INTERFERED_NOISE_DBM - BASE_NOISE_FLOOR_DBM)
                 self.interference_reports.append({
                     "type": "INTERFERENCE_REPORT",
@@ -2548,17 +2864,37 @@ class Bridge:
         self.estimated_epicenter = self.estimate_epicenter(nodes)
 
     def estimate_epicenter(self, nodes: list[MeshNode]) -> tuple[float, float] | None:
-        """Weighted centroid of degraded perimeter reports (weight = observed attenuation)."""
+        """Strict no-cheat tomography of the interference centre.
+
+        Only observable evidence is used: (1) fringe reports from degraded nodes that still
+        have a route, weighted by their attenuation; (2) missing-edge midpoints between a
+        surviving parent's live position and its silent child's LKGP; (3) as a last resort
+        the centroid of the silent nodes' LKGPs. The live coordinates of JAMMED / OFFLINE
+        nodes are never read -- the gateway cannot hear them.
+        """
         if self.zone is None:
             return None
-        total_w = sum(r["penalty_db"] for r in self.interference_reports)
+        silent_states = (STATUS_JAMMED, STATUS_OFFLINE)
+        silent = [
+            n for n in nodes
+            if not n.is_gateway and n.type != "uav"
+            and (n.rf_state == STATUS_JAMMED or n.status in silent_states or not n.reachable)
+        ]
+        # Fringe reports come from nodes that still have a route; their coords are observable.
+        samples = [(r["coords"][0], r["coords"][1], r["penalty_db"]) for r in self.interference_reports]
+        # Missing-edge tomography: the link died somewhere between a surviving parent and its
+        # last known child position, so the midpoint is evidence of the attenuation boundary.
+        by_id = {n.id: n for n in nodes}
+        for n in silent:
+            parent = by_id.get(n.last_reachable_parent_id or "")
+            if parent is None or not parent.reachable or parent.status in silent_states:
+                continue
+            samples.append(((parent.lat + n.lkgp_lat) / 2, (parent.lng + n.lkgp_lng) / 2, MISSING_EDGE_WEIGHT_DB))
+        total_w = sum(w for _, _, w in samples)
         if total_w > 0:
-            lat = sum(r["coords"][0] * r["penalty_db"] for r in self.interference_reports) / total_w
-            lng = sum(r["coords"][1] * r["penalty_db"] for r in self.interference_reports) / total_w
-            return lat, lng
-        jammed = [n for n in nodes if n.rf_state == STATUS_JAMMED]
-        if jammed:
-            return sum(n.lat for n in jammed) / len(jammed), sum(n.lng for n in jammed) / len(jammed)
+            return sum(la * w for la, _, w in samples) / total_w, sum(ln * w for _, ln, w in samples) / total_w
+        if silent:
+            return sum(n.lkgp_lat for n in silent) / len(silent), sum(n.lkgp_lng for n in silent) / len(silent)
         return None
 
     def recompute_topology(self) -> None:
@@ -2576,6 +2912,7 @@ class Bridge:
         for un in uav_nodes:
             un.channel = self.active_channel
         graph_nodes = [*nodes, *uav_nodes]
+        self.advance_sweeper()
         self.spectrum_noise = self.compute_spectrum()
         self.apply_rf_environment(graph_nodes)
 
@@ -2619,6 +2956,14 @@ class Bridge:
         self.mesh_graph = g
         self.paths = paths
         self.update_node_states(graph_nodes, best_neighbor)
+        # Stranded: stuck on an old channel, or silent (jammed / no route). Both need a UAV
+        # or the node's own watchdog to recover; the gateway cannot command them.
+        self.stranded_nodes = {
+            n.id for n in nodes
+            if not n.is_gateway
+            and not (n.type == "hardware" and n.reported_status == STATUS_OFFLINE)
+            and (n.channel != self.active_channel or n.status == STATUS_JAMMED or not n.reachable)
+        }
         self.compute_metrics(nodes)
 
     def _try_link(self, g: nx.DiGraph, a: MeshNode, b: MeshNode, best_neighbor: dict[str, float]) -> None:
@@ -2646,11 +2991,19 @@ class Bridge:
         best_neighbor[b.id] = max(best_neighbor.get(b.id, -999.0), rssi)
 
     def update_node_states(self, nodes: list[MeshNode], best_neighbor: dict[str, float]) -> None:
+        t = self.swarm.t
         for n in nodes:
             path = self.paths.get(n.id)
             n.reachable = path is not None
             n.hop_path = list(path) if path else []
             n.parent_id = path[-2] if path and len(path) >= 2 else None
+            # LKGP datum: the gateway only learns a node's position while it has a route to it.
+            if n.reachable:
+                n.lkgp_lat, n.lkgp_lng, n.lkgp_ts = n.lat, n.lng, t
+                n.last_reachable_parent_id = n.parent_id
+                n.orphan_since = None
+            else:
+                n.orphan_since = n.orphan_since if n.orphan_since is not None else t
             if n.is_gateway:
                 if n.rf_state == STATUS_JAMMED:
                     n.status = STATUS_JAMMED
@@ -2729,6 +3082,7 @@ class Bridge:
         self.fleet.update_homes()
         self.fleet.step(SIM_TICK_S)
         self.recompute_topology()
+        self.evaluate_shepherd_and_hunt()
         self.evaluate_rf_alerts()
         self.evaluate_acs()
         self.fleet.evaluate()
@@ -2771,9 +3125,11 @@ class Bridge:
                 self._last_rf_alert_at = now
                 est = self.estimated_epicenter
                 est_txt = f"; est. center {est[0]:.5f}, {est[1]:.5f}" if est else ""
+                where = "BARRAGE CH 1-11" if self.zone.barrage else f"{self.zone.mode} CH {self.zone.channel}"
+                stranded = len(self.stranded_nodes)
                 self.log_event(
                     "RF-ALERT", "critical" if jammed else "warn",
-                    f"CH {self.zone.channel}: {jammed} node(s) in primary drop zone, {degraded} degraded "
+                    f"{where}: {jammed} node(s) in primary drop zone, {degraded} degraded, {stranded} stranded/silent "
                     f"({len(self.interference_reports)} interference reports{est_txt})",
                 )
             self._last_rf_counts = counts
@@ -2796,17 +3152,56 @@ class Bridge:
             channel = self.active_channel
         if channel not in WIFI_CHANNELS:
             raise ValueError(f"channel {channel} outside 1-11")
+        mode = str(msg.get("mode", ZONE_MODE_SPOT)).upper()
+        if mode not in ZONE_MODES:
+            raise ValueError(f"interference mode {mode!r} not in {ZONE_MODES}")
+        if mode == ZONE_MODE_SWEEPER and channel not in SWEEPER_CYCLE:
+            channel = min(SWEEPER_CYCLE, key=lambda c: abs(c - channel))
+        now = time.monotonic()
         self.zone = InterferenceZone(
             lat=lat, lng=lng, kill_radius_m=kill, bleed_radius_m=bleed,
-            channel=channel, freq_mhz=channel_freq_mhz(channel), deployed_at=time.monotonic(),
+            channel=channel, freq_mhz=channel_freq_mhz(channel), deployed_at=now, mode=mode, last_sweep_at=now,
         )
         self._last_rf_counts = (0, 0)
+        self._barrage_acs_notice = False
         self.log_event(
             "RF-ALERT", "critical",
-            f"Interference zone placed at {lat:.5f}, {lng:.5f} on CH {channel} ({channel_freq_mhz(channel)} MHz): "
+            f"{self._zone_mode_text()} interference zone placed at {lat:.5f}, {lng:.5f}: "
             f"primary drop {kill:.0f} m / fringe {bleed:.0f} m",
         )
-        self.notify_phones(f"[RF-ALERT] Interference detected on CH {channel}")
+        self.notify_phones(f"[RF-ALERT] {mode} interference detected" + ("" if mode == ZONE_MODE_BARRAGE else f" on CH {channel}"))
+
+    def _zone_mode_text(self) -> str:
+        z = self.zone
+        if z is None:
+            return "no"
+        if z.barrage:
+            return "BARRAGE (wideband CH 1-11)"
+        if z.mode == ZONE_MODE_SWEEPER:
+            return f"SWEEPER (hopping 1/6/11 every {SWEEPER_INTERVAL_S:.0f} s, now CH {z.channel})"
+        return f"SPOT CH {z.channel} ({z.freq_mhz} MHz)"
+
+    def set_zone_mode(self, mode: str) -> None:
+        mode = str(mode).upper()
+        if mode not in ZONE_MODES:
+            raise ValueError(f"interference mode {mode!r} not in {ZONE_MODES}")
+        z = self.zone
+        if z is None:
+            raise ValueError("no interference zone active")
+        if z.mode == mode:
+            return
+        prev = z.mode
+        z.mode = mode
+        z.last_sweep_at = time.monotonic()
+        if mode == ZONE_MODE_SWEEPER and z.channel not in SWEEPER_CYCLE:
+            z.channel = min(SWEEPER_CYCLE, key=lambda c: abs(c - z.channel))
+            z.freq_mhz = channel_freq_mhz(z.channel)
+        self._last_rf_counts = (0, 0)
+        self._barrage_acs_notice = False
+        if self.acs_state == ACS_CONFIRMING:
+            self._cancel_confirmation(f"interference mode changed {prev} -> {mode}")
+        self.log_event("RF-ALERT", "critical", f"Interference mode {prev} -> {mode}: now {self._zone_mode_text()}")
+        self.notify_phones(f"[RF-ALERT] Interference mode now {mode}")
 
     def clear_zone(self) -> None:
         if self.zone is None:
@@ -2814,6 +3209,7 @@ class Bridge:
         self.zone = None
         self.estimated_epicenter = None
         self._last_rf_counts = (0, 0)
+        self._barrage_acs_notice = False
         if self.acs_state == ACS_CONFIRMING:
             self._cancel_confirmation("interference zone cleared")
         self.log_event("RF-ALERT", "ok", "Interference zone cleared; spectrum nominal")
@@ -2837,7 +3233,10 @@ class Bridge:
     def fhss_countdown_s(self) -> float | None:
         if self.acs_state != ACS_CONFIRMING or self.acs_confirm_started is None:
             return None
-        return max(0.0, ACS_CONFIRM_S - (time.monotonic() - self.acs_confirm_started))
+        return max(0.0, self.acs_confirm_duration_s - (time.monotonic() - self.acs_confirm_started))
+
+    def gateway_in_zone(self) -> bool:
+        return self.zone is not None and self.gateway.rf_state in (STATUS_JAMMED, STATUS_DEGRADED)
 
     def _cancel_confirmation(self, reason: str) -> None:
         self.acs_state = ACS_IDLE
@@ -2849,31 +3248,56 @@ class Bridge:
     def evaluate_acs(self) -> None:
         jammed, degraded = self.rf_counts()
         affected = jammed + degraded
-        zone_on_channel = self.zone is not None and self.zone.channel == self.active_channel
-        if self.acs_state == ACS_IDLE:
-            if self.acs_auto and zone_on_channel and affected >= ACS_TRIGGER_COUNT:
-                self.acs_state = ACS_CONFIRMING
-                self.acs_confirm_started = time.monotonic()
-                self.acs_target_channel = self.choose_clean_channel()
-                self.acs_confirm_token += 1
+        zone = self.zone
+        if zone is not None and zone.barrage:
+            # Wideband barrage: every channel is noisy at ground level, so hopping is pointless.
+            # Recovery falls to Protocol HIGH-MAST and perimeter flanking instead.
+            if self.acs_state == ACS_CONFIRMING:
+                self._cancel_confirmation("BARRAGE covers every channel; ACS cannot evade it")
+            if self.acs_auto and affected and not self._barrage_acs_notice:
+                self._barrage_acs_notice = True
                 self.log_event(
                     "CH-SWITCH", "warn",
-                    f"ACS: {affected} node(s) disconnected/degraded on CH {self.active_channel}; "
-                    f"confirming for {ACS_CONFIRM_S:.1f}s before switching to CH {self.acs_target_channel}",
+                    "ACS: wideband BARRAGE detected on CH 1-11; no clean channel exists. "
+                    "Holding channel; HIGH-MAST gateway proxy and relay flanking arcs take over",
                 )
-                self._spawn(self._confirm_then_switch(self.acs_confirm_token))
+            return
+        self._barrage_acs_notice = False
+        zone_on_channel = zone is not None and zone.channel == self.active_channel
+        gateway_hit = zone_on_channel and self.gateway.rf_state in (STATUS_JAMMED, STATUS_DEGRADED)
+        if self.acs_state == ACS_IDLE:
+            if self.acs_auto and zone_on_channel and (affected >= ACS_TRIGGER_COUNT or gateway_hit):
+                self.acs_state = ACS_CONFIRMING
+                self.acs_confirm_started = time.monotonic()
+                self.acs_confirm_duration_s = ACS_GATEWAY_EMERGENCY_CONFIRM_S if gateway_hit else ACS_CONFIRM_S
+                self.acs_target_channel = self.choose_clean_channel()
+                self.acs_confirm_token += 1
+                if gateway_hit:
+                    self.log_event(
+                        "CH-SWITCH", "critical",
+                        f"ACS: gateway radio reports CCA noise saturation on CH {self.active_channel} "
+                        f"({self.gateway.rf_state}); EMERGENCY channel evacuation to CH {self.acs_target_channel} "
+                        f"in {self.acs_confirm_duration_s:.1f}s",
+                    )
+                else:
+                    self.log_event(
+                        "CH-SWITCH", "warn",
+                        f"ACS: {affected} node(s) disconnected/degraded on CH {self.active_channel}; "
+                        f"confirming for {self.acs_confirm_duration_s:.1f}s before switching to CH {self.acs_target_channel}",
+                    )
+                self._spawn(self._confirm_then_switch(self.acs_confirm_token, self.acs_confirm_duration_s))
         elif self.acs_state == ACS_CONFIRMING:
             if not self.acs_auto:
                 self._cancel_confirmation("switched to MANUAL mode")
-            elif not zone_on_channel or affected < ACS_TRIGGER_COUNT:
+            elif not zone_on_channel or (affected < ACS_TRIGGER_COUNT and not gateway_hit):
                 self._cancel_confirmation("signal degradation subsided")
 
-    async def _confirm_then_switch(self, token: int) -> None:
-        await asyncio.sleep(ACS_CONFIRM_S)
+    async def _confirm_then_switch(self, token: int, delay_s: float = ACS_CONFIRM_S) -> None:
+        await asyncio.sleep(delay_s)
         if self.acs_state != ACS_CONFIRMING or token != self.acs_confirm_token:
             return
         target = self.choose_clean_channel()
-        await self.execute_channel_switch(target, "AUTO_CLEAN")
+        await self.execute_channel_switch(target, "GATEWAY_EVACUATION" if self.gateway_in_zone() else "AUTO_CLEAN")
 
     async def execute_channel_switch(self, target: int, reason: str) -> None:
         if target not in WIFI_CHANNELS:
@@ -2903,55 +3327,183 @@ class Bridge:
         # 1. Tell the physical ESP32 mesh (and their phones) about the new channel.
         self.serial_send(f"CH_SWITCH:{target}|{reason}")
 
-        # 2. Move every active node to the new channel.
+        # 2. The CH_SWITCH broadcast is an over-the-air frame: only nodes that currently have a
+        #    route and are not inside the drop zone can hear it. Everyone else stays on the old
+        #    channel at its LKGP and must be recovered causally (Shepherd UAV or its own watchdog).
         self.active_channel = target
-        moved = 0
+        self.gateway.channel = target
+        for u in self.fleet.uavs.values():
+            if u.airborne:
+                u.node.channel = target
+        moved, stranded = 0, 0
+        t_sim = self.swarm.t
         for n in self.all_nodes():
-            if n.channel == old and n.status != STATUS_JAMMED and not (n.type == "hardware" and n.reported_status == STATUS_OFFLINE):
-                n.channel = target
-                moved += 1
+            if n.type == "hardware" and n.reported_status == STATUS_OFFLINE:
+                continue  # not on the air at all
+            if n.is_gateway or (n.reachable and n.status != STATUS_JAMMED):
+                if n.channel != target:
+                    n.channel = target
+                    n.stranded_since = None
+                    moved += 1
+            elif n.channel != target:
+                n.stranded_since = n.stranded_since if n.stranded_since is not None else t_sim
+                stranded += 1
+        self._switch_t0 = t0
+        self._switch_sim_t = t_sim
+        self._switch_old_channel = old
+        self.self_heal_convergence_ms = None
         self.recompute_topology()
-        await self.broadcast_snapshot()
-        self.log_event("CH-SWITCH", "info", f"{moved} active node(s) retuned to CH {target}; scanning for stragglers")
-
-        # 3. After the scan delay, pull the disconnected nodes onto the clean channel.
-        self.acs_state = ACS_SCANNING
-        await asyncio.sleep(ACS_SCAN_DELAY_S)
-        recovered = 0
-        for n in self.all_nodes():
-            if n.channel == old and not (n.type == "hardware" and n.reported_status == STATUS_OFFLINE):
-                n.channel = target
-                recovered += 1
-        self.recompute_topology()
-
-        # 4. Record self-healing convergence.
-        self.self_heal_convergence_ms = (time.perf_counter() - t0) * 1000.0
-        members = [n for n in self.all_nodes() if not n.is_gateway]
-        reachable = sum(1 for n in members if n.reachable)
         self.acs_state = ACS_IDLE
         self.acs_target_channel = None
+        if stranded:
+            self.log_event(
+                "CH-SWITCH", "warn",
+                f"{moved} node(s) heard the CH_SWITCH broadcast and retuned to CH {target}; "
+                f"{stranded} silent node(s) stranded on CH {old} at their LKGP -- awaiting Shepherd UAV "
+                f"burn-through (<= {SHEPHERD_BURNTHROUGH_SLANT_M:.0f} m slant) or autonomous beacon hunt "
+                f"(>= {ORPHAN_BEACON_HUNT_S:.0f} s silence)",
+            )
+        else:
+            self.log_event("CH-SWITCH", "info", f"{moved} node(s) retuned to CH {target} over the air; no stragglers")
+        self.evaluate_shepherd_and_hunt()
+        await self.broadcast_snapshot()
+
+    # ------------------------------------------------------------------ #
+    # Causal recovery of nodes stranded on an old channel
+    # ------------------------------------------------------------------ #
+    def _hunt_beacon_in_range(self, n: MeshNode, beacons: list[MeshNode], uavs: list["UavAgent"]) -> MeshNode | None:
+        """A reachable radio on the active channel that this node's sweep would hear."""
+        zone = self.zone
+        if zone is not None and zone.affects_channel(self.active_channel):
+            if haversine_m(n.lat, n.lng, zone.lat, zone.lng) <= zone.kill_radius_m:
+                return None  # the sweep hears only noise on every candidate channel
+        for b in beacons:
+            if b.id != n.id and haversine_m(n.lat, n.lng, b.lat, b.lng) <= LINK_MAX_M:
+                return b
+        for u in uavs:
+            if math.hypot(haversine_m(n.lat, n.lng, u.node.lat, u.node.lng), u.node.alt_m) <= RELAY_LINK_MAX_M:
+                return u.node
+        return None
+
+    def evaluate_shepherd_and_hunt(self) -> None:
+        """Every tick: Shepherd burn-through and the orphan beacon-hunt watchdog for stranded nodes."""
+        target = self.active_channel
+        stranded = [
+            n for n in self.all_nodes()
+            if not n.is_gateway and n.channel != target
+            and not (n.type == "hardware" and n.reported_status == STATUS_OFFLINE)
+        ]
+        zone = self.zone
+        if not stranded:
+            self._finish_convergence()
+            return
+        airborne = [u for u in self.fleet.uavs.values() if u.in_mesh and u.node.channel == target]
+        beacons = [
+            n for n in self.all_nodes()
+            if n.channel == target and (n.is_gateway or n.reachable) and n.status not in (STATUS_JAMMED, STATUS_OFFLINE)
+        ]
+        # A Shepherd already tasked (or still inbound this tick, before allocate() refreshes
+        # shepherd_assigned) must be allowed to finish the flyover. Hunt is the fallback only
+        # when no UAV is on that duty -- i.e. the fleet is empty, landed, or otherwise unavailable.
+        shepherd_inbound = self.fleet.shepherd_assigned > 0 or any(
+            u.task == TASK_SHEPHERD for u in self.fleet.uavs.values()
+        )
+        t = self.swarm.t
+        retuned = 0
+        for n in stranded:
+            # (a) Shepherd UAV proximity burn-through: steep slant path beats the ground noise.
+            hit = None
+            for u in airborne:
+                slant = math.hypot(haversine_m(n.lkgp_lat, n.lkgp_lng, u.node.lat, u.node.lng), u.node.alt_m)
+                if slant <= SHEPHERD_BURNTHROUGH_SLANT_M and (hit is None or slant < hit[1]):
+                    hit = (u, slant)
+            if hit is not None:
+                u, slant = hit
+                n.channel = target
+                n.stranded_since = None
+                retuned += 1
+                self.log_event(
+                    "SHEPHERD", "ok",
+                    f"[SHEPHERD] {u.id} burned through RF noise over {n.id} (slant {slant:.0f} m) -> retuned {n.id} to CH {target}",
+                )
+                continue
+            # (b) Autonomous firmware beacon hunt, counted from the channel switch (stranded_since),
+            #     never from orphan_since -- a node jammed for minutes would otherwise hunt at 0 s
+            #     and self-heal via ground neighbours before any UAV leaves the pad.
+            if n.stranded_since is None:
+                continue
+            elapsed = t - n.stranded_since
+            timeout = ORPHAN_BEACON_HUNT_S + n.hunt_jitter_s
+            if elapsed < timeout:
+                continue
+            if shepherd_inbound:
+                continue  # UAV is already flying to the LKGP; do not steal the recovery
+            beacon = self._hunt_beacon_in_range(n, beacons, airborne)
+            if beacon is None:
+                continue
+            n.channel = target
+            n.stranded_since = None
+            retuned += 1
+            self.log_event(
+                "CH-SWITCH", "ok",
+                f"[CH-SWITCH] {n.id} autonomous beacon-hunt locked onto CH {target} after {elapsed:.0f} s "
+                f"of silence (beacon {beacon.id})",
+            )
+        if retuned:
+            self.recompute_topology()
+        remaining = [
+            n for n in stranded if n.channel != target
+            and not (zone is not None and zone.barrage and haversine_m(n.lat, n.lng, zone.lat, zone.lng) <= zone.kill_radius_m)
+        ]
+        if not remaining:
+            self._finish_convergence()
+
+    def _finish_convergence(self) -> None:
+        if self._switch_t0 is None:
+            return
+        # Wall clock for a sub-second over-the-air switch; sim ticks once Shepherd / hunt recovery took part.
+        self.self_heal_convergence_ms = max(
+            (time.perf_counter() - self._switch_t0) * 1000.0,
+            (self.swarm.t - self._switch_sim_t) * 1000.0,
+        )
+        members = [n for n in self.all_nodes() if not n.is_gateway]
+        reachable = sum(1 for n in members if n.reachable)
         elapsed_s = self.self_heal_convergence_ms / 1000.0
+        old = self._switch_old_channel
+        self._switch_t0 = None
+        self._switch_old_channel = None
         if reachable == len(members):
             self.log_event(
                 "CH-SWITCH", "ok",
-                f"Self-healing converged in {elapsed_s:.2f} s on CH {target}: "
-                f"{recovered} node(s) recovered, {reachable}/{len(members)} reachable via Dijkstra",
+                f"Self-healing converged in {elapsed_s:.2f} s: every node left CH {old} for CH {self.active_channel}; "
+                f"{reachable}/{len(members)} reachable via Dijkstra",
             )
         else:
             self.log_event(
                 "CH-SWITCH", "warn",
-                f"Channel switch settled in {elapsed_s:.2f} s on CH {target}, but only "
-                f"{reachable}/{len(members)} node(s) reachable; CH {target} is still impaired",
+                f"Channel recovery settled in {elapsed_s:.2f} s on CH {self.active_channel}; "
+                f"{reachable}/{len(members)} node(s) reachable, the rest sit inside the drop zone",
             )
-        await self.broadcast_snapshot()
 
     def threat_dict(self) -> dict:
         jammed, degraded = self.rf_counts()
         z = self.zone
         est = self.estimated_epicenter
         countdown = self.fhss_countdown_s()
+        mast = self.mast_overhead_uav()
+        sweep = self.sweeper_next_hop_s()
         return {
             "active": z is not None,
+            "mode": z.mode if z else ZONE_MODE_SPOT,
+            "barrage": bool(z and z.barrage),
+            "sweeper_next_hop_s": round(sweep, 1) if sweep is not None else None,
+            "stranded_count": sum(1 for n in self.all_nodes() if not n.is_gateway and n.channel != self.active_channel),
+            "shepherd_assigned": self.fleet.shepherd_assigned,
+            "mast_active": mast is not None,
+            "mast_uav_id": mast.id if mast else None,
+            "gateway_protected": mast is not None,
+            "gateway_in_zone": self.gateway_in_zone(),
+            "gateway_rf_state": self.gateway.rf_state,
             "epicenter": [z.lat, z.lng] if z else None,
             "estimated_epicenter": [round(est[0], 7), round(est[1], 7)] if est else None,
             "estimation_error_m": round(haversine_m(z.lat, z.lng, est[0], est[1]), 1) if (z and est) else None,
@@ -2966,7 +3518,7 @@ class Bridge:
             "acs_state": self.acs_state,
             "acs_target_channel": self.acs_target_channel,
             "fhss_countdown_s": round(countdown, 2) if countdown is not None else None,
-            "fhss_confirm_s": ACS_CONFIRM_S,
+            "fhss_confirm_s": self.acs_confirm_duration_s if countdown is not None else ACS_CONFIRM_S,
         }
 
     async def sim_loop(self):
@@ -3021,6 +3573,11 @@ class Bridge:
             "holding": n.hold_pos is not None,
             "hold_reason": n.hold_reason,
             "lost_link_s": round(self.swarm.t - n.lost_link_since, 1) if n.lost_link_since is not None else None,
+            "lkgp": [round(n.lkgp_lat, 7), round(n.lkgp_lng, 7)],
+            "lkgp_age_s": round(self.swarm.t - n.lkgp_ts, 1) if not n.reachable else 0.0,
+            "stranded": (not n.is_gateway) and n.channel != self.active_channel,
+            "stranded_s": round(self.swarm.t - n.stranded_since, 1) if n.stranded_since is not None else None,
+            "orphan_s": round(self.swarm.t - n.orphan_since, 1) if n.orphan_since is not None else None,
         }
 
     def network_dict(self) -> dict:
@@ -3243,6 +3800,13 @@ class Bridge:
             return True
         if mtype == "CLEAR_JAMMER":
             self.clear_zone()
+            return True
+        if mtype == "SET_JAMMER_MODE":
+            try:
+                self.set_zone_mode(str(msg["mode"]))
+            except ValueError as exc:
+                self.log_event("RF-ALERT", "warn", f"Interference mode rejected: {exc}")
+                return False
             return True
         if mtype == "SET_ECCM_MODE":
             self.acs_auto = bool(msg["auto"])
@@ -3499,6 +4063,7 @@ class Bridge:
             channel=self.active_channel,
             last_seen=time.monotonic(),
             proj_distance_m=display_distance(None, node_id),
+            hunt_jitter_s=self.rng.uniform(0.0, ORPHAN_HUNT_JITTER_MAX_S),
         )
         self.hw_nodes[node_id] = hw
         return hw

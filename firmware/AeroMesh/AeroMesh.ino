@@ -69,6 +69,12 @@ void setup() {
       html += "<h1>AeroMesh Tactical Edge</h1>";
       html += "<p style='font-size:20px; color:#94a3b8;'>Node " + String(mesh.getNodeId()) + "</p>";
       html += "<p style='display:inline-block; font-size:22px; background:#064e3b; color:#6ee7b7; padding:10px 18px; border-radius:8px;'>Channel " + String(activeChannel) + "</p>";
+      // Orphan channel-hunt watchdog status: how long since the hub was last heard
+      unsigned long beaconAgeMs = millis() - lastGatewayBeaconMs;
+      bool hunting = beaconAgeMs > ORPHAN_HUNT_MS;
+      html += "<p style='display:inline-block; margin-left:12px; font-size:18px; padding:8px 14px; border-radius:8px; background:" + String(hunting ? "#7f1d1d" : "#1e3a8a") + "; color:" + String(hunting ? "#fecaca" : "#bfdbfe") + ";'>";
+      html += hunting ? "HUNTING CARRIER (beacon lost " + String(beaconAgeMs / 1000) + " s)" : "Hub beacon " + String(beaconAgeMs / 1000) + " s ago";
+      html += "</p>";
       html += "<h2 style='color:#f87171;'>Latest Hub Message:</h2>";
       html += "<p style='font-size:32px; background:#1e293b; padding:20px; border-radius:10px;'>" + htmlEscape(latestPacket) + "</p>";
       html += "<hr style='border-color:#334155; margin:30px 0;'>";

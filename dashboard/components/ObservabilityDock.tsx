@@ -10,6 +10,7 @@ const TAG_COLORS: Record<LogTag, string> = {
   SERIAL: "text-sky-300",
   "RF-ALERT": "text-rose-400",
   "CH-SWITCH": "text-emerald-300",
+  SHEPHERD: "text-teal-300",
   FLEET: "text-violet-300",
   MAVLINK: "text-violet-300",
   MSG: "text-amber-300",

@@ -2,13 +2,18 @@
 
 import {
   BLEED_RATIO,
+  MAST_ALT_M,
+  SHEPHERD_SLANT_M,
   WIFI_CHANNELS,
+  ZONE_MODES,
+  ZONE_MODE_META,
   channelFreqMhz,
   fmtCoord,
   type BridgeCommand,
   type Snapshot,
+  type ZoneMode,
 } from "@/lib/mesh";
-import { Badge, HudButton, Panel, Stat } from "@/components/ui";
+import { Badge, HudButton, Panel, Stat, type Tone } from "@/components/ui";
 import type { InteractionMode } from "@/components/NodeOrchestrator";
 
 export type ZoneChannelChoice = "active" | 1 | 6 | 11;
@@ -16,14 +21,18 @@ export type ZoneChannelChoice = "active" | 1 | 6 | 11;
 const NOISE_MIN = -95;
 const NOISE_MAX = -30;
 
+const MODE_TONE: Record<ZoneMode, Tone> = { SPOT: "red", BARRAGE: "violet", SWEEPER: "amber" };
+
 function SpectrumChart({
   noise,
   activeChannel,
   zoneChannel,
+  barrage,
 }: {
   noise: Record<string, number>;
   activeChannel: number;
   zoneChannel: number | null;
+  barrage: boolean;
 }) {
   const W = 220;
   const H = 110;
@@ -50,7 +59,7 @@ function SpectrumChart({
         const bw = slot * 0.64;
         const y = toY(v);
         const isActive = ch === activeChannel;
-        const color = v > -60 ? "#f43f5e" : v > -80 ? "#f59e0b" : isActive ? "#22d3ee" : "#334155";
+        const color = v > -60 ? (barrage ? "#a855f7" : "#f43f5e") : v > -80 ? "#f59e0b" : isActive ? "#22d3ee" : "#334155";
         return (
           <g key={ch}>
             <title>{`CH ${ch} (${channelFreqMhz(ch)} MHz): ${v.toFixed(1)} dBm`}</title>
@@ -58,12 +67,17 @@ function SpectrumChart({
               <rect x={x - 2} y={2} width={bw + 4} height={plotH + 4} fill="#22d3ee" fillOpacity={0.04} stroke="#22d3ee" strokeOpacity={0.45} strokeWidth={0.6} strokeDasharray="2 2" rx={1.5} />
             )}
             <rect x={x} y={y} width={bw} height={Math.max(1, 4 + plotH - y)} fill={color} rx={1} className="spectrum-bar" />
-            <text x={x + bw / 2} y={H - 5} textAnchor="middle" fontSize="7.5" fill={isActive ? "#67e8f9" : zoneChannel === ch ? "#fb7185" : "#94a3b8"} fontWeight={isActive ? 700 : 400}>
+            <text x={x + bw / 2} y={H - 5} textAnchor="middle" fontSize="7.5" fill={isActive ? "#67e8f9" : barrage || zoneChannel === ch ? "#fb7185" : "#94a3b8"} fontWeight={isActive ? 700 : 400}>
               {ch}
             </text>
           </g>
         );
       })}
+      {barrage && (
+        <text x={padL + plotW / 2} y={12} textAnchor="middle" fontSize="7.5" fill="#d8b4fe" fontWeight={700} letterSpacing="1.5">
+          WIDEBAND BARRAGE CH 1-11
+        </text>
+      )}
     </svg>
   );
 }
@@ -78,6 +92,8 @@ export default function RfControlPanel({
   onZoneRadius,
   zoneChannel,
   onZoneChannel,
+  zoneMode,
+  onZoneMode,
 }: {
   snapshot: Snapshot | null;
   connected: boolean;
@@ -88,15 +104,26 @@ export default function RfControlPanel({
   onZoneRadius: (r: number) => void;
   zoneChannel: ZoneChannelChoice;
   onZoneChannel: (c: ZoneChannelChoice) => void;
+  zoneMode: ZoneMode;
+  onZoneMode: (m: ZoneMode) => void;
 }) {
   const net = snapshot?.network;
   const threat = snapshot?.threat;
+  const fleetCfg = snapshot?.fleet.config;
   const activeChannel = net?.channel ?? 6;
   const placing = mode === "place_zone";
   const switching = threat?.acs_state === "SWITCHING" || threat?.acs_state === "SCANNING";
   const countdown = threat?.fhss_countdown_s ?? null;
   const countdownPct = countdown !== null && threat ? (countdown / threat.fhss_confirm_s) * 100 : 0;
   const auto = threat?.eccm_auto ?? true;
+  /** the live zone's mode wins over the operator's pending selection */
+  const liveMode: ZoneMode = threat?.active ? threat.mode : zoneMode;
+  const barrage = !!threat?.active && threat.barrage;
+  const stranded = threat?.stranded_count ?? 0;
+  const mastActive = !!threat?.mast_active;
+  const gatewayInZone = !!threat?.gateway_in_zone;
+  const shepherdSlant = fleetCfg?.shepherd_slant_m ?? SHEPHERD_SLANT_M;
+  const mastAlt = fleetCfg?.mast_alt_m ?? MAST_ALT_M;
 
   const fhss = (ch: number) => send({ type: "EXECUTE_FHSS", target_channel: ch });
 
@@ -104,7 +131,15 @@ export default function RfControlPanel({
     <div className="hud-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
       <Panel
         title="RF Interference Simulator"
-        right={threat?.active ? <Badge tone="red" pulse>ZONE ACTIVE</Badge> : <Badge>STANDBY</Badge>}
+        right={
+          threat?.active ? (
+            <Badge tone={MODE_TONE[liveMode]} pulse>
+              {ZONE_MODE_META[liveMode].short} ACTIVE
+            </Badge>
+          ) : (
+            <Badge>STANDBY</Badge>
+          )
+        }
         className="shrink-0"
       >
         <div className="space-y-2.5 p-3">
@@ -115,6 +150,33 @@ export default function RfControlPanel({
             <HudButton disabled={!connected || !threat?.active} onClick={() => send({ type: "CLEAR_JAMMER" })}>
               Clear Zone
             </HudButton>
+          </div>
+          <div>
+            <div className="mb-1 flex justify-between text-[10px] tracking-wider text-slate-400">
+              <span>INTERFERENCE MODE</span>
+              {threat?.active && <span className="text-slate-500">live: switches the active zone</span>}
+            </div>
+            <div className="grid grid-cols-3 gap-1" role="radiogroup" aria-label="Interference mode">
+              {ZONE_MODES.map((m) => (
+                <HudButton
+                  key={m}
+                  tone={MODE_TONE[m]}
+                  active={liveMode === m}
+                  disabled={!connected}
+                  onClick={() => onZoneMode(m)}
+                  className="px-1"
+                  title={ZONE_MODE_META[m].description}
+                >
+                  {ZONE_MODE_META[m].short}
+                </HudButton>
+              ))}
+            </div>
+            <p className="mt-1 text-[9.5px] leading-snug text-slate-500">
+              <span className="font-semibold" style={{ color: ZONE_MODE_META[liveMode].color }}>
+                {ZONE_MODE_META[liveMode].label}
+              </span>{" "}
+              — {ZONE_MODE_META[liveMode].description}
+            </p>
           </div>
           <div>
             <div className="mb-1 flex justify-between text-[10px] tracking-wider text-slate-400">
@@ -139,22 +201,51 @@ export default function RfControlPanel({
               <span>500 m</span>
             </div>
           </div>
-          <div>
-            <div className="mb-1 text-[10px] tracking-wider text-slate-400">TARGET CHANNEL</div>
+          <div className={liveMode === "BARRAGE" ? "opacity-40" : ""}>
+            <div className="mb-1 flex justify-between text-[10px] tracking-wider text-slate-400">
+              <span>TARGET CHANNEL</span>
+              {liveMode === "BARRAGE" && <span className="text-slate-500">all channels</span>}
+              {liveMode === "SWEEPER" && <span className="text-slate-500">start of sweep</span>}
+            </div>
             <div className="grid grid-cols-4 gap-1">
               {(["active", 1, 6, 11] as ZoneChannelChoice[]).map((c) => (
-                <HudButton key={String(c)} active={zoneChannel === c} tone="red" onClick={() => onZoneChannel(c)} className="px-1">
+                <HudButton
+                  key={String(c)}
+                  active={zoneChannel === c}
+                  tone="red"
+                  disabled={liveMode === "BARRAGE"}
+                  onClick={() => onZoneChannel(c)}
+                  className="px-1"
+                >
                   {c === "active" ? `MESH ${activeChannel}` : `CH ${c}`}
                 </HudButton>
               ))}
             </div>
           </div>
           {threat?.active && (
-            <div className="rounded border border-rose-500/30 bg-rose-500/5 p-2">
+            <div className={`rounded border p-2 ${barrage ? "border-violet-500/30 bg-violet-500/5" : "border-rose-500/30 bg-rose-500/5"}`}>
               <Stat label="EPICENTER" value={fmtCoord(threat.epicenter)} />
-              <Stat label="EST. CENTER" value={fmtCoord(threat.estimated_epicenter)} tone="text-rose-300" />
-              <Stat label="EST. ERROR" value={threat.estimation_error_m !== null ? `${threat.estimation_error_m.toFixed(0)} m` : "--"} />
-              <Stat label="CHANNEL" value={`CH ${threat.channel} (${threat.freq_mhz} MHz)`} />
+              <Stat label="EST. CENTER (LKGP)" value={fmtCoord(threat.estimated_epicenter)} tone="text-rose-300" />
+              <Stat
+                label="LKGP TRIANGULATION ERROR"
+                value={threat.estimation_error_m !== null ? `${threat.estimation_error_m.toFixed(0)} m` : "--"}
+                tone={threat.estimation_error_m !== null && threat.estimation_error_m > 150 ? "text-amber-300" : "text-slate-200"}
+              />
+              <Stat
+                label="CHANNEL"
+                value={
+                  barrage ? (
+                    <span className="text-violet-300">CH 1-11 wideband</span>
+                  ) : (
+                    <>
+                      CH {threat.channel} ({threat.freq_mhz} MHz)
+                      {threat.sweeper_next_hop_s !== null && (
+                        <span className="text-amber-300"> · hop in {threat.sweeper_next_hop_s.toFixed(0)} s</span>
+                      )}
+                    </>
+                  )
+                }
+              />
               <Stat
                 label="AFFECTED"
                 value={
@@ -167,12 +258,44 @@ export default function RfControlPanel({
               <Stat label="INTERFERENCE REPORTS" value={threat.report_count} />
             </div>
           )}
+
+          <div className="rounded border border-slate-800 bg-slate-900/40 p-2">
+            <div className="mb-1 text-[9px] tracking-[0.2em] text-slate-500">CAUSAL RECOVERY</div>
+            <Stat
+              label="STRANDED ON OLD CH"
+              value={
+                stranded ? (
+                  <span className="text-amber-300">
+                    {stranded} · awaiting {threat?.shepherd_assigned ? `${threat.shepherd_assigned} shepherd` : "shepherd"} / hunt
+                  </span>
+                ) : (
+                  <span className="text-emerald-300">0</span>
+                )
+              }
+            />
+            <Stat
+              label="GATEWAY PROTECTION"
+              value={
+                mastActive ? (
+                  <span className="text-sky-300">HIGH-MAST ACTIVE ({threat?.mast_uav_id} @ {mastAlt.toFixed(0)} m)</span>
+                ) : gatewayInZone ? (
+                  <span className="text-rose-300">GATEWAY {threat?.gateway_rf_state} · MAST INBOUND</span>
+                ) : (
+                  <span className="text-emerald-300">NOMINAL</span>
+                )
+              }
+            />
+            <p className="mt-1 text-[9px] leading-snug text-slate-600">
+              Silent nodes never hear CH_SWITCH: a Shepherd UAV within {shepherdSlant.toFixed(0)} m slant retunes them, or their own
+              watchdog sweeps 1/6/11 after prolonged silence.
+            </p>
+          </div>
         </div>
       </Panel>
 
       <Panel title="2.4 GHz Channel Noise Floor" right={<span className="text-[9px] text-slate-500">dBm</span>} className="shrink-0 border-t border-slate-800">
         <div className="px-2 pb-1 pt-2">
-          <SpectrumChart noise={net?.spectrum_noise ?? {}} activeChannel={activeChannel} zoneChannel={threat?.channel ?? null} />
+          <SpectrumChart noise={net?.spectrum_noise ?? {}} activeChannel={activeChannel} zoneChannel={threat?.channel ?? null} barrage={barrage} />
         </div>
       </Panel>
 
@@ -197,10 +320,21 @@ export default function RfControlPanel({
               <span className={`absolute top-0.5 h-3.5 w-3.5 rounded-full transition-all ${auto ? "left-5 bg-emerald-300" : "left-0.5 bg-slate-400"}`} />
             </button>
           </div>
+          {barrage && (
+            <div className="rounded border border-violet-500/30 bg-violet-500/5 px-2 py-1 text-[9.5px] leading-snug text-violet-200">
+              Wideband barrage: no clean channel exists, ACS holds. Recovery via HIGH-MAST proxy and flanking relays.
+            </div>
+          )}
           <div>
             <div className="mb-1 flex justify-between text-[10px] text-slate-500">
-              <span>{countdown !== null ? `SWITCHING TO CH ${threat?.acs_target_channel} IN` : switching ? "RETUNING MESH..." : "CONFIRMATION TIMER"}</span>
-              <span className="tabular-nums text-slate-300">{countdown !== null ? `${countdown.toFixed(1)} s` : `${threat?.fhss_confirm_s ?? 3}.0 s`}</span>
+              <span>
+                {countdown !== null
+                  ? `${gatewayInZone ? "EMERGENCY EVACUATION" : "SWITCHING"} TO CH ${threat?.acs_target_channel} IN`
+                  : switching
+                    ? "RETUNING MESH..."
+                    : "CONFIRMATION TIMER"}
+              </span>
+              <span className="tabular-nums text-slate-300">{countdown !== null ? `${countdown.toFixed(1)} s` : `${(threat?.fhss_confirm_s ?? 3).toFixed(1)} s`}</span>
             </div>
             <div className="h-1.5 overflow-hidden rounded bg-slate-800">
               <div
@@ -222,8 +356,14 @@ export default function RfControlPanel({
           </div>
           <Stat
             label="LAST CONVERGENCE"
-            value={net?.self_heal_convergence_ms != null ? `${(net.self_heal_convergence_ms / 1000).toFixed(2)} s` : "--"}
-            tone="text-emerald-300"
+            value={
+              net?.self_heal_convergence_ms != null
+                ? `${(net.self_heal_convergence_ms / 1000).toFixed(2)} s`
+                : stranded
+                  ? "recovering..."
+                  : "--"
+            }
+            tone={stranded ? "text-amber-300" : "text-emerald-300"}
           />
         </div>
       </Panel>

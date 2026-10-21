@@ -43,6 +43,10 @@ export default function HeaderBar({
   const airborne = net?.airborne_uav_count ?? 0;
   const gcs = snapshot?.fleet.gcs;
   const acsState = snapshot?.threat.acs_state ?? "IDLE";
+  const threat = snapshot?.threat;
+  const mastActive = !!threat?.mast_active;
+  const gatewayInZone = !!threat?.gateway_in_zone;
+  const stranded = threat?.stranded_count ?? 0;
 
   const wsTone = wsStatus === "connected" ? "emerald" : wsStatus === "connecting" ? "amber" : "red";
 
@@ -75,8 +79,18 @@ export default function HeaderBar({
         </Badge>
         <Badge tone={auto ? "emerald" : "amber"} pulse={acsState !== "IDLE"}>
           ACS {auto ? "AUTO" : "MANUAL"}
-          {acsState !== "IDLE" ? ` · ${acsState}` : ""}
+          {acsState !== "IDLE" ? ` · ${acsState}` : threat?.barrage ? " · BARRAGE HOLD" : ""}
         </Badge>
+        {(mastActive || gatewayInZone) && (
+          <Badge tone={mastActive ? "cyan" : "red"} pulse={!mastActive}>
+            {mastActive ? `HIGH-MAST ${threat?.mast_uav_id ?? ""}` : "GATEWAY IN ZONE"}
+          </Badge>
+        )}
+        {stranded > 0 && (
+          <Badge tone="amber" pulse>
+            {stranded} STRANDED
+          </Badge>
+        )}
         <Badge tone={gcs?.connected ? "violet" : "slate"}>
           GCS {gcs?.connected ? "LINKED" : "UDP"} :{gcs?.port ?? 14550}
         </Badge>

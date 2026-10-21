@@ -19,6 +19,12 @@
 // dropping mesh heartbeats.
 #define BROADCAST_INTERVAL_MS 4000
 
+// Autonomous orphan channel-hunt watchdog (Edge nodes only). A node that has
+// heard nothing from the hub for this long cannot have received a CH_SWITCH
+// broadcast either, so it sweeps the non-overlapping channels 1 -> 6 -> 11
+// looking for a clean carrier instead of waiting forever on a dead channel.
+#define ORPHAN_HUNT_MS 14000
+
 // The physical BOOT button on standard generic ESP32 boards
 #define BOOT_BUTTON 0 
 

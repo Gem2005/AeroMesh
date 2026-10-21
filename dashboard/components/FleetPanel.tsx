@@ -369,13 +369,15 @@ export default function FleetPanel({
         className="shrink-0"
       >
         <div className="space-y-2.5 p-3">
-          <div className="grid grid-cols-3 gap-1 text-center">
+          <div className="grid grid-cols-4 gap-1 text-center">
             {(
               [
                 ["TOTAL", counts.total, "text-slate-100"],
                 ["AIRBORNE", counts.airborne, "text-sky-300"],
                 ["BRIDGING", counts.bridging, "text-violet-300"],
                 ["COVERING", counts.covering, "text-cyan-300"],
+                ["SHEPHERD", counts.shepherding, counts.shepherding ? "text-emerald-300" : "text-slate-500"],
+                ["MAST", counts.mast, counts.mast ? "text-sky-300" : "text-slate-500"],
                 ["LOW BATT", counts.low_battery, counts.low_battery ? "text-amber-300" : "text-slate-500"],
                 ["FAILSAFE", counts.failsafe, counts.failsafe ? "text-rose-300" : "text-slate-500"],
               ] as const
@@ -389,18 +391,43 @@ export default function FleetPanel({
 
           <div
             className={`rounded border p-2 text-[10px] ${
-              allocator.suspended
+              allocator.gateway_in_zone && !allocator.mast_active
                 ? "border-rose-500/40 bg-rose-500/5"
-                : allocator.shortfall > 0
-                  ? "border-amber-500/40 bg-amber-500/5"
-                  : "border-slate-800 bg-slate-900/40"
+                : allocator.mast_active
+                  ? "border-sky-500/40 bg-sky-500/5"
+                  : allocator.shortfall > 0
+                    ? "border-amber-500/40 bg-amber-500/5"
+                    : "border-slate-800 bg-slate-900/40"
             }`}
           >
-            <div className="mb-1 text-[9px] tracking-[0.2em] text-slate-500">RELAY ALLOCATOR</div>
+            <div className="mb-1 text-[9px] tracking-[0.2em] text-slate-500">MISSION ALLOCATOR</div>
             <Stat label="ISOLATED NODES" value={allocator.isolated} tone={allocator.isolated ? "text-rose-300" : undefined} />
+            <Stat label="STRANDED / SILENT" value={allocator.stranded_count} tone={allocator.stranded_count ? "text-amber-300" : undefined} />
             <Stat label="CLUSTERS" value={allocator.clusters.length} />
             <Stat label="SLOTS ASSIGNED" value={`${allocator.assigned} / ${allocator.needed}`} />
-            {allocator.suspended && <div className="mt-1 text-rose-200">Gateway jammed: relays cannot restore C2. Switch channel.</div>}
+            <Stat
+              label="SHEPHERDS"
+              value={allocator.shepherd_assigned ? `${allocator.shepherd_assigned} burning through` : "--"}
+              tone={allocator.shepherd_assigned ? "text-emerald-300" : undefined}
+            />
+            <Stat
+              label="GATEWAY"
+              value={
+                allocator.mast_active
+                  ? `HIGH-MAST ACTIVE (${snapshot?.fleet.config.mast_alt_m ?? 95} m)`
+                  : allocator.gateway_in_zone
+                    ? allocator.mast_assigned
+                      ? "IN ZONE · MAST INBOUND"
+                      : "IN ZONE · NO MAST UAV"
+                    : "NOMINAL"
+              }
+              tone={allocator.mast_active ? "text-sky-300" : allocator.gateway_in_zone ? "text-rose-300" : "text-emerald-300"}
+            />
+            {allocator.gateway_in_zone && !allocator.mast_active && (
+              <div className="mt-1 text-rose-200">
+                Protocol HIGH-MAST: a multirotor climbs to {snapshot?.fleet.config.mast_alt_m ?? 95} m over the gateway so the vertical link survives the zone.
+              </div>
+            )}
             {allocator.shortfall > 0 && (
               <div className="mt-1.5 flex items-center justify-between gap-2 text-amber-200">
                 <span>

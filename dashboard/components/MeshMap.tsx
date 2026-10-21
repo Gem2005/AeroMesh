@@ -23,10 +23,12 @@ import {
   FLIGHT_STATE_LABEL,
   RSSI_BUCKETS,
   STATUS_COLORS,
+  ZONE_MODE_META,
   batteryColor,
   isUavId,
   roleLabel,
   rssiBucket,
+  shepherdFootprintM,
   uavTypeColor,
   type Airframe,
   type FleetState,
@@ -35,6 +37,7 @@ import {
   type LatLng,
   type MeshNodeState,
   type NodeStatus,
+  type SlotKind,
   type Snapshot,
   type UavState,
 } from "@/lib/mesh";
@@ -165,14 +168,25 @@ function uavIcon(mode: FlightMode, type: string, airframe: Airframe, heading: nu
 }
 
 const COVER_COLOR = "#22d3ee";
+const SHEPHERD_COLOR = "#34d399";
+const MAST_COLOR = "#38bdf8";
+const STRANDED_COLOR = "#fbbf24";
+/** bridge.py MAST_HORIZONTAL_RADIUS_M: the mast must hover within this of the gateway */
+const MAST_HORIZONTAL_RADIUS_M = 25;
+const SLOT_COLORS: Record<SlotKind, string> = { RELAY: "#a78bfa", COVER: COVER_COLOR, SHEPHERD: SHEPHERD_COLOR, MAST: MAST_COLOR };
 
-function slotIcon(kind: "RELAY" | "COVER", assigned: boolean) {
+function slotIcon(kind: SlotKind, assigned: boolean) {
   return cachedIcon(`slot:${kind}:${assigned}`, () => {
-    const c = kind === "COVER" ? COVER_COLOR : "#a78bfa";
+    const c = SLOT_COLORS[kind];
+    const dash = assigned ? "0" : "2 1.5";
     const shape =
       kind === "COVER"
-        ? `<circle cx="8" cy="8" r="6.2" fill="none" stroke="${c}" stroke-width="1.4" stroke-dasharray="${assigned ? "0" : "2 1.5"}"/>`
-        : `<polygon points="8,1 15,8 8,15 1,8" fill="none" stroke="${c}" stroke-width="1.4" stroke-dasharray="${assigned ? "0" : "2 1.5"}"/>`;
+        ? `<circle cx="8" cy="8" r="6.2" fill="none" stroke="${c}" stroke-width="1.4" stroke-dasharray="${dash}"/>`
+        : kind === "SHEPHERD"
+          ? `<path d="M8 1.5 L14.5 13 L1.5 13 Z" fill="none" stroke="${c}" stroke-width="1.4" stroke-linejoin="round" stroke-dasharray="${dash}"/>`
+          : kind === "MAST"
+            ? `<rect x="2" y="2" width="12" height="12" rx="1.5" fill="none" stroke="${c}" stroke-width="1.4" stroke-dasharray="${dash}"/><line x1="8" y1="2" x2="8" y2="14" stroke="${c}" stroke-width="1"/>`
+            : `<polygon points="8,1 15,8 8,15 1,8" fill="none" stroke="${c}" stroke-width="1.4" stroke-dasharray="${dash}"/>`;
     return L.divIcon({
       className: "",
       html: `<div class="mk" style="--mk:${c};cursor:default">
@@ -264,9 +278,47 @@ const NodeMarker = memo(function NodeMarker({
               {node.lost_link_s !== null ? ` · ${node.lost_link_s.toFixed(0)} s` : ""}
             </div>
           )}
+          {node.stranded && (
+            <div style={{ color: STRANDED_COLOR }}>
+              STRANDED on CH {node.channel} · never heard CH_SWITCH
+              {node.stranded_s !== null ? ` · ${node.stranded_s.toFixed(0)} s` : ""} · awaiting Shepherd / beacon hunt
+            </div>
+          )}
+          {!node.reachable && node.role !== "gateway" && (
+            <div className="text-slate-400">
+              Gateway datum: LKGP {node.lkgp[0].toFixed(5)}, {node.lkgp[1].toFixed(5)} ({node.lkgp_age_s.toFixed(0)} s old)
+            </div>
+          )}
         </div>
       </Tooltip>
     </Marker>
+  );
+});
+
+/** Dashed uncertainty ring at the Last Known Good Position of a silent / stranded node. */
+const LkgpGhost = memo(function LkgpGhost({ node, activeChannel }: { node: MeshNodeState; activeChannel: number }) {
+  const stranded = node.stranded;
+  const color = stranded ? STRANDED_COLOR : STATUS_COLORS.JAMMED;
+  // the datum ages: the ring grows with uncertainty (orbit speed ~3 m/s), capped for readability
+  const radius = Math.min(60, 12 + node.lkgp_age_s * 0.6);
+  return (
+    <>
+      <Circle
+        center={node.lkgp}
+        radius={radius}
+        className="lkgp-ring"
+        pathOptions={{ color, weight: 1.4, opacity: 0.85, dashArray: "4 6", fillColor: color, fillOpacity: 0.06 }}
+        interactive={false}
+      >
+        {stranded && (
+          <Tooltip permanent direction="bottom" offset={[0, 6]} className="hud-tooltip hud-tooltip-amber">
+            STRANDED CH {node.channel} (LKGP)
+            {activeChannel !== node.channel ? ` · mesh on CH ${activeChannel}` : ""}
+          </Tooltip>
+        )}
+      </Circle>
+      <CircleMarker center={node.lkgp} radius={2.5} pathOptions={{ color, weight: 1, fillColor: color, fillOpacity: 0.9 }} interactive={false} />
+    </>
   );
 });
 
@@ -275,18 +327,23 @@ const UavMarker = memo(function UavMarker({
   cfg,
   selected,
   pinLabel,
+  mastActive,
   onNodeClick,
 }: {
   uav: UavState;
   cfg: FleetState["config"];
   selected: boolean;
   pinLabel: boolean;
+  /** this UAV is the HIGH-MAST proxy currently keeping the gateway alive */
+  mastActive: boolean;
   onNodeClick: (id: string) => void;
 }) {
   const handlers = useMemo(() => ({ click: () => onNodeClick(uav.id) }), [uav.id, onNodeClick]);
   const airborne = uav.flight_state !== "LANDED";
   const alert = uav.failsafe !== null || uav.battery_pct <= cfg.relief_battery_pct;
-  const permanent = selected || (airborne && pinLabel && uav.dist_home_m > PAD_LABEL_CLEARANCE_M);
+  const special = airborne && (uav.task === "MAST" || uav.task === "SHEPHERD");
+  const permanent = selected || special || (airborne && pinLabel && uav.dist_home_m > PAD_LABEL_CLEARANCE_M);
+  const tooltipTone = uav.task === "MAST" ? "hud-tooltip-sky" : uav.task === "SHEPHERD" ? "hud-tooltip-emerald" : "hud-tooltip-violet";
   return (
     <Marker
       position={uav.coords}
@@ -299,9 +356,19 @@ const UavMarker = memo(function UavMarker({
         permanent={permanent}
         direction="bottom"
         offset={[0, 14]}
-        className="hud-tooltip hud-tooltip-violet"
+        className={`hud-tooltip ${tooltipTone}`}
       >
         <span className="font-mono text-[10px]">
+          {uav.task === "MAST" && airborne && (
+            <span className="block font-semibold" style={{ color: MAST_COLOR }}>
+              {mastActive ? `HIGH-MAST PROXY (${cfg.mast_alt_m.toFixed(0)} m)` : `HIGH-MAST CLIMBING ${uav.alt_m.toFixed(0)} / ${cfg.mast_alt_m.toFixed(0)} m`}
+            </span>
+          )}
+          {uav.task === "SHEPHERD" && airborne && (
+            <span className="block font-semibold" style={{ color: SHEPHERD_COLOR }}>
+              SHEPHERD · burn-through {shepherdFootprintM(uav.alt_m).toFixed(0)} m footprint
+            </span>
+          )}
           {uav.id} {uav.type} · {uav.mode} · {airborne ? `${uav.alt_m.toFixed(0)} m` : FLIGHT_STATE_LABEL[uav.flight_state]}
           {uav.slot_label ? ` · ${uav.slot_label}` : ""}
           {" · "}
@@ -355,6 +422,14 @@ function MeshMap({
   const gateway = snapshot?.gateway.coords;
   const uavs = useMemo(() => fleet?.uavs ?? [], [fleet]);
   const pinLabels = (fleet?.counts.airborne ?? 0) <= PINNED_LABEL_LIMIT;
+  const activeChannel = snapshot?.network.channel ?? 6;
+  /** silent or stranded ground nodes: the gateway only knows their LKGP */
+  const ghostNodes = useMemo(
+    () => groundNodes.filter((n) => n.role !== "gateway" && (n.stranded || n.status === "JAMMED" || (!n.reachable && n.status !== "OFFLINE"))),
+    [groundNodes],
+  );
+  const barrage = !!threat?.active && threat.barrage;
+  const zoneColor = threat?.active ? ZONE_MODE_META[threat.mode].color : "#f43f5e";
 
   const coordById = useMemo(() => {
     const m = new Map<string, LatLng>();
@@ -491,24 +566,57 @@ function MeshMap({
             <Circle
               center={threat.epicenter}
               radius={threat.kill_radius_m}
-              className="zone-kill"
-              pathOptions={{ color: "#f43f5e", weight: 2, fillColor: "#f43f5e", fillOpacity: 0.16 }}
+              className={barrage ? "zone-barrage" : "zone-kill"}
+              pathOptions={{ color: zoneColor, weight: 2, fillColor: zoneColor, fillOpacity: 0.16 }}
               interactive={false}
             >
-              <Tooltip permanent direction="center" className="hud-tooltip hud-tooltip-red">
-                PRIMARY DROP ZONE {Math.round(threat.kill_radius_m)} m · CH {threat.channel}
+              <Tooltip permanent direction="center" className={`hud-tooltip ${barrage ? "hud-tooltip-violet" : "hud-tooltip-red"}`}>
+                {barrage ? "BARRAGE DROP ZONE" : threat.mode === "SWEEPER" ? "SWEEPER DROP ZONE" : "PRIMARY DROP ZONE"} {Math.round(threat.kill_radius_m)} m ·{" "}
+                {barrage ? "CH 1-11" : `CH ${threat.channel}`}
+                {threat.sweeper_next_hop_s !== null ? ` · hop ${threat.sweeper_next_hop_s.toFixed(0)} s` : ""}
               </Tooltip>
             </Circle>
+            {/* Safe perimeter flanking arc: relay slots inside the kill radius are pushed out here */}
+            {barrage && fleet && (
+              <Circle
+                center={threat.epicenter}
+                radius={threat.kill_radius_m + fleet.config.flank_margin_m}
+                pathOptions={{ color: "#a78bfa", weight: 1.2, opacity: 0.7, dashArray: "10 6", fill: false }}
+                interactive={false}
+              >
+                <Tooltip permanent direction="right" offset={[0, 0]} className="hud-tooltip hud-tooltip-violet">
+                  FLANKING ARC +{fleet.config.flank_margin_m.toFixed(0)} m
+                </Tooltip>
+              </Circle>
+            )}
             {threat.estimated_epicenter && (
               <Marker position={threat.estimated_epicenter} icon={crosshairIcon("est")} interactive={false} zIndexOffset={1500}>
                 <Tooltip permanent direction="bottom" offset={[0, 14]} className="hud-tooltip hud-tooltip-red">
-                  EST. INTERFERENCE CENTER
-                  {threat.estimation_error_m !== null ? ` (±${threat.estimation_error_m.toFixed(0)} m)` : ""}
+                  EST. CENTER (LKGP tomography)
+                  {threat.estimation_error_m !== null ? ` ±${threat.estimation_error_m.toFixed(0)} m` : ""}
                 </Tooltip>
               </Marker>
             )}
+            {/* HIGH-MAST vertical burn-through link over the gateway */}
+            {threat.mast_active && gateway && (
+              <Circle
+                center={gateway}
+                radius={MAST_HORIZONTAL_RADIUS_M}
+                pathOptions={{ color: MAST_COLOR, weight: 2, opacity: 0.9, dashArray: "3 4", fillColor: MAST_COLOR, fillOpacity: 0.12 }}
+                interactive={false}
+              >
+                <Tooltip permanent direction="top" offset={[0, -8]} className="hud-tooltip hud-tooltip-sky">
+                  VERTICAL BURN-THROUGH · {threat.mast_uav_id} @ {fleet?.config.mast_alt_m.toFixed(0) ?? 95} m
+                </Tooltip>
+              </Circle>
+            )}
           </>
         )}
+
+        {/* LKGP ghosts: the gateway's datum for every silent / stranded node */}
+        {ghostNodes.map((n) => (
+          <LkgpGhost key={`lkgp-${n.id}`} node={n} activeChannel={activeChannel} />
+        ))}
 
         {/* Dijkstra tree links */}
         {links.map((l) => {
@@ -581,14 +689,46 @@ function MeshMap({
             />
           ) : null,
         )}
+        {/* Shepherd burn-through footprint: ground disc of the slant-range cone under the UAV */}
+        {uavs.map((u) =>
+          u.task === "SHEPHERD" && u.flight_state !== "LANDED" && u.alt_m >= 10 ? (
+            <Circle
+              key={`shepherd-${u.id}`}
+              center={u.coords}
+              radius={shepherdFootprintM(u.alt_m)}
+              className="shepherd-footprint"
+              pathOptions={{ color: SHEPHERD_COLOR, weight: 1.6, fillColor: SHEPHERD_COLOR, fillOpacity: 0.1 }}
+              interactive={false}
+            />
+          ) : null,
+        )}
+        {/* Flanking arcs: dashed hop from the unsafe midpoint to the perimeter slot */}
+        {fleet?.allocator.slots.map((s) =>
+          s.flanked && s.flank_from ? (
+            <Polyline
+              key={`flank-${s.label}`}
+              positions={[s.flank_from, s.coords]}
+              pathOptions={{ color: "#a78bfa", weight: 1.4, opacity: 0.7, dashArray: "3 5" }}
+              interactive={false}
+            />
+          ) : null,
+        )}
         {fleet?.allocator.slots.map((s) => (
           <Marker key={`slot-${s.kind}-${s.label}`} position={s.coords} icon={slotIcon(s.kind, s.assigned_to !== null)} zIndexOffset={1100}>
             <Tooltip
               direction="top"
               offset={[0, -8]}
-              className={`hud-tooltip ${s.kind === "COVER" ? "hud-tooltip-sky" : "hud-tooltip-violet"}`}
+              className={`hud-tooltip ${
+                s.kind === "COVER" ? "hud-tooltip-sky" : s.kind === "SHEPHERD" ? "hud-tooltip-emerald" : s.kind === "MAST" ? "hud-tooltip-sky" : "hud-tooltip-violet"
+              }`}
             >
-              {s.kind === "COVER" ? `COVERAGE ${s.label} · ${s.size} weak next hop(s)` : `RELAY SLOT ${s.label}`}
+              {s.kind === "COVER"
+                ? `COVERAGE ${s.label} · ${s.size} weak next hop(s)`
+                : s.kind === "SHEPHERD"
+                  ? `SHEPHERD ${s.label} · ${s.size} stranded node(s) at LKGP`
+                  : s.kind === "MAST"
+                    ? `HIGH-MAST ${s.label} · ${s.alt_m?.toFixed(0) ?? 95} m over gateway`
+                    : `RELAY SLOT ${s.label}${s.flanked ? " · FLANK ARC (pushed out of kill zone)" : ""}`}
               {` · ${s.assigned_to ?? "unassigned"}`}
             </Tooltip>
           </Marker>
@@ -629,6 +769,7 @@ function MeshMap({
               cfg={fleet.config}
               selected={u.id === selectedUavId}
               pinLabel={pinLabels}
+              mastActive={!!threat?.mast_active && threat.mast_uav_id === u.id}
               onNodeClick={onNodeClick}
             />
           ))}
@@ -643,11 +784,27 @@ function MeshMap({
               : `PLACE INTERFERENCE ZONE: click map (primary ${zonePreviewRadius} m / fringe ${Math.round(zonePreviewRadius * BLEED_RATIO)} m)`}
         </div>
       )}
-      {(swarm?.holding_count ?? 0) > 0 && (
-        <div className="pointer-events-none absolute left-3 top-3 z-[1000] rounded border border-rose-500/40 bg-[#0a0e17]/90 px-2.5 py-1 text-[10px] font-semibold tracking-wider text-rose-200">
-          {swarm?.holding_count} NODE{swarm?.holding_count === 1 ? "" : "S"} HOLDING POSITION (LOST LINK)
-        </div>
-      )}
+      <div className="pointer-events-none absolute left-3 top-3 z-[1000] flex flex-col gap-1">
+        {(swarm?.holding_count ?? 0) > 0 && (
+          <div className="rounded border border-rose-500/40 bg-[#0a0e17]/90 px-2.5 py-1 text-[10px] font-semibold tracking-wider text-rose-200">
+            {swarm?.holding_count} NODE{swarm?.holding_count === 1 ? "" : "S"} HOLDING POSITION (LOST LINK)
+          </div>
+        )}
+        {(threat?.stranded_count ?? 0) > 0 && (
+          <div className="rounded border border-amber-500/40 bg-[#0a0e17]/90 px-2.5 py-1 text-[10px] font-semibold tracking-wider text-amber-200">
+            {threat?.stranded_count} STRANDED ON OLD CHANNEL · {threat?.shepherd_assigned ?? 0} SHEPHERD UAV{threat?.shepherd_assigned === 1 ? "" : "S"} INBOUND
+          </div>
+        )}
+        {threat?.gateway_in_zone && (
+          <div
+            className={`rounded border bg-[#0a0e17]/90 px-2.5 py-1 text-[10px] font-semibold tracking-wider ${
+              threat.mast_active ? "border-sky-500/40 text-sky-200" : "border-rose-500/40 text-rose-200"
+            }`}
+          >
+            {threat.mast_active ? `PROTOCOL HIGH-MAST ACTIVE · ${threat.mast_uav_id} PROXYING GATEWAY` : `GATEWAY ${threat.gateway_rf_state} · PROTOCOL HIGH-MAST ENGAGED`}
+          </div>
+        )}
+      </div>
 
       <div className="absolute bottom-3 right-3 z-[1000] flex flex-col items-end gap-1.5">
         <button
@@ -662,6 +819,8 @@ function MeshMap({
           <div><span className="text-teal-300">▲</span> ONLINE <span className="text-amber-300">▲</span> DEGRADED <span className="text-rose-400">▲</span> JAMMED</div>
           <div><span className="text-rose-400">⬚</span> LOST-LINK HOLD <span className="text-sky-300">⬚</span> RECONNECTING</div>
           <div><span className="text-violet-300">✚</span> UAV <span className="text-violet-300">◇</span> RELAY SLOT <span className="text-cyan-300">◯</span> COVERAGE AREA</div>
+          <div><span className="text-emerald-300">△</span> SHEPHERD SLOT / <span className="text-emerald-300">◉</span> BURN-THROUGH <span className="text-sky-300">▣</span> HIGH-MAST</div>
+          <div><span className="text-amber-300">◌</span> LKGP STRANDED <span className="text-rose-400">◌</span> LKGP SILENT <span className="text-violet-300">┅</span> FLANK ARC</div>
           <div>
             NEXT HOP <span className="text-emerald-400">━</span> EXCELLENT <span className="text-cyan-300">━</span> GOOD{" "}
             <span className="text-amber-300">━</span> DEGRADED <span className="text-violet-300">┅</span> VIA UAV

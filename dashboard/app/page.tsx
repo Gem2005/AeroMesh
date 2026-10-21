@@ -10,7 +10,7 @@
 
 import dynamic from "next/dynamic";
 import { useCallback, useState } from "react";
-import { BLEED_RATIO, channelFreqMhz, isUavId, type LatLng } from "@/lib/mesh";
+import { BLEED_RATIO, channelFreqMhz, isUavId, type LatLng, type ZoneMode } from "@/lib/mesh";
 import { useBridge } from "@/lib/useBridge";
 import HeaderBar from "@/components/HeaderBar";
 import NodeOrchestrator, { type InteractionMode } from "@/components/NodeOrchestrator";
@@ -36,6 +36,7 @@ export default function Home() {
   const [draftPolygon, setDraftPolygon] = useState<LatLng[]>([]);
   const [zoneRadius, setZoneRadius] = useState(200);
   const [zoneChannel, setZoneChannel] = useState<ZoneChannelChoice>("active");
+  const [zoneMode, setZoneMode] = useState<ZoneMode>("SPOT");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedUavId, setSelectedUavId] = useState<string | null>(null);
   const [tab, setTab] = useState<RightTab>("fleet");
@@ -70,6 +71,7 @@ export default function Home() {
           bleed_radius_m: Math.round(zoneRadius * BLEED_RATIO),
           freq_mhz: channelFreqMhz(channel),
           channel,
+          mode: zoneMode,
         });
         setMode("none");
       } else if (effectiveMode === "uav_goto" && selectedUavId) {
@@ -77,7 +79,16 @@ export default function Home() {
         setMode("none");
       }
     },
-    [effectiveMode, zoneChannel, activeChannel, zoneRadius, selectedUavId, send],
+    [effectiveMode, zoneChannel, zoneMode, activeChannel, zoneRadius, selectedUavId, send],
+  );
+
+  const changeZoneMode = useCallback(
+    (m: ZoneMode) => {
+      setZoneMode(m);
+      // A live zone changes mode immediately so the operator can flip SPOT -> BARRAGE mid-demo.
+      if (snapshot?.threat.active) send({ type: "SET_JAMMER_MODE", mode: m });
+    },
+    [snapshot?.threat.active, send],
   );
 
   const finishPolygon = useCallback(() => {
@@ -189,7 +200,9 @@ export default function Home() {
             >
               {label}
               {key === "fleet" && shortfall > 0 && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-rose-400" />}
-              {key === "rf" && snapshot?.threat.active && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-rose-400" />}
+              {key === "rf" && snapshot?.threat.active && (
+                <span className={`h-1.5 w-1.5 animate-pulse rounded-full ${snapshot.threat.mast_active ? "bg-sky-300" : "bg-rose-400"}`} />
+              )}
             </button>
           ))}
         </div>
@@ -214,6 +227,8 @@ export default function Home() {
             onZoneRadius={setZoneRadius}
             zoneChannel={zoneChannel}
             onZoneChannel={setZoneChannel}
+            zoneMode={zoneMode}
+            onZoneMode={changeZoneMode}
           />
         )}
       </aside>
