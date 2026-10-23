@@ -146,7 +146,7 @@ function CommsPanel({
   );
 
   return (
-    <div className="border-t border-slate-800 bg-[#0d1424] p-3">
+    <div className="hud-scroll max-h-[46%] shrink-0 overflow-y-auto border-t border-slate-800 bg-[#0d1424] p-3">
       <div className="mb-2 flex items-center justify-between">
         <div className="min-w-0">
           <div className={`truncate text-xs font-semibold ${node.type === "hardware" ? "text-amber-300" : "text-cyan-300"}`}>
