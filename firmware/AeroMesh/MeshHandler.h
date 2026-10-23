@@ -3,7 +3,30 @@
 
 #include <painlessMesh.h>
 
-// Expose state variables for the simulation and messaging
+// ------------------------------------------------------------------ //
+// P2P Ring Buffer: 12-message circular log for peer-to-peer chat
+// ------------------------------------------------------------------ //
+struct PeerMessage {
+    uint32_t seq;
+    String fromId;
+    String sender;
+    String target;
+    String text;
+    int channel;
+    unsigned long rxMillis;
+};
+
+#define MSG_LOG_SIZE 12
+
+extern PeerMessage msgLog[MSG_LOG_SIZE];
+extern int msgCount;
+extern uint32_t nextMsgSeq;
+
+void appendMessage(const String& fromId, const String& sender, const String& target, const String& text, int ch);
+
+// ------------------------------------------------------------------ //
+// Existing state variables
+// ------------------------------------------------------------------ //
 extern bool isJammed;
 extern unsigned long jammedStartTime;
 extern String latestPacket;

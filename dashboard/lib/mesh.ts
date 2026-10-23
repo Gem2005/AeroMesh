@@ -343,9 +343,11 @@ export interface Snapshot {
   links: MeshLink[];
   threat: ThreatState;
   fleet: FleetState;
+  /** rolling window of the last 20 P2P transmissions */
+  p2p_messages?: P2pMessage[];
 }
 
-export type LogTag = "SERIAL" | "RF-ALERT" | "CH-SWITCH" | "SHEPHERD" | "FLEET" | "MAVLINK" | "MSG" | "SYSTEM";
+export type LogTag = "SERIAL" | "RF-ALERT" | "CH-SWITCH" | "SHEPHERD" | "FLEET" | "MAVLINK" | "MSG" | "SYSTEM" | "P2P";
 export type Severity = "info" | "ok" | "warn" | "critical";
 
 export interface LogEventFrame {
@@ -363,9 +365,27 @@ export interface LogHistoryFrame {
 
 export interface PacketAnimationFrame {
   type: "PACKET_ANIMATION";
-  direction: "outbound" | "inbound";
+  direction: "outbound" | "inbound" | "p2p";
   path: string[];
   message: string;
+}
+
+export interface P2pMessage {
+  id: string;
+  source_id: string;
+  sender: string;
+  target_id: string;
+  text: string;
+  path: string[];
+  hops: number;
+  uav_bridged: boolean;
+  delivered: boolean;
+  origin: "hardware" | "dashboard" | "virtual";
+  ts: string;
+}
+
+export interface P2pMessageFrame extends P2pMessage {
+  type: "P2P_MESSAGE";
 }
 
 export interface NodeReplyFrame {
@@ -375,7 +395,7 @@ export interface NodeReplyFrame {
   ts: string;
 }
 
-export type BridgeFrame = Snapshot | LogEventFrame | LogHistoryFrame | PacketAnimationFrame | NodeReplyFrame;
+export type BridgeFrame = Snapshot | LogEventFrame | LogHistoryFrame | PacketAnimationFrame | NodeReplyFrame | P2pMessageFrame;
 
 /* ------------------------------------------------------------------ */
 /* Commands (dashboard -> bridge.py)                                   */
@@ -429,7 +449,15 @@ export type BridgeCommand =
   | { type: "SET_JAMMER_MODE"; mode: ZoneMode }
   | { type: "SET_ECCM_MODE"; auto: boolean }
   | { type: "EXECUTE_FHSS"; target_channel: number }
-  | { type: "REQUEST_SNAPSHOT" };
+  | { type: "REQUEST_SNAPSHOT" }
+  | {
+      /** Trigger a P2P transmission between any two mesh nodes from the dashboard. */
+      type: "SEND_P2P";
+      source_id: string;
+      sender?: string;
+      target_id: string;
+      message: string;
+    };
 
 /* ------------------------------------------------------------------ */
 /* Constants & helpers                                                 */

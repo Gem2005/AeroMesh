@@ -9,6 +9,7 @@ import {
   type BridgeCommand,
   type LatLng,
   type MeshNodeState,
+  type P2pMessage,
   type Snapshot,
   type SwarmState,
 } from "@/lib/mesh";
@@ -80,36 +81,74 @@ const RosterRow = memo(function RosterRow({
   );
 });
 
-function MessageInspector({
+type CommsMode = "uplink" | "p2p";
+
+function CommsPanel({
   node,
   canSend,
   serialUp,
   send,
   onClose,
+  allNodes,
+  p2pMessages,
 }: {
   node: MeshNodeState;
   canSend: boolean;
   serialUp: boolean;
   send: (cmd: BridgeCommand) => boolean;
   onClose: () => void;
+  allNodes: MeshNodeState[];
+  p2pMessages: P2pMessage[];
 }) {
-  const [text, setText] = useState("");
+  const [mode, setMode] = useState<CommsMode>("uplink");
+  const [uplinkText, setUplinkText] = useState("");
   const [lastSent, setLastSent] = useState<string | null>(null);
+  const [p2pText, setP2pText] = useState("");
+  const [p2pTarget, setP2pTarget] = useState("ALL");
+  const [p2pSender, setP2pSender] = useState("");
 
-  const submit = () => {
-    const message = text.trim();
+  const submitUplink = () => {
+    const message = uplinkText.trim();
     if (!message) return;
     if (send({ type: "UPLINK_TX", target_id: node.id, message })) {
       setLastSent(message);
-      setText("");
+      setUplinkText("");
     }
   };
+
+  const submitP2p = () => {
+    const message = p2pText.trim();
+    if (!message) return;
+    const sender = p2pSender.trim() || `Phone-${node.id.slice(-4)}`;
+    if (send({ type: "SEND_P2P", source_id: node.id, sender, target_id: p2pTarget, message })) {
+      setLastSent(`[${sender} -> ${p2pTarget}] ${message}`);
+      setP2pText("");
+    }
+  };
+
+  // Node options for P2P target dropdown (all nodes except self, plus ALL / HUB)
+  const peerOptions = useMemo(() => {
+    return [
+      { value: "ALL", label: "ALL PEERS (Broadcast)" },
+      { value: "HUB", label: "COMMAND HUB" },
+      ...allNodes
+        .filter((n) => n.id !== node.id)
+        .map((n) => ({ value: n.id, label: n.id })),
+    ];
+  }, [allNodes, node.id]);
+
+  // P2P messages relevant to this node (either source or target)
+  const relevantMsgs = useMemo(
+    () => p2pMessages.filter(
+      (m) => m.source_id === node.id || m.target_id === node.id || m.target_id === "ALL"
+    ).slice(-20).reverse(),
+    [p2pMessages, node.id]
+  );
 
   return (
     <div className="border-t border-slate-800 bg-[#0d1424] p-3">
       <div className="mb-2 flex items-center justify-between">
         <div className="min-w-0">
-          <div className="text-[9px] tracking-[0.2em] text-slate-500">NODE MESSAGE INSPECTOR</div>
           <div className={`truncate text-xs font-semibold ${node.type === "hardware" ? "text-amber-300" : "text-cyan-300"}`}>
             [{roleLabel(node)}] {node.id}
           </div>
@@ -118,50 +157,160 @@ function MessageInspector({
           CLOSE
         </button>
       </div>
+
+      {/* Stats */}
       <div className="mb-2 grid grid-cols-2 gap-x-3 gap-y-0.5">
         <Stat label="STATUS" value={<span style={{ color: STATUS_COLORS[node.status] }}>{node.status}</span>} />
         <Stat label="CHANNEL" value={`CH ${node.channel}`} />
         <Stat label="NEXT HOP" value={node.rssi !== null ? `${node.rssi.toFixed(1)} dBm` : "--"} />
-        <Stat label="SNR" value={node.snr !== null ? `${node.snr.toFixed(1)} dB` : "--"} />
-        <Stat label="BATTERY" value={node.battery_mv !== null ? `${node.battery_mv} mV` : "USB/--"} />
         <Stat label="HOPS" value={node.reachable ? node.hop_count : "NO ROUTE"} />
+        <Stat label="BATTERY" value={node.battery_mv !== null ? `${node.battery_mv} mV` : "USB/--"} />
+        <Stat label="SNR" value={node.snr !== null ? `${node.snr.toFixed(1)} dB` : "--"} />
       </div>
       <Stat label="PARENT" value={node.parent_id ?? "--"} />
-      {node.ground_rssi !== null && node.ground_rssi !== node.rssi && (
-        <Stat label="WITHOUT UAV" value={`${node.ground_rssi.toFixed(1)} dBm`} tone="text-slate-400" />
-      )}
       <Stat label="POSITION" value={fmtCoord(node.coords)} />
       <div className="mt-1 truncate text-[10px] text-slate-500" title={node.hop_path.join(" → ")}>
         ROUTE: {node.hop_path.length > 1 ? node.hop_path.join(" → ") : node.role === "gateway" ? "ROOT" : "partitioned"}
       </div>
-      <form
-        className="mt-2 flex gap-1.5"
-        onSubmit={(e) => {
-          e.preventDefault();
-          submit();
-        }}
-      >
-        <input
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          maxLength={120}
-          placeholder="Message to node..."
-          className="min-w-0 flex-1 rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-[11px] text-slate-100 outline-none placeholder:text-slate-600 focus:border-cyan-500"
-        />
+
+      {/* Mode toggle */}
+      <div className="mt-3 flex gap-1">
         <button
-          type="submit"
-          disabled={!canSend || !text.trim()}
-          className="rounded border border-cyan-500/50 bg-cyan-500/15 px-3 text-[10px] font-semibold tracking-wider text-cyan-200 hover:bg-cyan-500/25 disabled:opacity-35"
+          type="button"
+          onClick={() => setMode("uplink")}
+          className={`flex-1 rounded px-1 py-1 text-[9px] font-semibold tracking-wider transition-colors ${
+            mode === "uplink"
+              ? "bg-cyan-500/20 text-cyan-200 border border-cyan-500/40"
+              : "border border-slate-700 text-slate-500 hover:text-slate-300"
+          }`}
         >
-          SEND
+          HUB UPLINK
         </button>
-      </form>
-      <div className="mt-1.5 text-[9.5px] leading-snug text-slate-500">
-        {serialUp
-          ? "UPLINK_TX traces the Dijkstra route and is mirrored to http://aeromesh.local phones via TARGET:ALL."
-          : "Gateway serial offline: message animates on the digital twin only."}
-        {lastSent && <div className="mt-0.5 truncate text-emerald-400">SENT: {lastSent}</div>}
+        <button
+          type="button"
+          onClick={() => setMode("p2p")}
+          className={`flex-1 rounded px-1 py-1 text-[9px] font-semibold tracking-wider transition-colors ${
+            mode === "p2p"
+              ? "bg-fuchsia-500/20 text-fuchsia-200 border border-fuchsia-500/40"
+              : "border border-slate-700 text-slate-500 hover:text-slate-300"
+          }`}
+        >
+          PEER-TO-PEER (P2P)
+        </button>
       </div>
+
+      {mode === "uplink" ? (
+        <div className="mt-2">
+          <form
+            className="flex gap-1.5"
+            onSubmit={(e) => { e.preventDefault(); submitUplink(); }}
+          >
+            <input
+              value={uplinkText}
+              onChange={(e) => setUplinkText(e.target.value)}
+              maxLength={120}
+              placeholder="Message to node..."
+              className="min-w-0 flex-1 rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-[11px] text-slate-100 outline-none placeholder:text-slate-600 focus:border-cyan-500"
+            />
+            <button
+              type="submit"
+              disabled={!canSend || !uplinkText.trim()}
+              className="rounded border border-cyan-500/50 bg-cyan-500/15 px-3 text-[10px] font-semibold tracking-wider text-cyan-200 hover:bg-cyan-500/25 disabled:opacity-35"
+            >
+              SEND
+            </button>
+          </form>
+          <div className="mt-1.5 text-[9.5px] leading-snug text-slate-500">
+            {serialUp
+              ? "UPLINK_TX traces the Dijkstra route and is mirrored to http://aeromesh.local phones via TARGET:ALL."
+              : "Gateway serial offline: message animates on the digital twin only."}
+            {lastSent && <div className="mt-0.5 truncate text-emerald-400">SENT: {lastSent}</div>}
+          </div>
+        </div>
+      ) : (
+        <div className="mt-2 space-y-2">
+          {/* P2P Composer */}
+          <div className="rounded border border-fuchsia-500/20 bg-fuchsia-950/20 p-2">
+            <div className="mb-1.5 text-[9px] tracking-[0.15em] text-fuchsia-400">SOURCE NODE</div>
+            <div className="mb-2 truncate rounded bg-slate-950 px-2 py-1 text-[11px] text-fuchsia-200">
+              {node.id}
+            </div>
+            <div className="mb-1.5 text-[9px] tracking-[0.15em] text-fuchsia-400">CALLSIGN (optional)</div>
+            <input
+              value={p2pSender}
+              onChange={(e) => setP2pSender(e.target.value)}
+              maxLength={24}
+              placeholder={`Phone-${node.id.slice(-4)}`}
+              className="mb-2 w-full rounded border border-fuchsia-500/30 bg-slate-950 px-2 py-1.5 text-[11px] text-fuchsia-100 outline-none placeholder:text-fuchsia-900 focus:border-fuchsia-400"
+            />
+            <div className="mb-1.5 text-[9px] tracking-[0.15em] text-fuchsia-400">TARGET NODE</div>
+            <select
+              value={p2pTarget}
+              onChange={(e) => setP2pTarget(e.target.value)}
+              className="mb-2 w-full rounded border border-fuchsia-500/30 bg-slate-950 px-2 py-1.5 text-[11px] text-fuchsia-100 outline-none focus:border-fuchsia-400"
+            >
+              {peerOptions.map((o) => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+            <form
+              className="flex gap-1.5"
+              onSubmit={(e) => { e.preventDefault(); submitP2p(); }}
+            >
+              <input
+                value={p2pText}
+                onChange={(e) => setP2pText(e.target.value)}
+                maxLength={120}
+                placeholder="P2P message..."
+                className="min-w-0 flex-1 rounded border border-fuchsia-500/30 bg-slate-950 px-2 py-1.5 text-[11px] text-fuchsia-100 outline-none placeholder:text-fuchsia-900 focus:border-fuchsia-400"
+              />
+              <button
+                type="submit"
+                disabled={!canSend || !p2pText.trim()}
+                className="rounded border border-fuchsia-500/50 bg-fuchsia-500/15 px-3 text-[10px] font-semibold tracking-wider text-fuchsia-200 hover:bg-fuchsia-500/25 disabled:opacity-35"
+              >
+                TX
+              </button>
+            </form>
+            {lastSent && <div className="mt-1 truncate text-[9.5px] text-fuchsia-400">SENT: {lastSent}</div>}
+          </div>
+
+          {/* Live P2P feed */}
+          <div>
+            <div className="mb-1 text-[9px] tracking-[0.15em] text-fuchsia-500">LIVE P2P TRANSMISSIONS</div>
+            <div className="max-h-40 overflow-y-auto space-y-1 hud-scroll">
+              {relevantMsgs.length === 0 ? (
+                <div className="text-[9.5px] text-slate-600 py-2 text-center">No P2P traffic for this node</div>
+              ) : (
+                relevantMsgs.map((m) => (
+                  <div
+                    key={m.id}
+                    className="rounded border border-fuchsia-500/20 bg-fuchsia-950/30 px-2 py-1"
+                  >
+                    <div className="flex items-center gap-1 flex-wrap">
+                      <span className="text-[9px] font-semibold text-fuchsia-300">{m.sender}</span>
+                      <span className="text-[9px] text-slate-500">→</span>
+                      <span className="text-[9px] font-semibold text-fuchsia-200">{m.target_id}</span>
+                      <span className="text-[8px] rounded bg-slate-800 px-1 text-slate-400">{m.hops} hop{m.hops !== 1 ? "s" : ""}</span>
+                      {m.uav_bridged && (
+                        <span className="text-[8px] rounded border border-fuchsia-500/40 bg-fuchsia-950/40 px-1 text-fuchsia-300">
+                          [UAV BRIDGED]
+                        </span>
+                      )}
+                      {!m.delivered && (
+                        <span className="text-[8px] rounded border border-rose-500/40 bg-rose-950/40 px-1 text-rose-300">
+                          DROPPED
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-0.5 text-[10px] text-slate-200 leading-snug">{m.text}</div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -290,6 +439,7 @@ export default function NodeOrchestrator({
   onFinishPolygon,
   selectedId,
   onSelect,
+  p2pMessages,
 }: {
   snapshot: Snapshot | null;
   connected: boolean;
@@ -301,6 +451,7 @@ export default function NodeOrchestrator({
   onFinishPolygon: () => void;
   selectedId: string | null;
   onSelect: (id: string | null) => void;
+  p2pMessages: P2pMessage[];
 }) {
   const swarm = snapshot?.swarm;
   const [draftCount, setDraftCount] = useState<number | null>(null);
@@ -451,13 +602,15 @@ export default function NodeOrchestrator({
       </Panel>
 
       {selected && (
-        <MessageInspector
+        <CommsPanel
           key={selected.id}
           node={selected}
           canSend={connected}
           serialUp={snapshot?.bridge.serial_connected ?? false}
           send={send}
           onClose={() => onSelect(null)}
+          allNodes={nodes}
+          p2pMessages={p2pMessages}
         />
       )}
     </aside>

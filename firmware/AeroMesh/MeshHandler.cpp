@@ -1,6 +1,7 @@
 #include "MeshHandler.h"
 #include "Config.h"
 #include "Telemetry.h"
+#include <ArduinoJson.h>
 
 extern painlessMesh mesh;
 extern Scheduler userScheduler; // The task scheduler from painlessMesh
@@ -15,6 +16,33 @@ unsigned long lastGatewayBeaconMs = 0;      // millis() of the last frame heard 
 static const int HUNT_CHANNELS[] = {1, 6, 11}; // non-overlapping 2.4 GHz channels swept by the watchdog
 static const int HUNT_CHANNEL_COUNT = sizeof(HUNT_CHANNELS) / sizeof(HUNT_CHANNELS[0]);
 #endif
+
+// ------------------------------------------------------------------ //
+// P2P Ring Buffer
+// ------------------------------------------------------------------ //
+PeerMessage msgLog[MSG_LOG_SIZE];
+int msgCount = 0;
+uint32_t nextMsgSeq = 1;
+
+void appendMessage(const String& fromId, const String& sender, const String& target, const String& text, int ch) {
+  // Deduplication: reject if identical fromId + text arrived within 2500 ms
+  unsigned long now = millis();
+  for (int i = 0; i < min(msgCount, MSG_LOG_SIZE); i++) {
+    int idx = (msgCount >= MSG_LOG_SIZE) ? (msgCount + i) % MSG_LOG_SIZE : i;
+    if (msgLog[idx].fromId == fromId && msgLog[idx].text == text && (now - msgLog[idx].rxMillis) < 2500) {
+      return; // duplicate suppressed
+    }
+  }
+  int slot = msgCount % MSG_LOG_SIZE;
+  msgLog[slot].seq = nextMsgSeq++;
+  msgLog[slot].fromId = fromId;
+  msgLog[slot].sender = sender;
+  msgLog[slot].target = target;
+  msgLog[slot].text = text;
+  msgLog[slot].channel = ch;
+  msgLog[slot].rxMillis = now;
+  msgCount++;
+}
 
 // Define the broadcasting task
 Task taskSendMessage(TASK_MILLISECOND * BROADCAST_INTERVAL_MS, TASK_FOREVER, &broadcastTelemetry);
@@ -115,8 +143,29 @@ int parseChannelSwitch(const String &msg) {
 
 void receivedCallback(uint32_t from, String &msg) {
   if (msg.startsWith("{")) {
-    // Standard JSON telemetry / replies: print for the Python bridge
+    // Standard JSON telemetry / replies: always print for the Python bridge
     Serial.printf("Received from %u msg=%s\n", from, msg.c_str());
+
+    // NEW: P2P reception on Edge nodes — parse JSON for peer messages
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, msg);
+    if (!err && (doc.containsKey("reply") || doc.containsKey("p2p_msg"))) {
+      String fromId = String((uint32_t)doc["node_id"]);
+      String sender = doc["sender"] | "Peer";
+      String target = doc["target"] | "ALL";
+      String text;
+      if (doc.containsKey("p2p_msg")) {
+        text = String((const char*)doc["p2p_msg"]);
+      } else {
+        text = String((const char*)doc["reply"]);
+      }
+
+      if (target == "ALL" || target == String(mesh.getNodeId()) || target == "PEER") {
+        latestPacket = "[" + sender + " -> " + target + "] " + text;
+        appendMessage(fromId, sender, target, text, activeChannel);
+        noteGatewayBeacon();
+      }
+    }
   } else if (msg.startsWith("CH_SWITCH:")) {
     // Adaptive Channel Switching notification from the hub (only audible while connected)
     noteGatewayBeacon();
@@ -125,13 +174,33 @@ void receivedCallback(uint32_t from, String &msg) {
       activeChannel = channel;
       latestPacket = "[ACS] Switched to Channel " + String(activeChannel);
       Serial.printf("[ACS] Channel switch from %u -> Channel %d\n", from, activeChannel);
+      appendMessage("SYSTEM", "ACS", "ALL", latestPacket, activeChannel);
     } else {
       Serial.printf("[ACS] Ignored malformed channel switch from %u: %s\n", from, msg.c_str());
     }
+  } else if (msg.startsWith("P2P:")) {
+    // P2P bridged message from Gateway/bridge.py
+    // Format: P2P:<fromId>|<sender>|<target>|<text>
+    String payload = msg.substring(4);
+    int sep1 = payload.indexOf('|');
+    int sep2 = payload.indexOf('|', sep1 + 1);
+    int sep3 = payload.indexOf('|', sep2 + 1);
+    if (sep1 > 0 && sep2 > sep1 && sep3 > sep2) {
+      String fromId = payload.substring(0, sep1);
+      String sender = payload.substring(sep1 + 1, sep2);
+      String target = payload.substring(sep2 + 1, sep3);
+      String text = payload.substring(sep3 + 1);
+      if (target == "ALL" || target == String(mesh.getNodeId())) {
+        latestPacket = "[" + sender + " -> " + target + "] " + text;
+        appendMessage(fromId, sender, target, text, activeChannel);
+      }
+    }
+    Serial.printf("P2P PACKET from %u: %s\n", from, msg.c_str());
   } else {
     // Plain text: a hub broadcast message for the phone UI
     noteGatewayBeacon();
     latestPacket = msg;
+    appendMessage("HUB", "COMMAND", "ALL", msg, activeChannel);
     Serial.printf("DIRECT PACKET from %u: %s\n", from, msg.c_str());
   }
 }

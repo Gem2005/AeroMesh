@@ -30,7 +30,7 @@ const MeshMap = dynamic(() => import("@/components/MeshMap"), {
 type RightTab = "rf" | "fleet";
 
 export default function Home() {
-  const { wsStatus, snapshot, history, logs, animations, send, clearLogs, pushLog, getRecord } = useBridge();
+  const { wsStatus, snapshot, history, logs, animations, p2pMessages, send, clearLogs, pushLog, getRecord } = useBridge();
 
   const [mode, setMode] = useState<InteractionMode>("none");
   const [draftPolygon, setDraftPolygon] = useState<LatLng[]>([]);
@@ -158,6 +158,7 @@ export default function Home() {
         onFinishPolygon={finishPolygon}
         selectedId={selectedId}
         onSelect={onRosterSelect}
+        p2pMessages={p2pMessages}
       />
 
       <div className="relative min-h-0 min-w-0">

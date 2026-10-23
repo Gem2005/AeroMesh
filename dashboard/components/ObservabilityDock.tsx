@@ -15,6 +15,7 @@ const TAG_COLORS: Record<LogTag, string> = {
   MAVLINK: "text-violet-300",
   MSG: "text-amber-300",
   SYSTEM: "text-slate-400",
+  P2P: "text-fuchsia-300",
 };
 
 const SEVERITY_TEXT: Record<Severity, string> = {

@@ -7,6 +7,7 @@ import {
   type BridgeFrame,
   type LogEventFrame,
   type LogTag,
+  type P2pMessage,
   type Severity,
   type Snapshot,
 } from "@/lib/mesh";
@@ -44,7 +45,7 @@ export interface LogEntry extends LogEventFrame {
 
 export interface ActiveAnimation {
   id: number;
-  direction: "outbound" | "inbound";
+  direction: "outbound" | "inbound" | "p2p";
   path: string[];
   message: string;
 }
@@ -67,6 +68,7 @@ export function useBridge() {
   const [history, setHistory] = useState<MetricSample[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [animations, setAnimations] = useState<ActiveAnimation[]>([]);
+  const [p2pMessages, setP2pMessages] = useState<P2pMessage[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const idRef = useRef(0);
@@ -151,6 +153,27 @@ export function useBridge() {
         case "NODE_REPLY":
           // Replies are also streamed as LOG_EVENT [MSG]; the frame only drives the inbound animation.
           break;
+        case "P2P_MESSAGE": {
+          // Append to live feed (keep last 50)
+          const { type: _t, ...rec } = frame;
+          setP2pMessages((prev) => [...prev.slice(-49), rec as P2pMessage]);
+          // Also trigger a map animation for the P2P path
+          if (frame.path.length >= 2) {
+            const anim: ActiveAnimation = {
+              id: ++idRef.current,
+              direction: "p2p",
+              path: frame.path,
+              message: `[${frame.sender} -> ${frame.target_id}] ${frame.text}`,
+            };
+            setAnimations((prev) => [...prev, anim]);
+            const timer = setTimeout(() => {
+              animTimers.delete(timer);
+              setAnimations((prev) => prev.filter((a) => a.id !== anim.id));
+            }, ANIMATION_MS);
+            animTimers.add(timer);
+          }
+          break;
+        }
       }
     };
 
@@ -206,5 +229,5 @@ export function useBridge() {
   const clearLogs = useCallback(() => setLogs([]), []);
   const getRecord = useCallback(() => recordRef.current.slice(), []);
 
-  return { wsStatus, snapshot, history, logs, animations, send, clearLogs, pushLog, getRecord };
+  return { wsStatus, snapshot, history, logs, animations, p2pMessages, send, clearLogs, pushLog, getRecord };
 }

@@ -647,13 +647,19 @@ function MeshMap({
         {animations.map((anim) => {
           const pts = anim.path.map((id) => coordById.get(id)).filter((p): p is LatLng => !!p);
           if (pts.length < 2) return null;
-          const color = anim.direction === "outbound" ? "#22d3ee" : "#fbbf24";
+          const isP2p = anim.direction === "p2p";
+          const color = isP2p ? "#e879f9" : anim.direction === "outbound" ? "#22d3ee" : "#fbbf24";
           return (
             <Polyline
               key={anim.id}
               positions={pts}
               className={`packet-flow packet-${anim.direction}`}
-              pathOptions={{ color, weight: 4, opacity: 0.95 }}
+              pathOptions={{
+                color,
+                weight: isP2p ? 3 : 4,
+                opacity: 0.95,
+                dashArray: isP2p ? "6 4" : undefined,
+              }}
               interactive={false}
             />
           );

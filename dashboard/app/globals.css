@@ -274,6 +274,10 @@ body {
 .packet-inbound {
   animation: packet-flow-forward 0.7s linear infinite;
 }
+.packet-p2p {
+  animation: packet-flow-p2p 0.5s linear infinite;
+  filter: drop-shadow(0 0 6px #e879f9) drop-shadow(0 0 12px #a855f7);
+}
 @keyframes packet-flow-forward {
   from {
     stroke-dashoffset: 36;
@@ -282,3 +286,12 @@ body {
     stroke-dashoffset: 0;
   }
 }
+@keyframes packet-flow-p2p {
+  from {
+    stroke-dashoffset: 0;
+  }
+  to {
+    stroke-dashoffset: -36;
+  }
+}
+

@@ -1,0 +1,131 @@
+<USER_REQUEST>
+# MASTER ENGINEERING PROMPT: Peer-to-Peer (Phone-to-Phone & Node-to-Node) Mesh Communication Upgrade
+
+You are a Senior Embedded Systems & Distributed Networking Engineer. Currently, **AeroMesh** only supports Hub-to-Node (Dashboard -> Phone) and Node-to-Hub (Phone -> Dashboard) messaging. We need to implement full **Peer-to-Peer (P2P) Phone-to-Phone and Node-to-Node communication** across the ESP32 firmware, `bridge.py`, and the Next.js dashboard.
+
+*Context Note: This is an academic wireless sensor network (WSN) capstone project. Keep all terminology strictly academic and engineering-focused.*
+
+## 1. UPGRADE ESP32 FIRMWARE (Both `firmware/AeroMesh/` and `C:\Users\gemin\OneDrive\Documents\Arduino\AeroMesh\`)
+
+Right now, when Phone A sends a message on `http://aeromesh.local`, `AeroMesh.ino` broadcasts `{"node_id": ..., "reply": "..."}`, and `MeshHandler.cpp` ignores incoming JSON on Edge nodes—so Phone B connected to another ESP32 never receives Phone A's message! Furthermore, `latestPacket` only holds 1 string and requires manual page refreshes.
+
+### 1.1 Add a 12-Message Ring Buffer & P2P JSON Parser (`MeshHandler.h` & `MeshHandler.cpp`)
+- Define a lightweight circular message log on every node:
+  ```cpp
+  struct PeerMessage {
+      uint32_t seq;
+      String fromId;
+      String sender;
+      String target;
+      String text;
+      int channel;
+      unsigned long rxMillis;
+  };
+  ```
+- Maintain an array `PeerMessage msgLog[12];`, `int msgCount = 0;`, and `uint32_t nextMsgSeq = 1;` with a helper `void appendMessage(const String& fromId, const String& sender, const String& target, const String& text, int ch)` (deduplicating if the exact same `fromId + text` arrived within the last `2500 ms` so direct mesh broadcast + gateway relay don't double-log).
+- Update `receivedCallback(uint32_t from, String &msg)`:
+  1. If `msg.startsWith("{")`:
+     - Always keep printing `Received from %u msg=%s\n` to `Serial` so the Gateway forwards it to `bridge.py`.
+     - **NEW (Edge P2P Reception):** Parse the JSON using `ArduinoJson`. If it contains `"reply"` or `"p2p_msg"`:
+       - Extract `fromId` (`String(doc["node_id"])`), `sender` (`doc["sender"] | "Peer"`), `target` (`doc["target"] | "ALL"`), and `text` (`doc["p2p_msg"] | doc["reply"]`).
+       - If `target == "ALL"` or `target == String(mesh.getNodeId())` or `target == "PEER"`:
+         - Update `latestPacket = "[" + sender + " -> " + target + "] " + text;`
+         - Call `appendMessage(fromId, sender, target, text, activeChannel);`
+         - Reset `lastGatewayBeaconMs = millis();`
+  2. If `msg.startsWith("CH_SWITCH:")`:
+     - Keep existing channel switch logic and also log a system entry via `appendMessage("SYSTEM", "ACS", "ALL", latestPacket, activeChannel)`.
+  3. If `msg.startsWith("P2P:")`:
+     - Format: `P2P:<fromId>|<sender>|<target>|<text>` (sent by Gateway/`bridge.py` when bridging peers or sending from Dashboard/Virtual nodes).
+     - Parse the 4 fields. If `target == "ALL"` or `target == String(mesh.getNodeId())`, update `latestPacket` and call `appendMessage(fromId, sender, target, text, activeChannel)`.
+  4. Otherwise (plain C2 hub broadcast):
+     - Update `latestPacket = msg;` and call `appendMessage("HUB", "COMMAND", "ALL", msg, activeChannel);`.
+
+### 1.2 Upgrade Smartphone Web UI & Endpoints (`AeroMesh.ino`)
+- On Edge nodes (`#if !IS_GATEWAY`), upgrade the `WebServer` (port 80) with 3 endpoints so multiple smartphones can chat in real time without refreshing the browser:
+  1. `GET /peers`: Returns a JSON list of known connected mesh node IDs (`mesh.getNodeList()`) plus `"ALL"` and `"HUB"` so the phone dropdown can target specific peers or broadcast to all phones.
+  2. `GET /messages`: Returns a compact JSON object with `node_id`, `channel` (`activeChannel`), `latest` (`latestPacket`), and `messages` (array of the circular buffer items with `seq`, `from`, `sender`, `target`, `text`, `ch`, and `age_s = (millis() - rxMillis) / 1000`).
+  3. `GET /send`: Accepts query parameters `msg`, optional `sender` (default `"Phone-" + last 4 digits of nodeId`), and optional `target` (default `"ALL"`).
+     - Appends the message immediately to the sender's own local `msgLog` via `appendMessage(String(mesh.getNodeId()), sender, target, msg, activeChannel)` so the sender sees their own message immediately.
+     - Builds JSON: `{"node_id": mesh.getNodeId(), "p2p": true, "sender": sender, "target": target, "p2p_msg": msg, "reply": msg, "channel": activeChannel}` and calls `mesh.sendBroadcast(replyJson)`.
+     - If called with `ajax=1`, returns `200 OK` JSON `{"ok": true}`; otherwise redirects `303` to `/`.
+  4. `GET /`: Serve a clean, responsive, dark-mode mobile chat UI (`http://aeromesh.local`) that:
+     - Shows Node ID, active Wi-Fi Channel badge, and Mesh Peer count.
+     - Lets the user set their **Callsign** (persisted in `localStorage`, e.g., `Field-Alpha`) and select **Recipient** (`ALL PHONES (Broadcast)`, `COMMAND HUB`, or type/select a specific Node ID like `0xV_001` or another ESP32 ID).
+     - Displays a live-scrolling chat feed that polls `GET /messages` every `1500 ms` via JavaScript `fetch()` and submits messages via `fetch('/send?ajax=1&...')` without reloading the page!
+- On the Gateway node (`#if IS_GATEWAY`), in `loop()` where Serial commands are read:
+  - Support `P2P:` serial lines (`if (input.startsWith("P2P:")) { mesh.sendBroadcast(input); }`) in addition to `TARGET:` and `CH_SWITCH:`.
+- Mirror all updated firmware files identically to both `firmware/AeroMesh/` and `C:\Users\gemin\OneDrive\Documents\Arduino\AeroMesh\`.
+
+---
+
+## 2. UPGRADE `bridge.py` FOR P2P GRAPH ROUTING, VIRTUAL PEER REPLIES & ANIMATIONS
+
+Update `bridge.py` (`C:\Users\gemin\AeroMesh\bridge.py`) so that peer-to-peer messages are routed through the `NetworkX` digital twin graph, logged in a dedicated P2P state history, animated hop-by-hop across the map, and bridged across UAV relays.
+
+1. **Add P2P Message History & Routing in `Bridge`:**
+   - Add `self.p2p_history: list[dict] = []` (capped at 50 messages).
+   - Add helper `route_p2p_message(self, source_id: str, sender: str, target_id: str, text: str, origin: str = "hardware")`:
+     - Normalize `target_id` (default `"ALL"` if empty).
+     - **Case A: Direct Peer-to-Peer (`target_id` is a specific node ID in `self.mesh_graph`, e.g., another Hardware ESP32 or a Virtual Node `0xV_005`):**
+       - Check if an undirected/directed path exists in `self.mesh_graph` between `source_id` and `target_id` using `nx.shortest_path(self.mesh_graph, source=source_id, target=target_id, weight="weight")`.
+       - If a valid path exists:
+         - Compute hop count `len(path) - 1` and check if any relay UAV (`UAV-...`) is in `path`.
+         - Emit `self.emit_packet_animation("p2p", path, f"[{sender} -> {target_id}] {text}")`.
+         - Log event with tag `"P2P"` and severity `"ok"`: `f"P2P {source_id} ({sender}) -> {target_id} via {len(path)-1} hop(s){' [UAV BRIDGED]' if uav_in_path else ''}: {text}"`.
+         - Forward `P2P:{source_id}|{sender}|{target_id}|{text}` over Serial (`self.serial_send(...)`) so if the target is a physical ESP32 (or bridged via virtual UAV hops), it receives the packet.
+         - **Virtual Peer Auto-Responder:** If `target_id` is a virtual node (`type == "virtual"`) and is reachable/online, schedule an asynchronous reply `1.2s` later from `target_id` back to `source_id`:
+           - Text: `f"ACK from {target_id} (CH {target_node.channel}, RSSI {target_node.rssi or -65:.0f}dBm, Batt {target_node.battery_mv or 4000}mV): Copy '{text[:30]}'"`
+           - Animate the reverse path `list(reversed(path))` with direction `"p2p"` and send `P2P:{target_id}|{target_id}|{source_id}|{ack_text}` over Serial so the operator's physical smartphone receives the virtual node's reply right on `http://aeromesh.local`!
+       - If NO path exists in `self.mesh_graph` (e.g., node is isolated/jammed and not yet bridged by a UAV):
+         - Log event with tag `"P2P"` and severity `"warn"`: `f"P2P {source_id} -> {target_id} DROPPED: no active route in mesh topology (awaiting UAV bridge / channel heal)"`.
+     - **Case B: Mesh-Wide Peer Broadcast (`target_id == "ALL"`):**
+       - Find all reachable hardware edge nodes and sample up to 3 reachable virtual neighbor paths from `source_id` to animate a multi-cast P2P ripple (`emit_packet_animation("p2p", path, text)`).
+       - Send `P2P:{source_id}|{sender}|ALL|{text}` over Serial so all physical ESP32 nodes stay synchronized.
+       - Log event with tag `"P2P"` and severity `"ok"`: `f"P2P BROADCAST from {source_id} ({sender}): {text}"`.
+     - **Case C: Message to Command Hub (`target_id in ("HUB", GATEWAY_KEY)`):**
+       - Route along `reversed(self.paths.get(source_id))` to `GATEWAY_KEY` and animate `"inbound"`.
+     - Broadcast a `"P2P_MESSAGE"` WebSocket frame `{ "type": "P2P_MESSAGE", "id": ..., "source_id": source_id, "sender": sender, "target_id": target_id, "text": text, "path": path, "hops": ..., "uav_bridged": ..., "delivered": ..., "ts": utc_iso() }` and include `"p2p_messages": self.p2p_history[-20:]` inside `build_snapshot()`.
+2. **Hook `process_reply()` & WebSocket Command `SEND_P2P`:**
+   - Update `process_reply(self, data: dict)` in `bridge.py` to detect `"p2p": True` or `"p2p_msg"` (while keeping backward compatibility with `"reply"`), and invoke `self.route_p2p_message(...)`.
+   - Add WebSocket command handler `mtype == "SEND_P2P"` in `handle_command()` accepting `{"type": "SEND_P2P", "source_id": str, "sender": str, "target_id": str, "message": str}` so the operator on the Next.js dashboard can also simulate or trigger P2P transmissions between any two nodes (e.g., `HW Node 1 -> HW Node 2`, `Phone -> 0xV_010`, or `0xV_004 -> 0xV_022` across a UAV bridge) during presentations!
+
+---
+
+## 3. UPGRADE NEXT.JS DASHBOARD (`dashboard/`)
+
+1. **Update `dashboard/lib/mesh.ts`:**
+   - Add `"P2P"` to `LogTag`.
+   - Update `PacketAnimationFrame["direction"]` to `"outbound" | "inbound" | "p2p"`.
+   - Add `P2pMessage` interface (`id`, `source_id`, `sender`, `target_id`, `text`, `path`, `hops`, `uav_bridged`, `delivered`, `ts`) and include `p2p_messages?: P2pMessage[]` in `MeshSnapshot`.
+   - Add `{ type: "SEND_P2P"; source_id: string; sender?: string; target_id: string; message: string }` to `DashboardCommand`.
+2. **Update Map Packet Animation (`dashboard/components/MeshMap.tsx`):**
+   - Render `"p2p"` packet animations in vibrant **fuchsia/purple (`#e879f9`)** with a distinct dashed laser pulse so Peer-to-Peer traffic is visually distinct from cyan outbound Hub commands and emerald inbound replies.
+3. **Add Peer-to-Peer (P2P) Mesh Comms Tab / Card in `NodeRosterPanel.tsx` & `ObservabilityDock.tsx`:**
+   - In `NodeRosterPanel.tsx` (inside the bottom Inspector / Message drawer), add a toggle between **"HUB UPLINK"** and **"PEER-TO-PEER (P2P)"**:
+     - In **P2P mode**, allow selecting `Source Node` (any HW or Virtual node), `Target Node` (`ALL PEERS`, or any specific HW / Virtual node), and `Message`, plus a scrolling feed of recent **Live Phone-to-Phone & Node-to-Node P2P Transmissions** showing hop count and a `[UAV BRIDGED]` badge when a P2P packet routed through an airborne relay UAV!
+   - Add `P2P` tag styling (`text-fuchsia-300 border-fuchsia-500/40 bg-fuchsia-950/40`) in `ObservabilityDock.tsx`.
+
+---
+
+## 4. VERIFICATION & GIT COMMIT
+- Compile-check `bridge.py` (`python -m py_compile bridge.py`) and run a quick smoke test verifying `route_p2p_message` between two nodes and virtual peer auto-ACK.
+- Run `npx tsc --noEmit` and `npm run build` inside `dashboard/`.
+- Verify that both `firmware/AeroMesh/` and `C:\Users\gemin\OneDrive\Documents\Arduino\AeroMesh\` are 100% identical.
+- Stage and commit all changes with message:
+  `feat(p2p): implement phone-to-phone mesh chat, multi-hop P2P routing, virtual peer auto-ack, and live AJAX portal`
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-10-23T03:06:23+05:30.
+
+The user's current state is as follows:
+Active Document: c:\Users\gemin\AeroMesh\bridge.py (LANGUAGE_PYTHON)
+Cursor is on line: 1
+Other open documents:
+- c:\Users\gemin\AeroMesh\bridge.py (LANGUAGE_PYTHON)
+- c:\Users\gemin\AeroMesh\dashboard\app\globals.css (LANGUAGE_CSS)
+- c:\Users\gemin\AeroMesh\dashboard\lib\mesh.ts (LANGUAGE_TYPESCRIPT)
+- c:\Users\gemin\AeroMesh\dashboard\app\page.tsx (LANGUAGE_TSX)
+</ADDITIONAL_METADATA>
+<USER_SETTINGS_CHANGE>
+The user changed setting `Model Selection` from None to Claude Opus 4.6 (Thinking). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.
+</USER_SETTINGS_CHANGE>
